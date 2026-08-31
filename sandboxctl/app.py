@@ -888,10 +888,37 @@ $env:HERMES_DASHBOARD_BASIC_AUTH_PASSWORD = '__PASS__'
               -Argument ('-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "' + $runner + '"')
         $dt = New-ScheduledTaskTrigger -AtLogOn -User '@@WINUSER@@'
         $dp = New-ScheduledTaskPrincipal -UserId '@@WINUSER@@' -LogonType Interactive -RunLevel Limited
-        Register-ScheduledTask -TaskName 'HermesDashboard' -Action $da -Trigger $dt -Principal $dp -Force | Out-Null
+        # It is a server, so no execution time limit; and bring it back if it
+        # exits on its own rather than leaving it down until the next logon.
+        $ds = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
+              -ExecutionTimeLimit ([TimeSpan]::Zero) `
+              -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1)
+        Register-ScheduledTask -TaskName 'HermesDashboard' -Action $da -Trigger $dt `
+              -Principal $dp -Settings $ds -Force | Out-Null
+
+        # Stop the previous instance and WAIT for the scheduler to agree it has
+        # stopped. Start-ScheduledTask against a task the scheduler still counts
+        # as Running is silently ignored -- so killing the process and starting
+        # in the same breath took the dashboard down and never brought it back.
+        Stop-ScheduledTask -TaskName 'HermesDashboard' -ErrorAction SilentlyContinue
         Get-Process hermes -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+        $stopBy = (Get-Date).AddSeconds(30)
+        while ((Get-ScheduledTask -TaskName 'HermesDashboard').State -eq 'Running' -and (Get-Date) -lt $stopBy) {
+            Start-Sleep -Seconds 2
+        }
         Start-ScheduledTask -TaskName 'HermesDashboard'
-        Write-Output '  dashboard task started (first run builds the web UI, ~30s)'
+
+        # Report what happened, not that a start was requested. The first run
+        # builds the web UI, so allow a couple of minutes.
+        $up = $false
+        for ($i = 0; $i -lt 24; $i++) {
+            Start-Sleep -Seconds 5
+            if (Get-NetTCPConnection -State Listen -LocalPort @@DASHPORT@@ -ErrorAction SilentlyContinue) {
+                $up = $true; break
+            }
+        }
+        if ($up) { Write-Output '  dashboard listening on @@DASHPORT@@' }
+        else { Write-Output '  WARNING: dashboard did not bind @@DASHPORT@@ within two minutes' }
     }
     Write-Output 'HERMES-OK'
 }
