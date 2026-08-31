@@ -188,10 +188,18 @@ no toolchain at all.
 Each agent is seeded with:
 
 - an **inference endpoint** -- any OpenAI-compatible server (llama.cpp, vLLM,
-  Ollama, LM Studio). Set it per install in the UI, or default it with
-  `agents.base_url`. Hermes gets `model.provider: custom` plus `model.base_url`;
-  opencode gets a `provider` entry using `@ai-sdk/openai-compatible`. The key is
-  optional -- a local server that wants none just gets `not-needed`.
+  Ollama, LM Studio). Set it per install, or default it with `agents.base_url`.
+  Hermes gets `model.provider: custom` plus `model.base_url`; opencode gets a
+  `provider` entry using `@ai-sdk/openai-compatible`. The key is optional -- a
+  local server that wants none just gets `not-needed`.
+
+  ![Installing agents](docs/agents.png)
+
+  The model list is read from the endpoint's `/v1/models` when the panel opens,
+  and **models already resident are listed first and preselected**. On a box that
+  swaps models in and out of VRAM that is the difference between a reply now and
+  a cold load of tens of gigabytes. Servers that do not report residency just
+  come back all-equal and sort alphabetically.
 - the model name, and the provider keys from `agents.api_keys` if you use a
   hosted provider instead (written to Hermes's `.env`, never to `config.yaml`)
 - **that sandbox's own Deskhand as an MCP server**, on `127.0.0.1`

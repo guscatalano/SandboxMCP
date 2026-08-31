@@ -1194,6 +1194,33 @@ def do_install_agents(job, vmid, agents, opts=None):
 GH_REPO = CONFIG.get("github_repo", "guscatalano/Deskhand")
 
 
+def fetch_models(base_url, timeout=12):
+    """Ask an OpenAI-compatible endpoint what it can serve.
+
+    Sorted loaded-first. On a box that swaps models in and out of VRAM, choosing
+    one that is already resident is the difference between a reply now and a
+    cold load of tens of gigabytes. Servers that do not report residency simply
+    come back all-equal, which sorts alphabetically and costs nothing.
+    """
+    url = base_url.rstrip("/") + "/models"
+    req = urllib.request.Request(url, headers={"Accept": "application/json"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        data = json.loads(r.read().decode("utf-8", "replace"))
+    out = []
+    for m in (data.get("data") or []):
+        mid = m.get("id")
+        if not mid:
+            continue
+        out.append({
+            "id": mid,
+            "loaded": bool(m.get("loaded")),
+            "size_mb": m.get("size_mb"),
+            "state": m.get("proxy_state") or "",
+        })
+    out.sort(key=lambda e: (not e["loaded"], e["id"].lower()))
+    return out
+
+
 def artifact_kind():
     """Which payload is currently staged: 'zip', 'msi', or None."""
     if os.path.isfile(os.path.join(HERE, "payload", "deskhand.zip")):
@@ -1505,6 +1532,8 @@ details.menu>summary{list-style:none;cursor:pointer;border:1px solid #30363d;bor
 details.menu>summary::-webkit-details-marker{display:none}
 .mi{display:flex;position:absolute;right:0;top:115%;z-index:30;flex-direction:column;gap:6px;background:#161b22;border:1px solid var(--ln);border-radius:8px;padding:8px;min-width:210px;box-shadow:0 10px 30px rgba(0,0,0,.6)}
 .mi button{width:100%;text-align:left}
+label.opt{display:inline-flex;align-items:center;gap:7px;white-space:nowrap;color:var(--fg);font-size:14px;text-transform:none;letter-spacing:0}
+label.opt input{width:auto;margin:0}
 button{background:var(--acc);color:#08111f;border:0;border-radius:6px;padding:8px 14px;font-weight:600;cursor:pointer}
 button.d{background:transparent;color:var(--bad);border:1px solid var(--bad);padding:5px 10px;font-weight:500}
 button:disabled{opacity:.5;cursor:not-allowed}
@@ -1585,13 +1614,17 @@ pre{background:#0b0d11;border:1px solid var(--ln);border-radius:6px;padding:12px
   controller config instead; leave the key blank for a local server that needs none.</div>
   <div class="grid" style="margin-bottom:12px">
     <div style="grid-column:span 2"><label>Inference endpoint (OpenAI-compatible)</label>
-      <input id="ag_url" value="@@AGENT_BASEURL@@" placeholder="http://host:11444/v1"></div>
+      <input id="ag_url" value="@@AGENT_BASEURL@@" placeholder="http://host:11444/v1"
+             onchange="document.getElementById('ag_model').value='';loadModels()"></div>
     <div><label>API key</label><input id="ag_key" placeholder="blank if none"></div>
-    <div><label>Model</label><input id="ag_model" value="@@AGENT_MODEL@@" placeholder="e.g. qwen3-30b"></div>
+    <div><label>Model</label>
+      <input id="ag_model" list="ag_models" value="@@AGENT_MODEL@@" placeholder="pick or type">
+      <datalist id="ag_models"></datalist></div>
   </div>
+  <div class="warn" id="ag_models_note" style="margin:-4px 0 12px">&nbsp;</div>
   <div class="row" style="gap:16px;flex-wrap:wrap;align-items:center">
-    <label><input type="checkbox" id="ag_hermes" checked> Hermes</label>
-    <label><input type="checkbox" id="ag_opencode" checked> opencode</label>
+    <label class="opt"><input type="checkbox" id="ag_hermes" checked> Hermes</label>
+    <label class="opt"><input type="checkbox" id="ag_opencode" checked> opencode</label>
     <button onclick="installAgents()">Install</button>
     <button class="d" onclick="document.getElementById('agentcard').style.display='none'">Cancel</button>
   </div>
@@ -1763,6 +1796,32 @@ function agentPanel(vmid,name){
   var c=document.getElementById('agentcard');
   c.style.display='block';
   c.scrollIntoView({behavior:'smooth'});
+  loadModels();
+}
+// Ask the endpoint what it has. Loaded models come back first, and one of those
+// is pre-selected: picking a resident model is the difference between answering
+// now and waiting for a cold load.
+async function loadModels(){
+  var note=document.getElementById('ag_models_note');
+  var list=document.getElementById('ag_models');
+  var url=document.getElementById('ag_url').value.trim();
+  note.textContent='checking the endpoint\u2026';
+  list.innerHTML='';
+  try{
+    const r=await fetch('api/models'+(url?('?base_url='+encodeURIComponent(url)):''));
+    const d=await r.json();
+    if(d.error){ note.textContent='could not reach '+(d.base_url||'the endpoint')+': '+d.error; return; }
+    if(!d.models.length){ note.textContent=d.base_url?'no models reported by '+d.base_url:'no endpoint set'; return; }
+    list.innerHTML=d.models.map(function(m){
+      var gb=m.size_mb?(' \u00b7 '+(m.size_mb/1024).toFixed(1)+' GB'):'';
+      return '<option value="'+m.id+'">'+(m.loaded?'loaded':'available')+gb+'</option>';
+    }).join('');
+    var loaded=d.models.filter(function(m){return m.loaded;});
+    var box=document.getElementById('ag_model');
+    if(!box.value) box.value=(loaded[0]||d.models[0]).id;
+    note.textContent=d.models.length+' model'+(d.models.length===1?'':'s')+' at '+d.base_url+
+      (loaded.length?('  \u00b7  loaded: '+loaded.map(function(m){return m.id;}).join(', ')):'  \u00b7  none loaded');
+  }catch(e){ note.textContent='could not list models: '+e.message; }
 }
 async function installAgents(){
   if(!agvm) return;
@@ -1854,6 +1913,19 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, json.dumps(list_sandboxes()))
             except Exception as exc:                  # noqa: BLE001
                 return self._send(500, json.dumps({"error": str(exc)}))
+        if p.path == "/api/models":
+            q = urllib.parse.parse_qs(p.query)
+            base = (q.get("base_url", [""])[0] or AGENTS_CFG.get("base_url") or "").strip()
+            if not base:
+                return self._send(200, json.dumps({"models": [], "base_url": ""}))
+            try:
+                return self._send(200, json.dumps(
+                    {"models": fetch_models(base), "base_url": base}))
+            except Exception as exc:                   # noqa: BLE001
+                # A wrong or unreachable endpoint is a normal thing to type, so
+                # it is reported in the panel rather than raised as an error.
+                return self._send(200, json.dumps(
+                    {"models": [], "base_url": base, "error": str(exc)[:200]}))
         if p.path in ("/api/stream", "/api/screen"):
             q = urllib.parse.parse_qs(p.query)
             try:
