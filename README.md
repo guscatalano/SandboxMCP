@@ -49,6 +49,7 @@ client, and the lifecycle buttons. **Watch** opens a live view of any of them.
 | **Repair** | For a sandbox stuck at a lock screen or with no Deskhand: redo auto-logon and install. Issues a new token. |
 | **Destroy** | Purges the VM and its disk. |
 | **Watch** | Live MJPEG of the screen, from Proxmox's VNC framebuffer *or* Deskhand's own capture. |
+| **Agents** | Install Hermes and/or opencode *inside* a sandbox, on demand, preconfigured. |
 | **Proxy** | Every sandbox's Deskhand tools re-exported under one MCP endpoint, namespaced per sandbox. |
 
 The two watch sources are not redundant. **Proxmox VNC works when nothing is
@@ -172,6 +173,40 @@ and browser tools enabled, and those act on *your* machine, not the sandbox. In
 Hermes, `hermes -t sandboxctl -z "..."` limits a run to the sandbox tools alone
 (`hermes tools disable ...` makes it permanent, but that setting is shared with
 its Telegram and Discord surfaces).
+
+## Running an agent inside a sandbox
+
+The **Agents** button on a sandbox (or the `install_agents` MCP tool) installs
+[Hermes](https://hermes-agent.nousresearch.com) and/or
+[opencode](https://opencode.ai) into the guest itself and configures them.
+
+On demand rather than at creation: Hermes alone is a ~2 GB install that brings
+its own git, python and node. Both land in the sandbox account's profile and
+need no elevation. opencode is a plain zip from its GitHub release, so it needs
+no toolchain at all.
+
+Each agent is seeded with:
+
+- the provider keys from `agents.api_keys` in the controller config, set as user
+  environment variables and, for Hermes, written to its `.env`
+- the model named in `agents.hermes.model` / `agents.opencode.model`
+- **that sandbox's own Deskhand as an MCP server**, on `127.0.0.1`
+
+That last one is the interesting part. An agent running inside the sandbox
+cannot reach the controller's MCP endpoint -- the firewall rule blocks the
+control port from the sandbox subnet, deliberately -- but pointing it at the
+Deskhand on its own machine gives it the mouse, keyboard, screen and shell of
+the desktop it is sitting on. Deskhand accepts its token as a query parameter,
+so this works without either agent needing custom header support, and the
+traffic never leaves the guest.
+
+Two things worth knowing before you turn this on:
+
+- **The key is real, and the sandbox is not trusted.** Everything else in a
+  sandbox is disposable; a provider credential is not. Use a separate key with
+  its own spend limit.
+- **Anything installed in the guest runs as the sandbox user**, which is a local
+  administrator. That is fine for a throwaway VM and nowhere else.
 
 ## Security model
 

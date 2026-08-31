@@ -23,6 +23,7 @@ Design notes worth knowing before changing anything:
 
 Stdlib only, on purpose: no pip, nothing to keep patched.
 """
+import base64
 import html
 import json
 import os
@@ -61,6 +62,10 @@ PAYLOAD_LISTEN = CONFIG.get("payload_listen", ["0.0.0.0", 8081])
 SELF_URL = CONFIG["self_url"]                 # what the guest fetches from
 WIN_USER = CONFIG.get("windows_user", "sandbox")
 WIN_PASS = CONFIG["windows_password"]
+# Optional. What to seed an in-sandbox agent with: provider keys, a model per
+# agent, and any extra MCP servers. Absent or empty just means the agent is
+# installed unconfigured.
+AGENTS_CFG = CONFIG.get("agents") or {}
 
 _SSL = ssl.create_default_context()
 _SSL.check_hostname = False
@@ -101,7 +106,6 @@ def agent_run_ps(vmid, script, wait=True, timeout=180):
     Encoded rather than inline because the scripts carry tokens and passwords;
     base64 removes every quoting question between here and PowerShell at once.
     """
-    import base64
     enc = base64.b64encode(script.encode("utf-16-le")).decode()
     # The agent vanishes across the reboots Windows setup performs, so failing
     # to even start the command is a "not yet", not an error. Callers treat None
@@ -592,6 +596,22 @@ MCP_TOOLS = [
         },
     },
     {
+        "name": "install_agents",
+        "description": ("Install an AI agent INSIDE a sandbox (hermes, opencode, or both) and "
+                        "configure it with the controller's API keys and that sandbox's own "
+                        "Deskhand as an MCP server, so it can drive the desktop it runs on. "
+                        "On demand: Hermes alone is a ~2 GB install. Returns a job id."),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "vmid": {"type": "integer", "description": "The sandbox VMID"},
+                "agents": {"type": "array", "items": {"type": "string", "enum": ["hermes", "opencode"]},
+                           "description": "Which agents to install"},
+            },
+            "required": ["vmid", "agents"],
+        },
+    },
+    {
         "name": "repair_sandbox",
         "description": ("Finish a sandbox whose creation was interrupted (it sits at a lock "
                         "screen with no Deskhand). Re-runs auto-logon and the Deskhand "
@@ -668,6 +688,130 @@ def do_repair(job, vmid, opts=None):
     provision(job, vmid, opts, configure_hw=False)
 
 
+
+# The agent runs INSIDE the sandbox, so it needs no route back to the
+# controller -- and could not reach it anyway, since the control port is
+# firewalled off from the sandbox subnet. What it does get is the sandbox's own
+# Deskhand as an MCP server, which lets it drive the desktop it is sitting on.
+AGENTS_PS = r"""
+$ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
+
+# C:\Users\Public, not %LOCALAPPDATA%: this script runs unelevated as the
+# sandbox user, while the controller reads the log back through the guest
+# agent, which is SYSTEM. The drive root is not writable by either.
+$log = 'C:\Users\Public\sandboxctl-agents.log'
+try { Start-Transcript -Path $log -Force | Out-Null } catch { }
+try {
+
+$want = '@@AGENTS@@'.Split(',') | ForEach-Object { $_.Trim().ToLower() } | Where-Object { $_ }
+$cfg  = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('@@CFG@@')) | ConvertFrom-Json
+
+function Set-UserEnv($n, $v) {
+    [Environment]::SetEnvironmentVariable($n, $v, 'User')
+    Set-Item -Path ('Env:' + $n) -Value $v
+}
+
+# Both agents read provider credentials from the environment, under the same
+# names, so this is set once rather than per agent.
+if ($cfg.api_keys) {
+    foreach ($k in $cfg.api_keys.PSObject.Properties) {
+        if ($k.Value) { Set-UserEnv $k.Name $k.Value }
+    }
+}
+
+# ---------------------------------------------------------------- Hermes ---
+if ($want -contains 'hermes') {
+    $hh  = Join-Path $env:LOCALAPPDATA 'hermes'
+    $exe = Join-Path $hh 'bin\hermes.exe'
+    if (-not (Test-Path $exe)) {
+        # Brings its own git, python and node; user-scoped, so no elevation.
+        $src = Invoke-RestMethod 'https://hermes-agent.nousresearch.com/install.ps1'
+        & ([scriptblock]::Create($src)) -SkipSetup -SkipComputerUse
+    }
+    if (-not (Test-Path $exe)) { throw 'hermes.exe missing after install' }
+
+    # Secrets go in .env, which is the documented precedence path; config.yaml
+    # is for behaviour, not credentials.
+    if ($cfg.api_keys) {
+        $lines = foreach ($k in $cfg.api_keys.PSObject.Properties) {
+            if ($k.Value) { $k.Name + '=' + $k.Value }
+        }
+        if ($lines) { Set-Content (Join-Path $hh '.env') -Value $lines -Encoding UTF8 }
+    }
+    if ($cfg.mcp) {
+        # Deliberately NOT 'hermes mcp add': it asks whether the server needs
+        # authentication and blocks forever with no console attached. 'config
+        # set' writes the same entry and never prompts.
+        foreach ($m in $cfg.mcp.PSObject.Properties) {
+            $k = 'mcp_servers.' + $m.Name
+            try {
+                & $exe config set ($k + '.url') $m.Value.url 2>&1 | Out-Null
+                & $exe config set ($k + '.enabled') 'true' 2>&1 | Out-Null
+                & $exe config set ($k + '.connect_timeout') '180' 2>&1 | Out-Null
+                Write-Output ('  mcp ' + $m.Name + ' configured')
+            } catch {
+                Write-Output ('  mcp ' + $m.Name + ' failed: ' + $_.Exception.Message)
+            }
+        }
+    }
+    if ($cfg.hermes -and $cfg.hermes.model) {
+        try { & $exe config set model.name $cfg.hermes.model 2>&1 | Out-Null }
+        catch { Write-Output '  could not set the hermes model; set it with: hermes model' }
+    }
+    Write-Output 'HERMES-OK'
+}
+
+# -------------------------------------------------------------- opencode ---
+if ($want -contains 'opencode') {
+    # The published installer is a bash script, so it is no use here. The
+    # release ships a plain Windows zip: extract it and there is nothing to
+    # build and no node to install.
+    $dir = Join-Path $env:LOCALAPPDATA 'opencode'
+    $zip = Join-Path $env:TEMP 'opencode.zip'
+    $rel = Invoke-RestMethod 'https://api.github.com/repos/sst/opencode/releases/latest' `
+             -Headers @{ 'User-Agent' = 'sandboxctl' }
+    $asset = $rel.assets | Where-Object { $_.name -eq 'opencode-windows-x64.zip' } | Select-Object -First 1
+    if (-not $asset) {
+        $asset = $rel.assets | Where-Object { $_.name -like 'opencode-windows-x64*.zip' } | Select-Object -First 1
+    }
+    if (-not $asset) { throw 'no opencode windows x64 zip in the latest release' }
+    Invoke-WebRequest $asset.browser_download_url -OutFile $zip -UseBasicParsing
+    if (Test-Path $dir) { Remove-Item $dir -Recurse -Force }
+    Expand-Archive -Path $zip -DestinationPath $dir -Force
+    Remove-Item $zip -Force -ErrorAction SilentlyContinue
+    $oc = Get-ChildItem $dir -Recurse -Filter opencode.exe | Select-Object -First 1
+    if (-not $oc) { throw 'opencode.exe missing from the zip' }
+
+    $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
+    if (-not $userPath) { $userPath = '' }
+    if ($userPath -notlike ('*' + $oc.DirectoryName + '*')) {
+        [Environment]::SetEnvironmentVariable(
+            'Path', ($userPath.TrimEnd(';') + ';' + $oc.DirectoryName).TrimStart(';'), 'User')
+    }
+
+    $ocDir = Join-Path $env:USERPROFILE '.config\opencode'
+    New-Item -ItemType Directory -Path $ocDir -Force | Out-Null
+    $conf = [ordered]@{ '$schema' = 'https://opencode.ai/config.json' }
+    if ($cfg.opencode -and $cfg.opencode.model) { $conf['model'] = $cfg.opencode.model }
+    if ($cfg.mcp) {
+        $servers = [ordered]@{}
+        foreach ($m in $cfg.mcp.PSObject.Properties) {
+            $servers[$m.Name] = [ordered]@{ type = 'remote'; url = $m.Value.url; enabled = $true }
+        }
+        if ($servers.Count) { $conf['mcp'] = $servers }
+    }
+    ($conf | ConvertTo-Json -Depth 6) | Set-Content (Join-Path $ocDir 'opencode.json') -Encoding UTF8
+    Write-Output 'OPENCODE-OK'
+}
+
+Write-Output 'AGENTS-INSTALLED'
+} catch {
+    Write-Output ('AGENTS-FAILED: ' + $_.Exception.Message)
+}
+try { Stop-Transcript | Out-Null } catch { }
+"""
+
 def run_install(job, vmid, script, _retried=False):
     r"""Run the install script, rebooting once if C:\Deskhand is held open.
 
@@ -735,6 +879,120 @@ def do_update(job, vmid):
     after = read_token(vmid, refresh=True)
     job.result = {"vmid": vmid, "token_preserved": after == token}
     job.log("done" + ("" if after == token else "  WARNING: token changed"))
+
+
+
+GUEST_PUBLIC = "C:" + chr(92) + "Users" + chr(92) + "Public"
+
+
+def run_in_guest_as_user(job, vmid, script, timeout=2400):
+    """Run a PowerShell script inside the guest as the interactive user.
+
+    The guest agent runs as SYSTEM, so anything launched straight through it
+    installs into SYSTEM's profile -- the wrong place for a per-user tool like
+    Hermes, and not the session the desktop is logged into. Windows offers no
+    "run as that user" verb over the agent channel, so the script is staged to
+    disk and driven by a scheduled task whose principal is the sandbox account.
+
+    The task is fire-and-forget, so completion is observed by polling a log the
+    script writes to a world-readable path rather than by an exit code.
+    """
+    ps1 = GUEST_PUBLIC + chr(92) + "sandboxctl-agents.ps1"
+    log = GUEST_PUBLIC + chr(92) + "sandboxctl-agents.log"
+    blob = base64.b64encode(script.encode("utf-8")).decode()
+
+    stage = (
+        "$b = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('" + blob + "'))\n"
+        "Set-Content -LiteralPath '" + ps1 + "' -Value $b -Encoding UTF8\n"
+        "Remove-Item -LiteralPath '" + log + "' -Force -ErrorAction SilentlyContinue\n"
+        "$a = New-ScheduledTaskAction -Execute 'powershell.exe' "
+        "-Argument '-NoProfile -ExecutionPolicy Bypass -File \"" + ps1 + "\"'\n"
+        "$p = New-ScheduledTaskPrincipal -UserId '" + WIN_USER + "' "
+        "-LogonType Interactive -RunLevel Limited\n"
+        "Register-ScheduledTask -TaskName 'SandboxctlAgents' -Action $a -Principal $p -Force | Out-Null\n"
+        "Start-ScheduledTask -TaskName 'SandboxctlAgents'\n"
+        "Write-Output 'STARTED'\n"
+    )
+    out = agent_run_ps(vmid, stage, timeout=180) or ""
+    if "STARTED" not in out:
+        raise RuntimeError("could not start the in-guest task: " + (out[-300:] or "no output"))
+
+    read = "if (Test-Path '" + log + "') { Get-Content -LiteralPath '" + log + "' -Raw } else { '' }"
+    deadline = time.time() + timeout
+    seen = 0
+    while time.time() < deadline:
+        time.sleep(20)
+        text = agent_run_ps(vmid, read, timeout=120) or ""
+        # Surface progress rather than sitting silent for ten minutes.
+        # PowerShell writes a CLIXML progress envelope to stderr, which
+        # agent_run_ps concatenates onto the output; none of it is progress.
+        lines = [l.strip() for l in text.splitlines()
+                 if l.strip() and not l.lstrip().startswith(("<", "#< CLIXML"))]
+        if len(lines) > seen:
+            seen = len(lines)
+            job.log(lines[-1][:160])
+        if "AGENTS-FAILED" in text:
+            msg = [l for l in lines if "AGENTS-FAILED" in l]
+            raise RuntimeError(msg[-1] if msg else "agent install failed")
+        if "AGENTS-INSTALLED" in text:
+            return text
+    raise RuntimeError("agent install timed out")
+
+
+AGENT_NAMES = ("hermes", "opencode")
+
+
+def do_install_agents(job, vmid, agents):
+    """Install one or more AI agents inside a sandbox and configure them.
+
+    On demand rather than at creation: Hermes alone is a ~2 GB install and most
+    sandboxes never need one. Baking them into the template would make this
+    instant, at the cost of a much larger image for every sandbox.
+    """
+    vmid = _check_managed(vmid)
+    if (vm("/status/current", vmid=vmid) or {}).get("status") != "running":
+        raise RuntimeError("sandbox must be running to install agents")
+
+    wanted = [a.strip().lower() for a in (agents or []) if str(a).strip()]
+    unknown = [a for a in wanted if a not in AGENT_NAMES]
+    if unknown:
+        raise RuntimeError(f"unknown agent(s): {', '.join(unknown)}")
+    if not wanted:
+        raise RuntimeError("pick at least one agent")
+
+    cfg = {
+        "api_keys": dict(AGENTS_CFG.get("api_keys") or {}),
+        "hermes": dict(AGENTS_CFG.get("hermes") or {}),
+        "opencode": dict(AGENTS_CFG.get("opencode") or {}),
+        "mcp": dict(AGENTS_CFG.get("mcp") or {}),
+    }
+    if not any(cfg["api_keys"].values()):
+        job.log("WARNING: no api_keys in the controller config; the agent installs unconfigured")
+
+    # Point the agent at the Deskhand on its own machine. Deskhand accepts the
+    # token as a query parameter, so this needs no header support from either
+    # agent -- and 127.0.0.1 keeps it off the wire entirely.
+    launcher = read_launcher(vmid, timeout=120)
+    m = re.search(r"DESKHAND_TOKEN\s*=\s*'([^']+)'", launcher)
+    pm = re.search(r"DESKHAND_PORT\s*=\s*'(\d+)'", launcher)
+    if m:
+        port = int(pm.group(1)) if pm else 8791
+        cfg["mcp"].setdefault(
+            "deskhand", {"url": f"http://127.0.0.1:{port}/mcp?token={m.group(1)}"})
+        job.log(f"agents will get this sandbox's own Deskhand on 127.0.0.1:{port}")
+    else:
+        job.log("no Deskhand token found; agents get no local desktop tools")
+
+    blob = base64.b64encode(json.dumps(cfg).encode()).decode()
+    script = (AGENTS_PS.replace("@@AGENTS@@", ",".join(wanted))
+                       .replace("@@CFG@@", blob))
+    job.log(f"installing {', '.join(wanted)} as {WIN_USER} (several minutes)")
+    out = run_in_guest_as_user(job, vmid, script, timeout=2400)
+
+    done = [a for a in wanted if f"{a.upper()}-OK" in out]
+    job.result = {"vmid": vmid, "installed": done,
+                  "log": GUEST_PUBLIC + chr(92) + "sandboxctl-agents.log"}
+    job.log("installed: " + (", ".join(done) or "none"))
 
 
 # --------------------------------------------------------------------------
@@ -958,6 +1216,13 @@ def mcp_call(name, args):
             raise ValueError("vmid is required")
         job = start_job(f"Updating {vmid}", do_update, vmid)
         return {"job_id": job.id}
+    if name == "install_agents":
+        vmid = args.get("vmid")
+        if vmid is None:
+            raise ValueError("vmid is required")
+        agents = args.get("agents") or []
+        job = start_job(f"Installing agents on {vmid}", do_install_agents, vmid, agents)
+        return {"job_id": job.id, "note": "poll job_status; several minutes"}
     if name == "sandbox_call":
         return proxy_call(f"{args['sandbox']}{SEP}{args['tool']}", args.get("arguments") or {})
     if name == "job_status":
@@ -1116,6 +1381,20 @@ pre{background:#0b0d11;border:1px solid var(--ln);border-radius:6px;padding:12px
   &mdash; but note that setting is shared with Telegram and Discord.</div>
 </div>
 
+<div class="card" id="agentcard" style="display:none">
+  <b id="agenttitle"></b>
+  <div class="warn" style="margin:6px 0 10px">Installs into the sandbox itself and configures it with
+  the API keys from the controller&rsquo;s config, plus this sandbox&rsquo;s own Deskhand as an MCP server
+  &mdash; so the agent can drive the desktop it is running on. Several minutes; Hermes is a ~2&nbsp;GB install
+  that brings its own git, python and node.</div>
+  <div class="row" style="gap:16px;flex-wrap:wrap;align-items:center">
+    <label><input type="checkbox" id="ag_hermes" checked> Hermes</label>
+    <label><input type="checkbox" id="ag_opencode" checked> opencode</label>
+    <button onclick="installAgents()">Install</button>
+    <button class="d" onclick="document.getElementById('agentcard').style.display='none'">Cancel</button>
+  </div>
+</div>
+
 <div class="card" id="watchcard" style="display:none">
   <div class="row" style="justify-content:space-between;flex-wrap:wrap;gap:8px">
     <b id="watchtitle"></b>
@@ -1154,6 +1433,7 @@ async function refresh(){
     <td style="text-align:right">${s.token
       ? `<button class="d" style="color:#d29922;border-color:#d29922" title="Reinstall the staged Deskhand build on this sandbox. Keeps its existing token, so any MCP client stays working. ~25s." onclick="upd(${s.vmid})">Update</button>`
       : `<button class="d" style="color:#3fb950;border-color:#3fb950" title="This sandbox has no working Deskhand - its build was interrupted. Finishes auto-logon and installs Deskhand. Issues a NEW token. ~3min." onclick="rep(${s.vmid})">Finish setup</button>`}
+    <button class="d" style="color:#58a6ff;border-color:#58a6ff" title="Install an AI agent inside this sandbox, configured with your API keys and its own Deskhand." onclick="agentPanel(${s.vmid},'${s.name}')">Agents</button>
     <button class="d" style="color:#a371f7;border-color:#a371f7" title="Watch this sandbox's screen live." onclick="watch(${s.vmid},'${s.name}')">Watch</button>
     <button class="d" style="color:#8b949e;border-color:#8b949e" title="Reinstall from scratch: re-runs auto-logon and the Deskhand install. Issues a NEW token. Use when a sandbox is stuck or broken." onclick="rep(${s.vmid})">Repair</button>
     <button class="d" onclick="destroy(${s.vmid})">Destroy</button></td></tr>`).join('')
@@ -1174,12 +1454,12 @@ function hubCmd(kind){
 }
 function showHub(){
   document.getElementById('hubcmd').textContent =
-    '# Claude Code\n'+hubCmd('claude')+'\n\n# Hermes\n'+hubCmd('hermes');
+    '# Claude Code\\n'+hubCmd('claude')+'\\n\\n# Hermes\\n'+hubCmd('hermes');
 }
 function copyHub(kind){
   const cmd=hubCmd(kind);
   navigator.clipboard.writeText(cmd).then(
-    ()=>alert('Copied to clipboard:\n\n'+cmd),
+    ()=>alert('Copied to clipboard:\\n\\n'+cmd),
     ()=>prompt('Copy this:',cmd));
 }
 function copyMcp(kind,name,ip,port,token){
@@ -1190,10 +1470,10 @@ function copyMcp(kind,name,ip,port,token){
     ? `hermes mcp add ${name} --url ${url} --auth header`
     : `claude mcp add --transport http ${name} ${url} --header "Authorization: Bearer ${token}"`;
   const note = kind==='hermes'
-    ? `\n\nHermes will ask "Does this server require authentication?" - answer yes,\nchoose a header, and give it:\n\n  Authorization: Bearer ${token}`
+    ? `\\n\\nHermes will ask "Does this server require authentication?" - answer yes,\\nchoose a header, and give it:\\n\\n  Authorization: Bearer ${token}`
     : '';
   navigator.clipboard.writeText(cmd).then(
-    ()=>alert('Copied to clipboard:\n\n'+cmd+note),
+    ()=>alert('Copied to clipboard:\\n\\n'+cmd+note),
     ()=>prompt('Copy this:',cmd));
 }
 var wvm=null, wname='';
@@ -1242,6 +1522,25 @@ async function create(){
     port:+document.getElementById('port').value,
     shell:document.getElementById('shell').value==='1', tls:document.getElementById('tls').value==='1'};
   const r=await fetch('api/create',{method:'POST',body:JSON.stringify(body)});
+  const d=await r.json(); jobId=d.id; poll();
+}
+var agvm=null;
+function agentPanel(vmid,name){
+  agvm=vmid;
+  document.getElementById('agenttitle').textContent='Install agents in '+name+' (vmid '+vmid+')';
+  var c=document.getElementById('agentcard');
+  c.style.display='block';
+  c.scrollIntoView({behavior:'smooth'});
+}
+async function installAgents(){
+  if(!agvm) return;
+  var list=[];
+  if(document.getElementById('ag_hermes').checked) list.push('hermes');
+  if(document.getElementById('ag_opencode').checked) list.push('opencode');
+  if(!list.length){ alert('Pick at least one agent.'); return; }
+  document.getElementById('agentcard').style.display='none';
+  const r=await fetch('api/agents',{method:'POST',
+    body:JSON.stringify({vmid:agvm,agents:list})});
   const d=await r.json(); jobId=d.id; poll();
 }
 async function upd(vmid){
@@ -1464,6 +1763,10 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, json.dumps(out))
         if p.path == "/api/fetch":
             job = start_job("Fetching Deskhand", do_fetch, (body.get("tag") or None))
+            return self._send(200, json.dumps({"id": job.id}))
+        if p.path == "/api/agents":
+            job = start_job(f"Installing agents on {body.get('vmid')}",
+                            do_install_agents, body.get("vmid"), body.get("agents") or [])
             return self._send(200, json.dumps({"id": job.id}))
         if p.path == "/api/repair":
             job = start_job(f"Repairing {body.get('vmid')}", do_repair, body.get("vmid"))

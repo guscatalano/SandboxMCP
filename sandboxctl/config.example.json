@@ -27,5 +27,17 @@
   "windows_user": "sandbox",
   "windows_password": "change-me",
 
-  "github_repo": "guscatalano/Deskhand"
+  "github_repo": "guscatalano/Deskhand",
+
+  "_comment_agents": "Optional. Seeds an AI agent installed INSIDE a sandbox (see the Agents button / install_agents tool). The keys are written to the sandbox's environment and to Hermes's .env; every sandbox also gets its own Deskhand added as an MCP server automatically, so the agent can drive the desktop it runs on. Leave empty to install unconfigured.",
+  "agents": {
+    "api_keys": {
+      "ANTHROPIC_API_KEY": "",
+      "OPENAI_API_KEY": "",
+      "OPENROUTER_API_KEY": ""
+    },
+    "hermes": { "model": "" },
+    "opencode": { "model": "" },
+    "mcp": {}
+  }
 }
