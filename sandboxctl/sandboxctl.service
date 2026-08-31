@@ -1,0 +1,16 @@
+[Unit]
+Description=Sandbox controller (web UI + MCP server)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/sandboxctl
+ExecStart=/usr/bin/python3 /opt/sandboxctl/app.py
+Restart=always
+RestartSec=3
+# Config holds the Proxmox token and the Windows password.
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

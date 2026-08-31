@@ -1,0 +1,6 @@
+# Shell scripts run on the Proxmox node: CRLF breaks the shebang.
+*.sh   text eol=lf
+*.py   text eol=lf
+# PowerShell and answer files are consumed by Windows.
+*.ps1  text eol=crlf
+*.xml  text eol=crlf

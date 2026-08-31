@@ -1,0 +1,31 @@
+{
+  "_comment": "Copy to config.json and fill in. config.json is gitignored: it holds a Proxmox API token and the Windows account password in clear text. chmod 600 it.",
+
+  "pve_host": "192.168.1.10",
+  "node": "pve",
+  "token_id": "sandboxctl@pve!ui",
+  "token_secret": "00000000-0000-0000-0000-000000000000",
+
+  "_comment_template": "VMID of the sysprepped Windows 11 template built by windows11/make-template.sh.",
+  "template": 123,
+
+  "_comment_pool": "Every sandbox is created into this pool, and the app refuses to touch any VM that is not in it AND inside id_range. Both checks must pass.",
+  "pool": "sandboxes",
+  "id_range": [900, 949],
+
+  "_comment_bridge": "SDN vnet the sandboxes attach to. Isolated from the LAN, NATs outbound.",
+  "bridge": "sbx0",
+
+  "_comment_listen": "Control API + web UI. Sandboxes must NOT be able to reach this port.",
+  "listen": ["0.0.0.0", 8080],
+
+  "_comment_payload": "Deskhand builds are served on their own port, and that is the only port the sandbox firewall rule allows through. A compromised sandbox can fetch a zip and nothing else.",
+  "payload_listen": ["0.0.0.0", 8081],
+  "self_url": "http://10.66.0.1:8081",
+
+  "_comment_windows": "Local account created in each sandbox. The password is used for auto-logon and lands in the guest registry in clear text, which is why this belongs only on disposable VMs.",
+  "windows_user": "sandbox",
+  "windows_password": "change-me",
+
+  "github_repo": "guscatalano/Deskhand"
+}

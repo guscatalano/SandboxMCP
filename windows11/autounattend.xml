@@ -1,0 +1,290 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Windows 11 unattended answer file for Proxmox/KVM guests.
+
+  Placeholders written as @@…@@ are substituted by build-unattend-iso.sh; this file
+  is a template, not a finished answer file. Windows Setup reads it as
+  A:\autounattend.xml (or the root of any attached removable volume), which is why
+  it is burned to its own tiny ISO rather than injected into the Windows media —
+  the Windows ISO then stays pristine and interchangeable.
+
+  The two things that actually make an unattended Windows install work on KVM:
+
+    1. VirtIO SCSI drivers loaded during windowsPE. Without them Setup shows
+       "We couldn't find any drives" — the disk is on a virtio-scsi controller
+       that stock Windows media has no driver for. DriverPaths below loads it
+       before disk configuration runs.
+
+    2. A LocalAccount plus HideOnlineAccountScreens. Windows 11 OOBE otherwise
+       demands a Microsoft account and an internet connection, and there is no
+       supported way past that screen once you are looking at it.
+-->
+<unattend xmlns="urn:schemas-microsoft-com:unattend"
+          xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">
+
+  <!-- ===================================================================
+       PASS 1: windowsPE  — driver injection, disk layout, image selection
+       =================================================================== -->
+  <settings pass="windowsPE">
+
+    <component name="Microsoft-Windows-International-Core-WinPE"
+               processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35"
+               language="neutral" versionScope="nonSxS">
+      <SetupUILanguage>
+        <UILanguage>@@LOCALE@@</UILanguage>
+      </SetupUILanguage>
+      <InputLocale>@@KEYBOARD@@</InputLocale>
+      <SystemLocale>@@LOCALE@@</SystemLocale>
+      <UILanguage>@@LOCALE@@</UILanguage>
+      <UserLocale>@@LOCALE@@</UserLocale>
+    </component>
+
+    <component name="Microsoft-Windows-Setup"
+               processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35"
+               language="neutral" versionScope="nonSxS">
+
+      <!--
+        create-vm.sh gives the guest a real TPM 2.0, UEFI firmware and Secure
+        Boot, so these bypasses are not needed on this cluster. They are here as
+        a safety net: the same ISO then still installs on a host without swtpm,
+        or into a VM somebody built by hand and forgot to add a TPM to.
+      -->
+      <RunSynchronous>
+        <RunSynchronousCommand wcm:action="add">
+          <Order>1</Order>
+          <Path>cmd /c if exist D:\vioscsi\w11\amd64\vioscsi.inf drvload D:\vioscsi\w11\amd64\vioscsi.inf</Path>
+        </RunSynchronousCommand>
+        <RunSynchronousCommand wcm:action="add">
+          <Order>2</Order>
+          <Path>cmd /c if exist E:\vioscsi\w11\amd64\vioscsi.inf drvload E:\vioscsi\w11\amd64\vioscsi.inf</Path>
+        </RunSynchronousCommand>
+        <RunSynchronousCommand wcm:action="add">
+          <Order>3</Order>
+          <Path>cmd /c if exist F:\vioscsi\w11\amd64\vioscsi.inf drvload F:\vioscsi\w11\amd64\vioscsi.inf</Path>
+        </RunSynchronousCommand>
+        <RunSynchronousCommand wcm:action="add">
+          <Order>4</Order>
+          <Path>cmd /c if exist G:\vioscsi\w11\amd64\vioscsi.inf drvload G:\vioscsi\w11\amd64\vioscsi.inf</Path>
+        </RunSynchronousCommand>
+        <RunSynchronousCommand wcm:action="add">
+          <Order>5</Order>
+          <Path>reg add HKLM\SYSTEM\Setup\LabConfig /v BypassTPMCheck /t REG_DWORD /d 1 /f</Path>
+        </RunSynchronousCommand>
+        <RunSynchronousCommand wcm:action="add">
+          <Order>6</Order>
+          <Path>reg add HKLM\SYSTEM\Setup\LabConfig /v BypassSecureBootCheck /t REG_DWORD /d 1 /f</Path>
+        </RunSynchronousCommand>
+        <RunSynchronousCommand wcm:action="add">
+          <Order>7</Order>
+          <Path>reg add HKLM\SYSTEM\Setup\LabConfig /v BypassRAMCheck /t REG_DWORD /d 1 /f</Path>
+        </RunSynchronousCommand>
+        <RunSynchronousCommand wcm:action="add">
+          <Order>8</Order>
+          <Path>reg add HKLM\SYSTEM\Setup\LabConfig /v BypassCPUCheck /t REG_DWORD /d 1 /f</Path>
+        </RunSynchronousCommand>
+        <RunSynchronousCommand wcm:action="add">
+          <Order>9</Order>
+          <Path>reg add HKLM\SYSTEM\Setup\LabConfig /v BypassStorageCheck /t REG_DWORD /d 1 /f</Path>
+        </RunSynchronousCommand>
+      </RunSynchronous>
+
+      <!--
+        Deliberately no recovery partition. WinRE lands inside C: instead, which
+        for a VM is the right trade: the recovery partition exists so a laptop can
+        repair itself without media, and this machine's recovery story is
+        "restore last night's vzdump", which is both faster and more complete.
+        Skipping it also avoids the classic layout bug where a later feature
+        update cannot grow the recovery partition and silently disables WinRE.
+      -->
+      <DiskConfiguration>
+        <WillShowUI>OnError</WillShowUI>
+        <Disk wcm:action="add">
+          <DiskID>0</DiskID>
+          <WillWipeDisk>true</WillWipeDisk>
+          <CreatePartitions>
+            <CreatePartition wcm:action="add">
+              <Order>1</Order>
+              <Type>EFI</Type>
+              <Size>300</Size>
+            </CreatePartition>
+            <CreatePartition wcm:action="add">
+              <Order>2</Order>
+              <Type>MSR</Type>
+              <Size>128</Size>
+            </CreatePartition>
+            <CreatePartition wcm:action="add">
+              <Order>3</Order>
+              <Type>Primary</Type>
+              <Extend>true</Extend>
+            </CreatePartition>
+          </CreatePartitions>
+          <ModifyPartitions>
+            <ModifyPartition wcm:action="add">
+              <Order>1</Order>
+              <PartitionID>1</PartitionID>
+              <Label>System</Label>
+              <Format>FAT32</Format>
+            </ModifyPartition>
+            <ModifyPartition wcm:action="add">
+              <Order>2</Order>
+              <PartitionID>3</PartitionID>
+              <Label>Windows</Label>
+              <Letter>C</Letter>
+              <Format>NTFS</Format>
+            </ModifyPartition>
+          </ModifyPartitions>
+        </Disk>
+      </DiskConfiguration>
+
+      <ImageInstall>
+        <OSImage>
+          <!--
+            /IMAGE/NAME must match an edition present in install.wim exactly.
+            build-unattend-iso.sh cannot verify this (it never sees the Windows
+            media), so a typo here surfaces as Setup stopping on the edition
+            picker. Run the dism command in the README to list valid names.
+          -->
+          <InstallFrom>
+            <MetaData wcm:action="add">
+              <Key>/IMAGE/NAME</Key>
+              <Value>@@IMAGE_NAME@@</Value>
+            </MetaData>
+          </InstallFrom>
+          <InstallTo>
+            <DiskID>0</DiskID>
+            <PartitionID>3</PartitionID>
+          </InstallTo>
+          <WillShowUI>OnError</WillShowUI>
+        </OSImage>
+      </ImageInstall>
+
+      <UserData>
+        <!--
+          A generic KMS client setup key. It selects the edition and lets Setup
+          past the key prompt; it does NOT activate Windows. Activate afterwards
+          with your own licence.
+        -->
+        <ProductKey>
+          <Key>@@PRODUCT_KEY@@</Key>
+          <WillShowUI>OnError</WillShowUI>
+        </ProductKey>
+        <AcceptEula>true</AcceptEula>
+        <FullName>@@USERNAME@@</FullName>
+        <Organization>@@ORGANIZATION@@</Organization>
+      </UserData>
+
+      <EnableFirewall>true</EnableFirewall>
+      <EnableNetwork>true</EnableNetwork>
+    </component>
+  </settings>
+
+  <!-- ===================================================================
+       PASS 2: specialize  — identity and remote access
+       =================================================================== -->
+  <settings pass="specialize">
+
+    <component name="Microsoft-Windows-Shell-Setup"
+               processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35"
+               language="neutral" versionScope="nonSxS">
+      <ComputerName>@@COMPUTER_NAME@@</ComputerName>
+      <TimeZone>@@TIMEZONE@@</TimeZone>
+      <RegisteredOwner>@@USERNAME@@</RegisteredOwner>
+      <RegisteredOrganization>@@ORGANIZATION@@</RegisteredOrganization>
+    </component>
+
+    <!--
+      RDP is enabled here rather than in provision.ps1 so that the machine is
+      reachable even if first-logon scripting fails. A headless VM you can only
+      reach through the Proxmox noVNC console is a VM you will avoid using.
+    -->
+    <component name="Microsoft-Windows-TerminalServices-LocalSessionManager"
+               processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35"
+               language="neutral" versionScope="nonSxS">
+      <fDenyTSConnections>false</fDenyTSConnections>
+    </component>
+
+    <component name="Microsoft-Windows-TerminalServices-RDP-WinStationExtensions"
+               processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35"
+               language="neutral" versionScope="nonSxS">
+      <!-- Require NLA: the client authenticates before a session is created. -->
+      <UserAuthentication>1</UserAuthentication>
+      <SecurityLayer>2</SecurityLayer>
+    </component>
+
+  </settings>
+
+  <!-- ===================================================================
+       PASS 3: oobeSystem  — account creation, OOBE suppression, first logon
+       =================================================================== -->
+  <settings pass="oobeSystem">
+
+    <component name="Microsoft-Windows-International-Core"
+               processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35"
+               language="neutral" versionScope="nonSxS">
+      <InputLocale>@@KEYBOARD@@</InputLocale>
+      <SystemLocale>@@LOCALE@@</SystemLocale>
+      <UILanguage>@@LOCALE@@</UILanguage>
+      <UserLocale>@@LOCALE@@</UserLocale>
+    </component>
+
+    <component name="Microsoft-Windows-Shell-Setup"
+               processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35"
+               language="neutral" versionScope="nonSxS">
+
+      <OOBE>
+        <HideEULAPage>true</HideEULAPage>
+        <HideOEMRegistrationScreen>true</HideOEMRegistrationScreen>
+        <!-- The one that matters: no Microsoft account demand, no internet gate. -->
+        <HideOnlineAccountScreens>true</HideOnlineAccountScreens>
+        <HideLocalAccountScreen>true</HideLocalAccountScreen>
+        <HideWirelessSetupInOOBE>true</HideWirelessSetupInOOBE>
+        <!-- 3 = decline all express/telemetry opt-ins rather than accept them. -->
+        <ProtectYourPC>3</ProtectYourPC>
+      </OOBE>
+
+      <UserAccounts>
+        <LocalAccounts>
+          <LocalAccount wcm:action="add">
+            <Name>@@USERNAME@@</Name>
+            <DisplayName>@@USERNAME@@</DisplayName>
+            <Group>Administrators</Group>
+            <Password>
+              <Value>@@PASSWORD@@</Value>
+              <PlainText>true</PlainText>
+            </Password>
+          </LocalAccount>
+        </LocalAccounts>
+      </UserAccounts>
+
+      <!--
+        LogonCount 1: Windows logs in once so FirstLogonCommands can run, then
+        deletes the stored credential and returns to a normal logon screen. The
+        machine is not left permanently auto-logging-in.
+      -->
+      <AutoLogon>
+        <Enabled>true</Enabled>
+        <Username>@@USERNAME@@</Username>
+        <LogonCount>1</LogonCount>
+        <Password>
+          <Value>@@PASSWORD@@</Value>
+          <PlainText>true</PlainText>
+        </Password>
+      </AutoLogon>
+
+      <FirstLogonCommands>
+        <!--
+          Locate and run provision.ps1 from whichever removable volume carries it.
+          Same unpredictable-drive-letter problem as the driver paths, solved the
+          same way: try each letter, run the first that has the file. Single %
+          because cmd is invoked directly, not as a batch file.
+        -->
+        <SynchronousCommand wcm:action="add">
+          <Order>15</Order>
+          <Description>Run provisioning script</Description>
+          <CommandLine>cmd /c for %i in (D E F G H) do @if exist %i:\provision.ps1 powershell.exe -NoProfile -ExecutionPolicy Bypass -File %i:\provision.ps1 &gt;&gt; C:\Windows\Temp\provision.log 2&gt;&amp;1</CommandLine>
+          <RequiresUserInput>false</RequiresUserInput>
+        </SynchronousCommand>
+      </FirstLogonCommands>
+    </component>
+  </settings>
+</unattend>

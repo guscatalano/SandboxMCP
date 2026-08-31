@@ -1,0 +1,18 @@
+# Real config holds the Proxmox API token and the Windows account password.
+config.json
+*.token
+*-token
+*.secret
+.env
+
+# Staged Deskhand builds (tens of MB, fetched at runtime)
+sandboxctl/payload/
+*.zip
+*.msi
+*.msix
+
+# Windows install media
+*.iso
+
+__pycache__/
+*.pyc

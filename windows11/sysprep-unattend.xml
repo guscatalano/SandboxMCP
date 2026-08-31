@@ -1,0 +1,94 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Answer file for `sysprep /generalize /oobe /unattend:<this>`, used by
+  make-template.sh to turn a finished build into a Proxmox template.
+
+  Deliberately NOT the same file as autounattend.xml. Sysprep replays only the
+  specialize and oobeSystem passes — windowsPE, disk partitioning and image
+  selection never run again — and the one setting that must differ is the
+  computer name: `*` tells Windows to generate a fresh random name on each clone.
+  A template that stamped every clone with the same hostname would produce a
+  subnet full of machines that cannot tell each other apart in DNS.
+
+  Generalize also strips the machine SID, the activation state and driver
+  bindings, so each clone comes up as a genuinely distinct installation rather
+  than a bitwise copy wearing a different IP.
+
+  Placeholders written as @@…@@ are substituted by build-unattend-iso.sh.
+-->
+<unattend xmlns="urn:schemas-microsoft-com:unattend"
+          xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">
+
+  <settings pass="specialize">
+    <component name="Microsoft-Windows-Shell-Setup"
+               processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35"
+               language="neutral" versionScope="nonSxS">
+      <!-- '*' = generate a random name per clone. Rename afterwards if you want
+           something meaningful; clone-vm.sh does that for you. -->
+      <ComputerName>*</ComputerName>
+      <TimeZone>@@TIMEZONE@@</TimeZone>
+      <RegisteredOwner>@@USERNAME@@</RegisteredOwner>
+      <RegisteredOrganization>@@ORGANIZATION@@</RegisteredOrganization>
+    </component>
+
+    <!-- Re-assert remote access: generalize resets these to defaults. -->
+    <component name="Microsoft-Windows-TerminalServices-LocalSessionManager"
+               processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35"
+               language="neutral" versionScope="nonSxS">
+      <fDenyTSConnections>false</fDenyTSConnections>
+    </component>
+
+    <component name="Microsoft-Windows-TerminalServices-RDP-WinStationExtensions"
+               processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35"
+               language="neutral" versionScope="nonSxS">
+      <UserAuthentication>1</UserAuthentication>
+      <SecurityLayer>2</SecurityLayer>
+    </component>
+
+  </settings>
+
+  <settings pass="oobeSystem">
+    <component name="Microsoft-Windows-International-Core"
+               processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35"
+               language="neutral" versionScope="nonSxS">
+      <InputLocale>@@KEYBOARD@@</InputLocale>
+      <SystemLocale>@@LOCALE@@</SystemLocale>
+      <UILanguage>@@LOCALE@@</UILanguage>
+      <UserLocale>@@LOCALE@@</UserLocale>
+    </component>
+
+    <component name="Microsoft-Windows-Shell-Setup"
+               processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35"
+               language="neutral" versionScope="nonSxS">
+      <OOBE>
+        <HideEULAPage>true</HideEULAPage>
+        <HideOEMRegistrationScreen>true</HideOEMRegistrationScreen>
+        <HideOnlineAccountScreens>true</HideOnlineAccountScreens>
+        <HideLocalAccountScreen>true</HideLocalAccountScreen>
+        <HideWirelessSetupInOOBE>true</HideWirelessSetupInOOBE>
+        <ProtectYourPC>3</ProtectYourPC>
+      </OOBE>
+
+      <!--
+        The account survives generalize, but OOBE will still stop and demand one
+        unless the answer file supplies it. Re-declaring the same name is not a
+        duplicate: Windows updates the existing account instead of creating a
+        second one, which is exactly what is wanted here.
+      -->
+      <UserAccounts>
+        <LocalAccounts>
+          <LocalAccount wcm:action="add">
+            <Name>@@USERNAME@@</Name>
+            <DisplayName>@@USERNAME@@</DisplayName>
+            <Group>Administrators</Group>
+            <Password>
+              <Value>@@PASSWORD@@</Value>
+              <PlainText>true</PlainText>
+            </Password>
+          </LocalAccount>
+        </LocalAccounts>
+      </UserAccounts>
+
+    </component>
+  </settings>
+</unattend>
