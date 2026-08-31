@@ -1275,6 +1275,10 @@ def fetch_models(base_url, timeout=12):
             "loaded": bool(m.get("loaded")),
             "size_mb": m.get("size_mb"),
             "state": m.get("proxy_state") or "",
+            # A vLLM-backed entry states its window right here; an Ollama-backed
+            # one does not, and is filled in from /api/ps below.
+            "ctx_loaded": m.get("context_length") or m.get("max_model_len"),
+            "ctx_max": m.get("max_context_length") or m.get("max_model_len"),
         })
     # Context size is the thing that decides whether an agent works here at
     # all: ~83 Deskhand tools is roughly 8k tokens of schema before a word is
@@ -1299,8 +1303,9 @@ def fetch_models(base_url, timeout=12):
             pass
 
     for e in out:
-        e["ctx_loaded"] = loaded_ctx.get(e["id"])
-        e["ctx_max"] = max_ctx.get(e["id"])
+        # Only fill what the entry did not already state.
+        e["ctx_loaded"] = e.get("ctx_loaded") or loaded_ctx.get(e["id"])
+        e["ctx_max"] = e.get("ctx_max") or max_ctx.get(e["id"])
 
     out.sort(key=lambda e: (not e["loaded"], e["id"].lower()))
     return out
