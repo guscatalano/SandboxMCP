@@ -31,6 +31,9 @@
 
   "_comment_agents": "Optional. Seeds an AI agent installed INSIDE a sandbox (see the Agents button / install_agents tool). The keys are written to the sandbox's environment and to Hermes's .env; every sandbox also gets its own Deskhand added as an MCP server automatically, so the agent can drive the desktop it runs on. Leave empty to install unconfigured.",
   "agents": {
+    "_comment_endpoint": "Default inference endpoint for agents installed in a sandbox. Any OpenAI-compatible server (llama.cpp, vLLM, Ollama, LM Studio). Overridable per install in the UI. Leave api_key empty if the server needs none. A LAN endpoint also needs a firewall exception -- see the README.",
+    "base_url": "",
+    "api_key": "",
     "api_keys": {
       "ANTHROPIC_API_KEY": "",
       "OPENAI_API_KEY": "",

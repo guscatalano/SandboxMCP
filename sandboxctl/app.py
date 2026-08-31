@@ -24,6 +24,7 @@ Design notes worth knowing before changing anything:
 Stdlib only, on purpose: no pip, nothing to keep patched.
 """
 import base64
+import gzip
 import html
 import json
 import os
@@ -208,12 +209,14 @@ def list_sandboxes():
         members = api(f"/pools/{POOL}").get("members", [])
     except Exception:
         members = []
+    state = load_agent_state()
     for m in members:
         if m.get("type") != "qemu":
             continue
         vmid = m["vmid"]
         entry = {"vmid": vmid, "name": m.get("name", ""),
                  "status": m.get("status", "?"), "ip": None, "token": None, "port": 8791}
+        entry["agents"] = state.get(str(vmid)) or {}
         if entry["status"] == "running":
             entry["ip"] = guest_ip(vmid)
             entry["token"] = read_token(vmid)
@@ -225,6 +228,41 @@ def list_sandboxes():
 # read_launcher), and list_sandboxes reads every running sandbox's token on every
 # UI poll, so an uncached read there would put seconds of latency on each refresh.
 _TOKEN_CACHE = {}
+
+
+# What was installed where. Kept on disk so the UI can still offer a link after
+# a service restart, and so nothing has to be probed inside the guest on every
+# poll of the sandbox list.
+AGENT_STATE_PATH = os.path.join(HERE, "agents-state.json")
+AGENT_STATE_LOCK = threading.Lock()
+
+
+def load_agent_state():
+    try:
+        with open(AGENT_STATE_PATH) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def set_agent_state(vmid, data):
+    with AGENT_STATE_LOCK:
+        st = load_agent_state()
+        st[str(vmid)] = data
+        tmp = AGENT_STATE_PATH + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(st, f, indent=2)
+        os.replace(tmp, AGENT_STATE_PATH)
+
+
+def clear_agent_state(vmid):
+    with AGENT_STATE_LOCK:
+        st = load_agent_state()
+        if st.pop(str(vmid), None) is not None:
+            tmp = AGENT_STATE_PATH + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(st, f, indent=2)
+            os.replace(tmp, AGENT_STATE_PATH)
 
 
 def read_launcher(vmid, timeout=90):
@@ -530,6 +568,7 @@ def do_destroy(job, vmid):
             if (vm("/status/current", vmid=vmid) or {}).get("status") == "stopped":
                 break
     _TOKEN_CACHE.pop(vmid, None)
+    clear_agent_state(vmid)
     job.log("destroying")
     api(f"/nodes/{NODE}/qemu/{vmid}?purge=1&destroy-unreferenced-disks=1", "DELETE", timeout=180)
     job.log("gone")
@@ -607,6 +646,12 @@ MCP_TOOLS = [
                 "vmid": {"type": "integer", "description": "The sandbox VMID"},
                 "agents": {"type": "array", "items": {"type": "string", "enum": ["hermes", "opencode"]},
                            "description": "Which agents to install"},
+                "base_url": {"type": "string", "description": (
+                    "OpenAI-compatible inference endpoint the agent should call, e.g. "
+                    "http://10.0.0.5:11444/v1. Defaults to agents.base_url in the "
+                    "controller config. Leave the key empty if the server needs none.")},
+                "api_key": {"type": "string", "description": "Optional key for that endpoint"},
+                "model": {"type": "string", "description": "Model name to select, e.g. qwen3-30b"},
             },
             "required": ["vmid", "agents"],
         },
@@ -713,12 +758,20 @@ function Set-UserEnv($n, $v) {
 }
 
 # Both agents read provider credentials from the environment, under the same
-# names, so this is set once rather than per agent.
+# names, so this is set once rather than per agent. A local inference server
+# often needs no key at all, hence the emptiness check rather than a default.
 if ($cfg.api_keys) {
     foreach ($k in $cfg.api_keys.PSObject.Properties) {
         if ($k.Value) { Set-UserEnv $k.Name $k.Value }
     }
 }
+if ($cfg.base_url) {
+    # The OpenAI-compatible convention, understood by both agents and by most
+    # tools that speak to a local llama.cpp / vLLM / Ollama / LM Studio server.
+    Set-UserEnv 'OPENAI_BASE_URL' $cfg.base_url
+    if (-not $cfg.api_key) { Set-UserEnv 'OPENAI_API_KEY' 'not-needed' }
+}
+if ($cfg.api_key) { Set-UserEnv 'OPENAI_API_KEY' $cfg.api_key }
 
 # ---------------------------------------------------------------- Hermes ---
 if ($want -contains 'hermes') {
@@ -733,12 +786,29 @@ if ($want -contains 'hermes') {
 
     # Secrets go in .env, which is the documented precedence path; config.yaml
     # is for behaviour, not credentials.
+    $envLines = @()
     if ($cfg.api_keys) {
-        $lines = foreach ($k in $cfg.api_keys.PSObject.Properties) {
-            if ($k.Value) { $k.Name + '=' + $k.Value }
+        foreach ($k in $cfg.api_keys.PSObject.Properties) {
+            if ($k.Value) { $envLines += ($k.Name + '=' + $k.Value) }
         }
-        if ($lines) { Set-Content (Join-Path $hh '.env') -Value $lines -Encoding UTF8 }
     }
+    if ($cfg.api_key) { $envLines += ('OPENAI_API_KEY=' + $cfg.api_key) }
+    if ($envLines.Count) { Set-Content (Join-Path $hh '.env') -Value $envLines -Encoding UTF8 }
+
+    # 'custom' is Hermes's own name for any OpenAI-compatible endpoint;
+    # ollama/vllm/llamacpp are documented aliases for the same thing.
+    if ($cfg.base_url) {
+        & $exe config set model.provider 'custom' 2>&1 | Out-Null
+        & $exe config set model.base_url $cfg.base_url 2>&1 | Out-Null
+        if ($cfg.api_key) { & $exe config set model.api_key $cfg.api_key 2>&1 | Out-Null }
+        Write-Output ('  hermes -> ' + $cfg.base_url)
+    }
+    # 'model.default', not 'model.name'.
+    if ($cfg.hermes -and $cfg.hermes.model) {
+        & $exe config set model.default $cfg.hermes.model 2>&1 | Out-Null
+        Write-Output ('  hermes model ' + $cfg.hermes.model)
+    }
+
     if ($cfg.mcp) {
         # Deliberately NOT 'hermes mcp add': it asks whether the server needs
         # authentication and blocks forever with no console attached. 'config
@@ -755,9 +825,29 @@ if ($want -contains 'hermes') {
             }
         }
     }
-    if ($cfg.hermes -and $cfg.hermes.model) {
-        try { & $exe config set model.name $cfg.hermes.model 2>&1 | Out-Null }
-        catch { Write-Output '  could not set the hermes model; set it with: hermes model' }
+
+    # The dashboard as a logon task, so it survives reboots. A non-loopback
+    # bind always demands an auth provider, so basic auth is not optional.
+    if ($cfg.dashboard_password) {
+        $runner = Join-Path $hh 'run-dashboard.ps1'
+        $dash = @'
+$ip = (Get-NetIPAddress -AddressFamily IPv4 |
+       Where-Object { $_.IPAddress -notlike '127.*' -and $_.IPAddress -notlike '169.254.*' } |
+       Select-Object -First 1).IPAddress
+$env:HERMES_DASHBOARD_BASIC_AUTH_USERNAME = '__USER__'
+$env:HERMES_DASHBOARD_BASIC_AUTH_PASSWORD = '__PASS__'
+& "$env:LOCALAPPDATA\hermes\bin\hermes.exe" dashboard --host $ip --port __PORT__ --no-open
+'@
+        $dash = $dash.Replace('__USER__', '@@WINUSER@@').Replace('__PASS__', $cfg.dashboard_password).Replace('__PORT__', '@@DASHPORT@@')
+        Set-Content $runner -Value $dash -Encoding UTF8
+        $da = New-ScheduledTaskAction -Execute 'powershell.exe' `
+              -Argument ('-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "' + $runner + '"')
+        $dt = New-ScheduledTaskTrigger -AtLogOn -User '@@WINUSER@@'
+        $dp = New-ScheduledTaskPrincipal -UserId '@@WINUSER@@' -LogonType Interactive -RunLevel Limited
+        Register-ScheduledTask -TaskName 'HermesDashboard' -Action $da -Trigger $dt -Principal $dp -Force | Out-Null
+        Get-Process hermes -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+        Start-ScheduledTask -TaskName 'HermesDashboard'
+        Write-Output '  dashboard task started (first run builds the web UI, ~30s)'
     }
     Write-Output 'HERMES-OK'
 }
@@ -793,7 +883,25 @@ if ($want -contains 'opencode') {
     $ocDir = Join-Path $env:USERPROFILE '.config\opencode'
     New-Item -ItemType Directory -Path $ocDir -Force | Out-Null
     $conf = [ordered]@{ '$schema' = 'https://opencode.ai/config.json' }
-    if ($cfg.opencode -and $cfg.opencode.model) { $conf['model'] = $cfg.opencode.model }
+    if ($cfg.base_url) {
+        # An OpenAI-compatible endpoint is expressed as a provider whose SDK
+        # package is the openai-compatible one, with the URL in options.
+        $opts = [ordered]@{ baseURL = $cfg.base_url }
+        if ($cfg.api_key) { $opts['apiKey'] = $cfg.api_key } else { $opts['apiKey'] = 'not-needed' }
+        $models = [ordered]@{}
+        if ($cfg.opencode -and $cfg.opencode.model) { $models[$cfg.opencode.model] = [ordered]@{} }
+        $conf['provider'] = [ordered]@{
+            local = [ordered]@{
+                npm     = '@ai-sdk/openai-compatible'
+                name    = 'local'
+                options = $opts
+                models  = $models
+            }
+        }
+        if ($cfg.opencode -and $cfg.opencode.model) { $conf['model'] = 'local/' + $cfg.opencode.model }
+    } elseif ($cfg.opencode -and $cfg.opencode.model) {
+        $conf['model'] = $cfg.opencode.model
+    }
     if ($cfg.mcp) {
         $servers = [ordered]@{}
         foreach ($m in $cfg.mcp.PSObject.Properties) {
@@ -801,7 +909,7 @@ if ($want -contains 'opencode') {
         }
         if ($servers.Count) { $conf['mcp'] = $servers }
     }
-    ($conf | ConvertTo-Json -Depth 6) | Set-Content (Join-Path $ocDir 'opencode.json') -Encoding UTF8
+    ($conf | ConvertTo-Json -Depth 8) | Set-Content (Join-Path $ocDir 'opencode.json') -Encoding UTF8
     Write-Output 'OPENCODE-OK'
 }
 
@@ -882,6 +990,34 @@ def do_update(job, vmid):
 
 
 
+DASH_PORT = 9119
+
+
+def prepare_guest_firewall(vmid):
+    """Open the dashboard port before anything tries to listen on it.
+
+    Windows pops a "do you want to allow this app" dialog the first time an
+    unknown binary binds a socket. Nobody is there to answer it, so it sits
+    modal on the desktop forever -- and dismissing it writes a BLOCK rule for
+    that executable, which then beats any allow rule you add afterwards. So:
+    create the allow rule first, and clear any block rule a previous prompt
+    left behind. Requires elevation, which is why it runs through the guest
+    agent (SYSTEM) rather than in the user-context script.
+    """
+    ps = (
+        "Remove-NetFirewallRule -DisplayName 'Hermes Dashboard' -ErrorAction SilentlyContinue\n"
+        "New-NetFirewallRule -DisplayName 'Hermes Dashboard' -Direction Inbound -Action Allow "
+        "-Protocol TCP -LocalPort " + str(DASH_PORT) + " -Profile Any | Out-Null\n"
+        "Get-NetFirewallRule -Direction Inbound -Action Block -EA SilentlyContinue | ForEach-Object {\n"
+        "  $af = $_ | Get-NetFirewallApplicationFilter -EA SilentlyContinue\n"
+        "  if ($af.Program -like '*uv*python*' -or $af.Program -like '*hermes*' -or $af.Program -like '*opencode*') {\n"
+        "    Remove-NetFirewallRule -Name $_.Name -EA SilentlyContinue }\n"
+        "}\n"
+        "Write-Output 'FW-OK'\n"
+    )
+    return "FW-OK" in (agent_run_ps(vmid, ps, timeout=180) or "")
+
+
 GUEST_PUBLIC = "C:" + chr(92) + "Users" + chr(92) + "Public"
 
 
@@ -899,10 +1035,17 @@ def run_in_guest_as_user(job, vmid, script, timeout=2400):
     """
     ps1 = GUEST_PUBLIC + chr(92) + "sandboxctl-agents.ps1"
     log = GUEST_PUBLIC + chr(92) + "sandboxctl-agents.log"
-    blob = base64.b64encode(script.encode("utf-8")).decode()
+    # Gzipped, not plain base64. The staging script is itself delivered as a
+    # -EncodedCommand, so a plain base64 payload gets encoded a second time --
+    # and Windows caps a command line at 32767 characters, which this script
+    # quietly exceeded once it grew. Compressing first cuts it by roughly 4x.
+    blob = base64.b64encode(gzip.compress(script.encode("utf-8"))).decode()
 
     stage = (
-        "$b = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('" + blob + "'))\n"
+        "$gz = [Convert]::FromBase64String('" + blob + "')\n"
+        "$ms = New-Object IO.MemoryStream(,$gz)\n"
+        "$gs = New-Object IO.Compression.GzipStream($ms, [IO.Compression.CompressionMode]::Decompress)\n"
+        "$b = (New-Object IO.StreamReader($gs)).ReadToEnd()\n"
         "Set-Content -LiteralPath '" + ps1 + "' -Value $b -Encoding UTF8\n"
         "Remove-Item -LiteralPath '" + log + "' -Force -ErrorAction SilentlyContinue\n"
         "$a = New-ScheduledTaskAction -Execute 'powershell.exe' "
@@ -913,6 +1056,9 @@ def run_in_guest_as_user(job, vmid, script, timeout=2400):
         "Start-ScheduledTask -TaskName 'SandboxctlAgents'\n"
         "Write-Output 'STARTED'\n"
     )
+    # -EncodedCommand is UTF-16 then base64, so the wire cost is ~2.7x this.
+    if len(stage) * 2.8 > 30000:
+        raise RuntimeError(f"staging script too large for a Windows command line ({len(stage)} chars)")
     out = agent_run_ps(vmid, stage, timeout=180) or ""
     if "STARTED" not in out:
         raise RuntimeError("could not start the in-guest task: " + (out[-300:] or "no output"))
@@ -942,13 +1088,14 @@ def run_in_guest_as_user(job, vmid, script, timeout=2400):
 AGENT_NAMES = ("hermes", "opencode")
 
 
-def do_install_agents(job, vmid, agents):
+def do_install_agents(job, vmid, agents, opts=None):
     """Install one or more AI agents inside a sandbox and configure them.
 
     On demand rather than at creation: Hermes alone is a ~2 GB install and most
     sandboxes never need one. Baking them into the template would make this
     instant, at the cost of a much larger image for every sandbox.
     """
+    opts = opts or {}
     vmid = _check_managed(vmid)
     if (vm("/status/current", vmid=vmid) or {}).get("status") != "running":
         raise RuntimeError("sandbox must be running to install agents")
@@ -960,14 +1107,25 @@ def do_install_agents(job, vmid, agents):
     if not wanted:
         raise RuntimeError("pick at least one agent")
 
+    defaults = AGENTS_CFG
+    base_url = (opts.get("base_url") or defaults.get("base_url") or "").strip()
+    api_key = (opts.get("api_key") or defaults.get("api_key") or "").strip()
     cfg = {
-        "api_keys": dict(AGENTS_CFG.get("api_keys") or {}),
-        "hermes": dict(AGENTS_CFG.get("hermes") or {}),
-        "opencode": dict(AGENTS_CFG.get("opencode") or {}),
-        "mcp": dict(AGENTS_CFG.get("mcp") or {}),
+        "api_keys": dict(defaults.get("api_keys") or {}),
+        "hermes": dict(defaults.get("hermes") or {}),
+        "opencode": dict(defaults.get("opencode") or {}),
+        "mcp": dict(defaults.get("mcp") or {}),
+        "base_url": base_url,
+        "api_key": api_key,
     }
-    if not any(cfg["api_keys"].values()):
-        job.log("WARNING: no api_keys in the controller config; the agent installs unconfigured")
+    if opts.get("model"):
+        cfg["hermes"]["model"] = opts["model"]
+        cfg["opencode"]["model"] = opts["model"]
+
+    if base_url:
+        job.log(f"inference endpoint {base_url}" + ("" if api_key else " (no key)"))
+    elif not any(cfg["api_keys"].values()):
+        job.log("WARNING: no endpoint and no api_keys; the agent installs unconfigured")
 
     # Point the agent at the Deskhand on its own machine. Deskhand accepts the
     # token as a query parameter, so this needs no header support from either
@@ -976,22 +1134,49 @@ def do_install_agents(job, vmid, agents):
     m = re.search(r"DESKHAND_TOKEN\s*=\s*'([^']+)'", launcher)
     pm = re.search(r"DESKHAND_PORT\s*=\s*'(\d+)'", launcher)
     if m:
-        port = int(pm.group(1)) if pm else 8791
+        dport = int(pm.group(1)) if pm else 8791
         cfg["mcp"].setdefault(
-            "deskhand", {"url": f"http://127.0.0.1:{port}/mcp?token={m.group(1)}"})
-        job.log(f"agents will get this sandbox's own Deskhand on 127.0.0.1:{port}")
+            "deskhand", {"url": f"http://127.0.0.1:{dport}/mcp?token={m.group(1)}"})
+        job.log(f"agents will get this sandbox's own Deskhand on 127.0.0.1:{dport}")
     else:
         job.log("no Deskhand token found; agents get no local desktop tools")
 
+    dash_pw = ""
+    if "hermes" in wanted:
+        # A non-loopback bind always requires an auth provider, so every
+        # sandbox gets its own dashboard password rather than a shared default.
+        prev = (load_agent_state().get(str(vmid)) or {}).get("dashboard_password")
+        dash_pw = prev or "".join(
+            secrets.choice(string.ascii_letters + string.digits) for _ in range(20))
+        cfg["dashboard_password"] = dash_pw
+        if not prepare_guest_firewall(vmid):
+            job.log("WARNING: could not pre-open the dashboard port")
+
     blob = base64.b64encode(json.dumps(cfg).encode()).decode()
     script = (AGENTS_PS.replace("@@AGENTS@@", ",".join(wanted))
-                       .replace("@@CFG@@", blob))
+                       .replace("@@CFG@@", blob)
+                       .replace("@@WINUSER@@", WIN_USER)
+                       .replace("@@DASHPORT@@", str(DASH_PORT)))
     job.log(f"installing {', '.join(wanted)} as {WIN_USER} (several minutes)")
     out = run_in_guest_as_user(job, vmid, script, timeout=2400)
 
     done = [a for a in wanted if f"{a.upper()}-OK" in out]
+    prev = load_agent_state().get(str(vmid)) or {}
+    state = {
+        "installed": sorted(set((prev.get("installed") or []) + done)),
+        "base_url": base_url,
+        "model": opts.get("model") or "",
+    }
+    if dash_pw:
+        state["dashboard_password"] = dash_pw
+        state["dashboard_port"] = DASH_PORT
+        state["dashboard_user"] = WIN_USER
+    set_agent_state(vmid, state)
+
     job.result = {"vmid": vmid, "installed": done,
                   "log": GUEST_PUBLIC + chr(92) + "sandboxctl-agents.log"}
+    if dash_pw and "hermes" in done:
+        job.log(f"Hermes dashboard: user {WIN_USER} / password {dash_pw}")
     job.log("installed: " + (", ".join(done) or "none"))
 
 
@@ -1221,7 +1406,8 @@ def mcp_call(name, args):
         if vmid is None:
             raise ValueError("vmid is required")
         agents = args.get("agents") or []
-        job = start_job(f"Installing agents on {vmid}", do_install_agents, vmid, agents)
+        opts = {k: args.get(k) for k in ("base_url", "api_key", "model") if args.get(k)}
+        job = start_job(f"Installing agents on {vmid}", do_install_agents, vmid, agents, opts)
         return {"job_id": job.id, "note": "poll job_status; several minutes"}
     if name == "sandbox_call":
         return proxy_call(f"{args['sandbox']}{SEP}{args['tool']}", args.get("arguments") or {})
@@ -1312,6 +1498,13 @@ table{width:100%;border-collapse:collapse}th,td{text-align:left;padding:8px 10px
 th{color:var(--mut);font-weight:500;font-size:12px;text-transform:uppercase;letter-spacing:.04em}
 code{font:12px ui-monospace,Consolas,monospace;background:#0b0d11;padding:2px 6px;border-radius:4px;color:#c9d1d9}
 a{color:var(--acc)}
+.lnk{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+.badge{font:11px ui-monospace,Consolas,monospace;border:1px solid var(--ln);border-radius:999px;padding:1px 8px;color:var(--mut)}
+details.menu{position:relative;display:inline-block}
+details.menu>summary{list-style:none;cursor:pointer;border:1px solid #30363d;border-radius:6px;padding:7px 11px;color:var(--mut);background:#161b22;font-weight:700}
+details.menu>summary::-webkit-details-marker{display:none}
+.mi{display:flex;position:absolute;right:0;top:115%;z-index:30;flex-direction:column;gap:6px;background:#161b22;border:1px solid var(--ln);border-radius:8px;padding:8px;min-width:210px;box-shadow:0 10px 30px rgba(0,0,0,.6)}
+.mi button{width:100%;text-align:left}
 button{background:var(--acc);color:#08111f;border:0;border-radius:6px;padding:8px 14px;font-weight:600;cursor:pointer}
 button.d{background:transparent;color:var(--bad);border:1px solid var(--bad);padding:5px 10px;font-weight:500}
 button:disabled{opacity:.5;cursor:not-allowed}
@@ -1353,12 +1546,14 @@ pre{background:#0b0d11;border:1px solid var(--ln);border-radius:6px;padding:12px
 </div>
 
 <div class="card"><table id="tbl"><thead><tr>
-<th>VMID</th><th>Name</th><th>Status</th><th>Address</th><th>Deskhand</th><th>MCP</th><th></th>
-</tr></thead><tbody id="rows"><tr><td colspan="7" style="color:#8b93a1">loading&hellip;</td></tr></tbody></table></div>
+<th>VMID</th><th>Name</th><th>Status</th><th>Address</th><th>Open</th><th></th>
+</tr></thead><tbody id="rows"><tr><td colspan="6" style="color:#8b93a1">loading&hellip;</td></tr></tbody></table></div>
 
 <div class="card"><div class="warn">
-  <b>Update</b> &mdash; reinstall the staged build on a working sandbox; keeps its token (~25s).<br>
-  <b>Repair / Finish setup</b> &mdash; for a sandbox stuck at a lock screen or with no Deskhand: re-runs auto-logon and installs it. <b>Issues a new token</b> (~3min).<br>
+<b>Open</b> lists what is reachable on a sandbox. <b>Watch</b> is a live view of its screen,
+  <b>Agents</b> installs Hermes or opencode inside it, and <b>&#8943;</b> holds the rest:<br>
+  <b>Update Deskhand</b> &mdash; reinstall the staged build; keeps the token (~25s).<br>
+  <b>Repair / Finish setup</b> &mdash; for a sandbox stuck at a lock screen or with no Deskhand. <b>Issues a new token</b> (~3min).<br>
   <b>Destroy</b> &mdash; permanent; the disk goes too.
 </div></div>
 
@@ -1386,7 +1581,14 @@ pre{background:#0b0d11;border:1px solid var(--ln);border-radius:6px;padding:12px
   <div class="warn" style="margin:6px 0 10px">Installs into the sandbox itself and configures it with
   the API keys from the controller&rsquo;s config, plus this sandbox&rsquo;s own Deskhand as an MCP server
   &mdash; so the agent can drive the desktop it is running on. Several minutes; Hermes is a ~2&nbsp;GB install
-  that brings its own git, python and node.</div>
+  that brings its own git, python and node. Leave the endpoint blank to use the keys in the
+  controller config instead; leave the key blank for a local server that needs none.</div>
+  <div class="grid" style="margin-bottom:12px">
+    <div style="grid-column:span 2"><label>Inference endpoint (OpenAI-compatible)</label>
+      <input id="ag_url" value="@@AGENT_BASEURL@@" placeholder="http://host:11444/v1"></div>
+    <div><label>API key</label><input id="ag_key" placeholder="blank if none"></div>
+    <div><label>Model</label><input id="ag_model" value="@@AGENT_MODEL@@" placeholder="e.g. qwen3-30b"></div>
+  </div>
   <div class="row" style="gap:16px;flex-wrap:wrap;align-items:center">
     <label><input type="checkbox" id="ag_hermes" checked> Hermes</label>
     <label><input type="checkbox" id="ag_opencode" checked> opencode</label>
@@ -1419,25 +1621,55 @@ pre{background:#0b0d11;border:1px solid var(--ln);border-radius:6px;padding:12px
 </div>
 <script>
 let jobId=null;
+// One row is: what it is, what you can open on it, and what you can do to it.
+// Everything destructive or rarely used lives behind the menu so the common
+// actions stay one click away.
+function links(s){
+  if(!s.ip) return '&mdash;';
+  var a=s.agents||{}, inst=a.installed||[], out=[];
+  if(s.token) out.push(`<a href="http://${s.ip}:${s.port||8791}/?token=${s.token}" target="_blank">Deskhand</a>`);
+  if(inst.indexOf('hermes')>=0 && a.dashboard_port)
+    out.push(`<a href="http://${s.ip}:${a.dashboard_port}/" target="_blank" title="Hermes dashboard - sign in as ${a.dashboard_user}; the password is in the menu">Hermes</a>`);
+  if(inst.indexOf('opencode')>=0)
+    out.push('<span class="badge" title="Installed. opencode is a terminal app with no web UI - run it on the desktop (Watch), or point a client at opencode serve.">opencode</span>');
+  return out.length ? out.join('') : '&mdash;';
+}
+function actions(s){
+  var a=s.agents||{}, m=[];
+  if(s.token){
+    m.push(`<button class="d" onclick="copyMcp('claude','${s.name}','${s.ip}',${s.port||8791},'${s.token}')">Copy MCP for Claude</button>`);
+    m.push(`<button class="d" onclick="copyMcp('hermes','${s.name}','${s.ip}',${s.port||8791},'${s.token}')">Copy MCP for Hermes</button>`);
+    m.push(`<button class="d" onclick="copyText('${s.token}','Deskhand token')">Copy Deskhand token</button>`);
+  }
+  if(a.dashboard_password)
+    m.push(`<button class="d" onclick="copyText('${a.dashboard_password}','Dashboard password')">Copy dashboard password</button>`);
+  if(s.token)
+    m.push(`<button class="d" style="color:#d29922;border-color:#d29922" onclick="upd(${s.vmid})">Update Deskhand</button>`);
+  m.push(`<button class="d" style="color:#3fb950;border-color:#3fb950" onclick="rep(${s.vmid})">${s.token?'Repair':'Finish setup'}</button>`);
+  m.push(`<button class="d" style="color:#f85149;border-color:#f85149" onclick="destroy(${s.vmid})">Destroy</button>`);
+  return `<button class="d" style="color:#a371f7;border-color:#a371f7" onclick="watch(${s.vmid},'${s.name}')">Watch</button>
+    <button class="d" style="color:#58a6ff;border-color:#58a6ff" onclick="agentPanel(${s.vmid},'${s.name}')">Agents</button>
+    <details class="menu"><summary>&#8943;</summary><div class="mi">${m.join('')}</div></details>`;
+}
+function row(s){
+  return `<tr><td><code>${s.vmid}</code></td><td>${s.name}</td>
+    <td><span class="st ${s.status==='running'?'r':'s'}"></span>${s.status}</td>
+    <td>${s.ip?`<code>${s.ip}</code>`:'&mdash;'}</td>
+    <td><div class="lnk">${links(s)}</div></td>
+    <td style="text-align:right">${actions(s)}</td></tr>`;
+}
+function copyText(t,what){
+  navigator.clipboard.writeText(t).then(
+    ()=>alert(what+' copied to clipboard.'),
+    ()=>prompt(what+':',t));
+}
 async function refresh(){
  try{
   const r=await fetch('api/sandboxes');
   if(!r.ok) throw new Error('HTTP '+r.status);
   const d=await r.json();
-  document.getElementById('rows').innerHTML = d.length ? d.map(s=>`
-    <tr><td><code>${s.vmid}</code></td><td>${s.name}</td>
-    <td><span class="st ${s.status==='running'?'r':'s'}"></span>${s.status}</td>
-    <td>${s.ip?`<code>${s.ip}</code>`:'&mdash;'}</td>
-    <td>${s.ip&&s.token?`<a href="http://${s.ip}:8791/?token=${s.token}" target="_blank">open</a> <code>${s.token.slice(0,10)}&hellip;</code>`:'&mdash;'}</td>
-    <td>${s.ip&&s.token?`<button class="d" style="color:#4a9eff;border-color:#4a9eff" title="Point Claude Code straight at this one sandbox." onclick="copyMcp('claude','${s.name}','${s.ip}',${s.port||8791},'${s.token}')">claude</button> <button class="d" style="color:#3fb950;border-color:#3fb950" title="Point Hermes straight at this one sandbox." onclick="copyMcp('hermes','${s.name}','${s.ip}',${s.port||8791},'${s.token}')">hermes</button>`:'&mdash;'}</td>
-    <td style="text-align:right">${s.token
-      ? `<button class="d" style="color:#d29922;border-color:#d29922" title="Reinstall the staged Deskhand build on this sandbox. Keeps its existing token, so any MCP client stays working. ~25s." onclick="upd(${s.vmid})">Update</button>`
-      : `<button class="d" style="color:#3fb950;border-color:#3fb950" title="This sandbox has no working Deskhand - its build was interrupted. Finishes auto-logon and installs Deskhand. Issues a NEW token. ~3min." onclick="rep(${s.vmid})">Finish setup</button>`}
-    <button class="d" style="color:#58a6ff;border-color:#58a6ff" title="Install an AI agent inside this sandbox, configured with your API keys and its own Deskhand." onclick="agentPanel(${s.vmid},'${s.name}')">Agents</button>
-    <button class="d" style="color:#a371f7;border-color:#a371f7" title="Watch this sandbox's screen live." onclick="watch(${s.vmid},'${s.name}')">Watch</button>
-    <button class="d" style="color:#8b949e;border-color:#8b949e" title="Reinstall from scratch: re-runs auto-logon and the Deskhand install. Issues a NEW token. Use when a sandbox is stuck or broken." onclick="rep(${s.vmid})">Repair</button>
-    <button class="d" onclick="destroy(${s.vmid})">Destroy</button></td></tr>`).join('')
-    : '<tr><td colspan="7" style="color:#8b93a1">No sandboxes yet.</td></tr>';
+  document.getElementById('rows').innerHTML = d.length ? d.map(row).join('')
+    : '<tr><td colspan="6" style="color:#8b93a1">No sandboxes yet.</td></tr>';
  }catch(e){
   document.getElementById('rows').innerHTML =
     '<tr><td colspan="7" style="color:#f85149">Could not load: '+e.message+'</td></tr>';
@@ -1539,8 +1771,14 @@ async function installAgents(){
   if(document.getElementById('ag_opencode').checked) list.push('opencode');
   if(!list.length){ alert('Pick at least one agent.'); return; }
   document.getElementById('agentcard').style.display='none';
-  const r=await fetch('api/agents',{method:'POST',
-    body:JSON.stringify({vmid:agvm,agents:list})});
+  const body={vmid:agvm,agents:list};
+  var u=document.getElementById('ag_url').value.trim();
+  var k=document.getElementById('ag_key').value.trim();
+  var md=document.getElementById('ag_model').value.trim();
+  if(u) body.base_url=u;
+  if(k) body.api_key=k;
+  if(md) body.model=md;
+  const r=await fetch('api/agents',{method:'POST',body:JSON.stringify(body)});
   const d=await r.json(); jobId=d.id; poll();
 }
 async function upd(vmid){
@@ -1604,7 +1842,12 @@ class Handler(BaseHTTPRequestHandler):
         p = urllib.parse.urlparse(self.path)
         if p.path in ("/", "/index.html"):
             return self._send(200, PAGE.replace("@@PVEHOST@@", HOST)
-                              .replace("@@PVENODE@@", NODE),
+                              .replace("@@PVENODE@@", NODE)
+                              .replace("@@AGENT_BASEURL@@",
+                                       html.escape(AGENTS_CFG.get("base_url") or "", quote=True))
+                              .replace("@@AGENT_MODEL@@",
+                                       html.escape((AGENTS_CFG.get("hermes") or {}).get("model") or "",
+                                                   quote=True)),
                               "text/html; charset=utf-8")
         if p.path == "/api/sandboxes":
             try:
@@ -1765,8 +2008,9 @@ class Handler(BaseHTTPRequestHandler):
             job = start_job("Fetching Deskhand", do_fetch, (body.get("tag") or None))
             return self._send(200, json.dumps({"id": job.id}))
         if p.path == "/api/agents":
+            opts = {k: body.get(k) for k in ("base_url", "api_key", "model") if body.get(k)}
             job = start_job(f"Installing agents on {body.get('vmid')}",
-                            do_install_agents, body.get("vmid"), body.get("agents") or [])
+                            do_install_agents, body.get("vmid"), body.get("agents") or [], opts)
             return self._send(200, json.dumps({"id": job.id}))
         if p.path == "/api/repair":
             job = start_job(f"Repairing {body.get('vmid')}", do_repair, body.get("vmid"))

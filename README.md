@@ -187,10 +187,19 @@ no toolchain at all.
 
 Each agent is seeded with:
 
-- the provider keys from `agents.api_keys` in the controller config, set as user
-  environment variables and, for Hermes, written to its `.env`
-- the model named in `agents.hermes.model` / `agents.opencode.model`
+- an **inference endpoint** -- any OpenAI-compatible server (llama.cpp, vLLM,
+  Ollama, LM Studio). Set it per install in the UI, or default it with
+  `agents.base_url`. Hermes gets `model.provider: custom` plus `model.base_url`;
+  opencode gets a `provider` entry using `@ai-sdk/openai-compatible`. The key is
+  optional -- a local server that wants none just gets `not-needed`.
+- the model name, and the provider keys from `agents.api_keys` if you use a
+  hosted provider instead (written to Hermes's `.env`, never to `config.yaml`)
 - **that sandbox's own Deskhand as an MCP server**, on `127.0.0.1`
+
+Hermes also gets its web dashboard started as a logon task, with a password
+generated per sandbox. The sandbox row then links straight to it. opencode has
+no web UI -- `opencode serve` is a headless API -- so it shows as installed and
+you drive it on the desktop.
 
 That last one is the interesting part. An agent running inside the sandbox
 cannot reach the controller's MCP endpoint -- the firewall rule blocks the
@@ -207,6 +216,17 @@ Two things worth knowing before you turn this on:
   its own spend limit.
 - **Anything installed in the guest runs as the sandbox user**, which is a local
   administrator. That is fine for a throwaway VM and nowhere else.
+- **A LAN endpoint needs a hole in the isolation.** Sandboxes are blocked from
+  the whole of `192.168.0.0/16` by the `sandbox` security group, so an inference
+  server on your LAN is unreachable until you allow it. Keep the exception to one
+  host and one port, and put it *above* the DROP rules:
+
+  ```sh
+  pvesh create /cluster/firewall/groups/sandbox --type out --action ACCEPT       --dest 10.0.0.5 --dport 11444 --proto tcp --enable 1 --pos 0       --comment 'inference endpoint for in-sandbox agents'
+  ```
+
+  The controller's own token cannot do this -- it has no cluster firewall
+  rights, deliberately -- so it is a one-time admin change.
 
 ## Security model
 
