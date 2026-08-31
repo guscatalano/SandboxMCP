@@ -217,6 +217,14 @@ keep everything.
 its own. An 8k-context model cannot hold that plus a system prompt, and the
 agent will behave as though the tools are not there.
 
+The picker shows each model's context, and warns below 32k. Note that the
+*served* window and the model's *ceiling* are different numbers: a tag pinned to
+`num_ctx=8192` still advertises whatever the weights support, so a model listed
+as 262,144-capable may be answering with 8,192. Ollama-style servers report the
+served window on `/api/ps`; the install passes it to Hermes as
+`model.context_length`, which is where it decides to compress history. Left to
+auto-detect it reads the ceiling and overflows.
+
 Hermes also gets its web dashboard started as a logon task, with a password
 generated per sandbox. The sandbox row then links straight to it. opencode has
 no web UI -- `opencode serve` is a headless API -- so it shows as installed and

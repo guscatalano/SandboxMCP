@@ -652,6 +652,10 @@ MCP_TOOLS = [
                     "controller config. Leave the key empty if the server needs none.")},
                 "api_key": {"type": "string", "description": "Optional key for that endpoint"},
                 "model": {"type": "string", "description": "Model name to select, e.g. qwen3-30b"},
+                "context_length": {"type": "integer", "description": (
+                    "The context window the server actually serves this model with. Worth "
+                    "setting for a local server whose tag pins a custom num_ctx, since "
+                    "/v1/models advertises the model ceiling instead.")},
             },
             "required": ["vmid", "agents"],
         },
@@ -828,6 +832,10 @@ if ($want -contains 'hermes') {
     if ($cfg.hermes -and $cfg.hermes.model) {
         & $exe config set model.default $cfg.hermes.model 2>&1 | Out-Null
         Write-Output ('  hermes model ' + $cfg.hermes.model)
+    }
+    if ($cfg.hermes -and $cfg.hermes.context_length) {
+        & $exe config set model.context_length ([string]$cfg.hermes.context_length) 2>&1 | Out-Null
+        Write-Output ('  context_length ' + $cfg.hermes.context_length)
     }
 
     if ($cfg.mcp) {
@@ -1162,6 +1170,15 @@ def do_install_agents(job, vmid, agents, opts=None):
     if opts.get("model"):
         cfg["hermes"]["model"] = opts["model"]
         cfg["opencode"]["model"] = opts["model"]
+    # Hermes auto-detects the window, and gets it wrong against a local server
+    # whose tag pins a custom num_ctx: /v1/models advertises the model ceiling,
+    # not the size it was actually loaded with. Telling it the served number
+    # puts history compression at the right threshold instead of overflowing.
+    if opts.get("context_length"):
+        try:
+            cfg["hermes"]["context_length"] = int(opts["context_length"])
+        except (TypeError, ValueError):
+            pass
     cfg["hermes"].setdefault("disable_toolsets", DEFAULT_OFF)
 
     if base_url:
@@ -1259,6 +1276,32 @@ def fetch_models(base_url, timeout=12):
             "size_mb": m.get("size_mb"),
             "state": m.get("proxy_state") or "",
         })
+    # Context size is the thing that decides whether an agent works here at
+    # all: ~83 Deskhand tools is roughly 8k tokens of schema before a word is
+    # said. Ollama-style servers report the *served* window on /api/ps and the
+    # model's ceiling on /api/tags, and the two differ -- a tag pinned to
+    # num_ctx=8192 still advertises a 262144 maximum. Both are best-effort:
+    # a server that offers neither simply shows no context.
+    root = base_url.rstrip("/")
+    if root.endswith("/v1"):
+        root = root[:-3]
+    loaded_ctx, max_ctx = {}, {}
+    for path, sink, key in (("/api/ps", loaded_ctx, "context_length"),
+                            ("/api/tags", max_ctx, None)):
+        try:
+            with urllib.request.urlopen(root + path, timeout=6) as r:
+                for m in (json.loads(r.read().decode("utf-8", "replace")).get("models") or []):
+                    n = m.get("name")
+                    if not n:
+                        continue
+                    sink[n] = m.get(key) if key else (m.get("details") or {}).get("context_length")
+        except Exception:
+            pass
+
+    for e in out:
+        e["ctx_loaded"] = loaded_ctx.get(e["id"])
+        e["ctx_max"] = max_ctx.get(e["id"])
+
     out.sort(key=lambda e: (not e["loaded"], e["id"].lower()))
     return out
 
@@ -1475,7 +1518,8 @@ def mcp_call(name, args):
         if vmid is None:
             raise ValueError("vmid is required")
         agents = args.get("agents") or []
-        opts = {k: args.get(k) for k in ("base_url", "api_key", "model") if args.get(k)}
+        opts = {k: args.get(k) for k in ("base_url", "api_key", "model", "context_length")
+                if args.get(k)}
         job = start_job(f"Installing agents on {vmid}", do_install_agents, vmid, agents, opts)
         return {"job_id": job.id, "note": "poll job_status; several minutes"}
     if name == "sandbox_call":
@@ -1862,7 +1906,7 @@ async function create(){
   const r=await fetch('api/create',{method:'POST',body:JSON.stringify(body)});
   const d=await r.json(); jobId=d.id; poll();
 }
-var agvm=null;
+var agvm=null, MODEL_CTX={};
 function agentPanel(vmid,name){
   agvm=vmid;
   document.getElementById('agenttitle').textContent='Install agents in '+name+' (vmid '+vmid+')';
@@ -1887,12 +1931,20 @@ async function loadModels(){
     if(!d.models.length){ note.textContent=d.base_url?'no models reported by '+d.base_url:'no endpoint set'; return; }
     list.innerHTML=d.models.map(function(m){
       var gb=m.size_mb?(' \u00b7 '+(m.size_mb/1024).toFixed(1)+' GB'):'';
-      return '<option value="'+m.id+'">'+(m.loaded?'loaded':'available')+gb+'</option>';
+      var c=m.ctx_loaded||m.ctx_max;
+      var ctx=c?(' \u00b7 '+(c>=1024?Math.round(c/1024)+'k':c)+' ctx'):'';
+      return '<option value="'+m.id+'">'+(m.loaded?'loaded':'available')+ctx+gb+'</option>';
     }).join('');
+    // Remember the served window so the install can tell Hermes where its
+    // compression threshold really is.
+    MODEL_CTX={}; d.models.forEach(function(m){ MODEL_CTX[m.id]=m.ctx_loaded||m.ctx_max||0; });
     var loaded=d.models.filter(function(m){return m.loaded;});
     var box=document.getElementById('ag_model');
     if(!box.value) box.value=(loaded[0]||d.models[0]).id;
-    note.textContent=d.models.length+' model'+(d.models.length===1?'':'s')+' at '+d.base_url+
+    var pick=MODEL_CTX[box.value]||0;
+    var warn=(pick&&pick<32768)?((pick>=1024?Math.round(pick/1024)+'k':pick)+
+      ' context may be too small (Deskhand alone is ~83 tools)  \u00b7  '):'';
+    note.textContent=warn+d.models.length+' model'+(d.models.length===1?'':'s')+' at '+d.base_url+
       (loaded.length?('  \u00b7  loaded: '+loaded.map(function(m){return m.id;}).join(', ')):'  \u00b7  none loaded');
   }catch(e){ note.textContent='could not list models: '+e.message; }
 }
@@ -1910,6 +1962,7 @@ async function installAgents(){
   if(u) body.base_url=u;
   if(k) body.api_key=k;
   if(md) body.model=md;
+  if(MODEL_CTX[md]) body.context_length=MODEL_CTX[md];
   const r=await fetch('api/agents',{method:'POST',body:JSON.stringify(body)});
   const d=await r.json(); jobId=d.id; poll();
 }
@@ -2153,7 +2206,8 @@ class Handler(BaseHTTPRequestHandler):
             job = start_job("Fetching Deskhand", do_fetch, (body.get("tag") or None))
             return self._send(200, json.dumps({"id": job.id}))
         if p.path == "/api/agents":
-            opts = {k: body.get(k) for k in ("base_url", "api_key", "model") if body.get(k)}
+            opts = {k: body.get(k) for k in ("base_url", "api_key", "model", "context_length")
+                    if body.get(k)}
             job = start_job(f"Installing agents on {body.get('vmid')}",
                             do_install_agents, body.get("vmid"), body.get("agents") or [], opts)
             return self._send(200, json.dumps({"id": job.id}))
