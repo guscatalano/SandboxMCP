@@ -202,7 +202,20 @@ Each agent is seeded with:
   come back all-equal and sort alphabetically.
 - the model name, and the provider keys from `agents.api_keys` if you use a
   hosted provider instead (written to Hermes's `.env`, never to `config.yaml`)
-- **that sandbox's own Deskhand as an MCP server**, on `127.0.0.1`
+- **that sandbox's own Deskhand as an MCP server.** The address is resolved
+  inside the guest, not on the controller: Deskhand binds to the machine's own
+  IPv4 and never to loopback, so a `127.0.0.1` URL is refused outright.
+
+Hermes's built-in toolsets are also trimmed on install. It ships 16 of them --
+36 KB of tool schema before Deskhand contributes its own 83 tools -- and on a
+small local model the schemas alone can exceed the whole context window. `file`,
+`terminal` and `code_execution` are kept, because inside a sandbox they act on
+the sandbox, which is the point. Set `agents.hermes.disable_toolsets` to `[]` to
+keep everything.
+
+**Pick a model with room.** 83 Deskhand tools is roughly 8k tokens of schema on
+its own. An 8k-context model cannot hold that plus a system prompt, and the
+agent will behave as though the tools are not there.
 
 Hermes also gets its web dashboard started as a logon task, with a password
 generated per sandbox. The sandbox row then links straight to it. opencode has

@@ -773,6 +773,27 @@ if ($cfg.base_url) {
 }
 if ($cfg.api_key) { Set-UserEnv 'OPENAI_API_KEY' $cfg.api_key }
 
+# Deskhand binds to the machine's own IPv4 and never to loopback -- see its
+# launcher -- so a 127.0.0.1 URL is refused outright. Resolve the same address
+# its launcher picks, here rather than on the controller, so the entry stays
+# correct whatever address this clone was leased.
+if ($cfg.deskhand -and $cfg.deskhand.token) {
+    $dip = (Get-NetIPAddress -AddressFamily IPv4 |
+            Where-Object { $_.IPAddress -notlike '127.*' -and $_.IPAddress -notlike '169.254.*' } |
+            Select-Object -First 1).IPAddress
+    if ($dip) {
+        $durl = 'http://' + $dip + ':' + $cfg.deskhand.port + '/mcp?token=' + $cfg.deskhand.token
+        if (-not $cfg.mcp) {
+            $cfg | Add-Member -NotePropertyName mcp -NotePropertyValue ([pscustomobject]@{}) -Force
+        }
+        $cfg.mcp | Add-Member -NotePropertyName deskhand `
+                   -NotePropertyValue ([pscustomobject]@{ url = $durl }) -Force
+        Write-Output ('  deskhand mcp -> http://' + $dip + ':' + $cfg.deskhand.port + '/mcp')
+    } else {
+        Write-Output '  no usable IPv4; skipping the deskhand mcp entry'
+    }
+}
+
 # ---------------------------------------------------------------- Hermes ---
 if ($want -contains 'hermes') {
     $hh  = Join-Path $env:LOCALAPPDATA 'hermes'
@@ -823,6 +844,21 @@ if ($want -contains 'hermes') {
             } catch {
                 Write-Output ('  mcp ' + $m.Name + ' failed: ' + $_.Exception.Message)
             }
+        }
+    }
+
+    # Hermes ships 16 toolsets on by default, 36 KB of schema before Deskhand
+    # adds its own. Inside a sandbox most of them are noise -- and on a small
+    # local model the schemas alone can exceed the whole context window. file,
+    # terminal and code_execution are kept: here they act on the sandbox, which
+    # is the point.
+    if ($cfg.hermes -and $cfg.hermes.disable_toolsets) {
+        $off = @($cfg.hermes.disable_toolsets) -join ' '
+        if ($off) {
+            try {
+                & $exe tools disable @($cfg.hermes.disable_toolsets) 2>&1 | Out-Null
+                Write-Output ('  toolsets off: ' + $off)
+            } catch { Write-Output ('  could not disable toolsets: ' + $_.Exception.Message) }
         }
     }
 
@@ -1110,6 +1146,11 @@ def do_install_agents(job, vmid, agents, opts=None):
     defaults = AGENTS_CFG
     base_url = (opts.get("base_url") or defaults.get("base_url") or "").strip()
     api_key = (opts.get("api_key") or defaults.get("api_key") or "").strip()
+    # Overridable: set agents.hermes.disable_toolsets to [] to keep them all.
+    DEFAULT_OFF = ["web", "browser", "image_gen", "tts", "video", "video_gen",
+                   "x_search", "stt", "homeassistant", "spotify", "yuanbao",
+                   "delegation", "cronjob", "session_search", "skills", "memory",
+                   "todo", "clarify", "vision"]
     cfg = {
         "api_keys": dict(defaults.get("api_keys") or {}),
         "hermes": dict(defaults.get("hermes") or {}),
@@ -1121,6 +1162,7 @@ def do_install_agents(job, vmid, agents, opts=None):
     if opts.get("model"):
         cfg["hermes"]["model"] = opts["model"]
         cfg["opencode"]["model"] = opts["model"]
+    cfg["hermes"].setdefault("disable_toolsets", DEFAULT_OFF)
 
     if base_url:
         job.log(f"inference endpoint {base_url}" + ("" if api_key else " (no key)"))
@@ -1134,10 +1176,10 @@ def do_install_agents(job, vmid, agents, opts=None):
     m = re.search(r"DESKHAND_TOKEN\s*=\s*'([^']+)'", launcher)
     pm = re.search(r"DESKHAND_PORT\s*=\s*'(\d+)'", launcher)
     if m:
-        dport = int(pm.group(1)) if pm else 8791
-        cfg["mcp"].setdefault(
-            "deskhand", {"url": f"http://127.0.0.1:{dport}/mcp?token={m.group(1)}"})
-        job.log(f"agents will get this sandbox's own Deskhand on 127.0.0.1:{dport}")
+        # Only the port and token travel; the guest resolves the host, because
+        # Deskhand listens on the machine's IPv4 rather than on loopback.
+        cfg["deskhand"] = {"port": int(pm.group(1)) if pm else 8791, "token": m.group(1)}
+        job.log("agents will get this sandbox's own Deskhand as an MCP server")
     else:
         job.log("no Deskhand token found; agents get no local desktop tools")
 
