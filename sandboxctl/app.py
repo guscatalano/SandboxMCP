@@ -1530,10 +1530,16 @@ a{color:var(--acc)}
 details.menu{position:relative;display:inline-block}
 details.menu>summary{list-style:none;cursor:pointer;border:1px solid #30363d;border-radius:6px;padding:7px 11px;color:var(--mut);background:#161b22;font-weight:700}
 details.menu>summary::-webkit-details-marker{display:none}
-.mi{display:flex;position:absolute;right:0;top:115%;z-index:30;flex-direction:column;gap:6px;background:#161b22;border:1px solid var(--ln);border-radius:8px;padding:8px;min-width:210px;box-shadow:0 10px 30px rgba(0,0,0,.6)}
-.mi button{width:100%;text-align:left}
+.mi{display:flex;position:absolute;right:0;top:115%;z-index:30;flex-direction:column;gap:6px;background:#161b22;border:1px solid var(--ln);border-radius:8px;padding:8px;min-width:226px;text-align:left;box-shadow:0 10px 30px rgba(0,0,0,.6)}
+/* .d with no inline colour is the destructive style; menu entries are not. */
+.mi button.d{width:100%;text-align:left;color:#c9d1d9;border-color:#30363d}
+.mi button.d.warnish{color:#d29922;border-color:#d29922}
+.mi button.d.okish{color:#3fb950;border-color:#3fb950}
+.mi button.d.badish{color:#f85149;border-color:#f85149}
 label.opt{display:inline-flex;align-items:center;gap:7px;white-space:nowrap;color:var(--fg);font-size:14px;text-transform:none;letter-spacing:0}
 label.opt input{width:auto;margin:0}
+.cred{text-align:left;font:12px/1.6 ui-sans-serif,system-ui,sans-serif;color:var(--mut);padding:2px 4px 8px;border-bottom:1px solid var(--ln);margin-bottom:4px}
+.cred code{font-size:11px}
 button{background:var(--acc);color:#08111f;border:0;border-radius:6px;padding:8px 14px;font-weight:600;cursor:pointer}
 button.d{background:transparent;color:var(--bad);border:1px solid var(--bad);padding:5px 10px;font-weight:500}
 button:disabled{opacity:.5;cursor:not-allowed}
@@ -1674,12 +1680,17 @@ function actions(s){
     m.push(`<button class="d" onclick="copyMcp('hermes','${s.name}','${s.ip}',${s.port||8791},'${s.token}')">Copy MCP for Hermes</button>`);
     m.push(`<button class="d" onclick="copyText('${s.token}','Deskhand token')">Copy Deskhand token</button>`);
   }
-  if(a.dashboard_password)
+  if(a.dashboard_password){
+    // Readable, not just copyable: a password you can only copy is a password
+    // you cannot check.
+    m.push(`<div class="cred">Hermes dashboard sign-in<br>
+      user <code>${a.dashboard_user||'sandbox'}</code><br>pass <code>${a.dashboard_password}</code></div>`);
     m.push(`<button class="d" onclick="copyText('${a.dashboard_password}','Dashboard password')">Copy dashboard password</button>`);
+  }
   if(s.token)
-    m.push(`<button class="d" style="color:#d29922;border-color:#d29922" onclick="upd(${s.vmid})">Update Deskhand</button>`);
-  m.push(`<button class="d" style="color:#3fb950;border-color:#3fb950" onclick="rep(${s.vmid})">${s.token?'Repair':'Finish setup'}</button>`);
-  m.push(`<button class="d" style="color:#f85149;border-color:#f85149" onclick="destroy(${s.vmid})">Destroy</button>`);
+    m.push(`<button class="d warnish" onclick="upd(${s.vmid})">Update Deskhand</button>`);
+  m.push(`<button class="d okish" onclick="rep(${s.vmid})">${s.token?'Repair':'Finish setup'}</button>`);
+  m.push(`<button class="d badish" onclick="destroy(${s.vmid})">Destroy</button>`);
   return `<button class="d" style="color:#a371f7;border-color:#a371f7" onclick="watch(${s.vmid},'${s.name}')">Watch</button>
     <button class="d" style="color:#58a6ff;border-color:#58a6ff" onclick="agentPanel(${s.vmid},'${s.name}')">Agents</button>
     <details class="menu"><summary>&#8943;</summary><div class="mi">${m.join('')}</div></details>`;
@@ -1691,10 +1702,35 @@ function row(s){
     <td><div class="lnk">${links(s)}</div></td>
     <td style="text-align:right">${actions(s)}</td></tr>`;
 }
-function copyText(t,what){
-  navigator.clipboard.writeText(t).then(
-    ()=>alert(what+' copied to clipboard.'),
-    ()=>prompt(what+':',t));
+// navigator.clipboard exists only in a SECURE context, and this UI is served
+// over plain http. Touching it throws synchronously -- before any .then()
+// handler can run -- which is why every copy button silently did nothing.
+// So: feature-detect, fall back to a scratch textarea, and fall back again to
+// a prompt, which at least puts the value on screen where it can be read.
+function copyText(t,what,extra){
+  var shown=(what||'Value')+' copied to clipboard:'+String.fromCharCode(10,10)+t+(extra||'');
+  function viaTextarea(){
+    try{
+      var ta=document.createElement('textarea');
+      ta.value=t; ta.setAttribute('readonly','');
+      ta.style.position='fixed'; ta.style.top='-1000px'; ta.style.opacity='0';
+      document.body.appendChild(ta);
+      ta.select(); ta.setSelectionRange(0,t.length);
+      var ok=document.execCommand('copy');
+      document.body.removeChild(ta);
+      if(ok){ alert(shown); return true; }
+    }catch(e){}
+    return false;
+  }
+  try{
+    if(window.isSecureContext && navigator.clipboard && navigator.clipboard.writeText){
+      navigator.clipboard.writeText(t).then(
+        function(){ alert(shown); },
+        function(){ if(!viaTextarea()) prompt((what||'Value')+' (copy it):',t); });
+      return;
+    }
+  }catch(e){}
+  if(!viaTextarea()) prompt((what||'Value')+' (copy it):',t);
 }
 async function refresh(){
  try{
@@ -1722,10 +1758,7 @@ function showHub(){
     '# Claude Code\\n'+hubCmd('claude')+'\\n\\n# Hermes\\n'+hubCmd('hermes');
 }
 function copyHub(kind){
-  const cmd=hubCmd(kind);
-  navigator.clipboard.writeText(cmd).then(
-    ()=>alert('Copied to clipboard:\\n\\n'+cmd),
-    ()=>prompt('Copy this:',cmd));
+  copyText(hubCmd(kind),'Command');
 }
 function copyMcp(kind,name,ip,port,token){
   const url=`http://${ip}:${port}/mcp`;
@@ -1737,9 +1770,7 @@ function copyMcp(kind,name,ip,port,token){
   const note = kind==='hermes'
     ? `\\n\\nHermes will ask "Does this server require authentication?" - answer yes,\\nchoose a header, and give it:\\n\\n  Authorization: Bearer ${token}`
     : '';
-  navigator.clipboard.writeText(cmd).then(
-    ()=>alert('Copied to clipboard:\\n\\n'+cmd+note),
-    ()=>prompt('Copy this:',cmd));
+  copyText(cmd,'MCP command',note);
 }
 var wvm=null, wname='';
 function watch(vmid,name){
