@@ -844,6 +844,10 @@ if ($want -contains 'hermes') {
         & $exe config set model.context_length ([string]$cfg.hermes.context_length) 2>&1 | Out-Null
         Write-Output ('  context_length ' + $cfg.hermes.context_length)
     }
+    if ($cfg.hermes -and $cfg.hermes.mcp_result_size_chars) {
+        & $exe config set tool_budget.mcp_result_size_chars ([string]$cfg.hermes.mcp_result_size_chars) 2>&1 | Out-Null
+        Write-Output ('  mcp result cap ' + $cfg.hermes.mcp_result_size_chars + ' chars')
+    }
 
     if ($cfg.mcp) {
         # Deliberately NOT 'hermes mcp add': it asks whether the server needs
@@ -1225,11 +1229,25 @@ def do_install_agents(job, vmid, agents, opts=None):
     # whose tag pins a custom num_ctx: /v1/models advertises the model ceiling,
     # not the size it was actually loaded with. Telling it the served number
     # puts history compression at the right threshold instead of overflowing.
+    ctx = 0
     if opts.get("context_length"):
         try:
-            cfg["hermes"]["context_length"] = int(opts["context_length"])
+            ctx = int(opts["context_length"])
+            cfg["hermes"]["context_length"] = ctx
         except (TypeError, ValueError):
-            pass
+            ctx = 0
+
+    # Hermes caps a single MCP tool result at 50k characters and, unlike its
+    # built-in tools, does NOT scale that to the context window -- so on a 262k
+    # model a large UI tree comes back truncated to a 1.5k preview while most of
+    # the window sits unused. Deskhand IS the toolset here, so raise it, using
+    # the same fraction Hermes applies to its own tools (0.15 of the window,
+    # 4 chars per token) and the same 8k floor.
+    override = (defaults.get("hermes") or {}).get("mcp_result_size_chars")
+    if override:
+        cfg["hermes"]["mcp_result_size_chars"] = int(override)
+    elif ctx:
+        cfg["hermes"]["mcp_result_size_chars"] = max(8_000, min(150_000, int(ctx * 4 * 0.15)))
     cfg["hermes"].setdefault("disable_toolsets", DEFAULT_OFF)
 
     if base_url:
