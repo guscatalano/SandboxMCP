@@ -67,6 +67,9 @@ WIN_PASS = CONFIG["windows_password"]
 # agent, and any extra MCP servers. Absent or empty just means the agent is
 # installed unconfigured.
 AGENTS_CFG = CONFIG.get("agents") or {}
+# Matches the default agent-side MCP cap, so Deskhand spills to its OutputStore
+# at the same point the client would otherwise start discarding.
+DESKHAND_TOOL_CHARS = int(CONFIG.get("deskhand_max_tool_chars") or 150000)
 
 _SSL = ssl.create_default_context()
 _SSL.check_hostname = False
@@ -435,6 +438,12 @@ if (-not `$ip) { `$ip = 'any' }
 `$env:DESKHAND_BIND  = `$ip
 `$env:DESKHAND_TOKEN = '@@TOKEN@@'
 `$env:DESKHAND_PORT  = '@@PORT@@'
+# Cap a single tool result. Deskhand 0.2.7+ does not truncate: past this it
+# stores the full text and returns a small valid envelope instead. Worth setting
+# to whatever the CLIENT will accept -- Hermes trims an MCP result above its own
+# cap to a 1.5k preview, so a Deskhand budget larger than that just guarantees
+# the client throws the difference away.
+`$env:DESKHAND_MAX_TOOL_CHARS = '@@TOOLCHARS@@'
 @@SHELL_LINE@@
 @@TLS_LINE@@
 Set-Location '$dir'
@@ -547,7 +556,8 @@ def provision(job, vmid, opts, configure_hw=True):
               .replace("@@PORT@@", str(opts["port"]))
               .replace("@@SHELL_LINE@@", shell_line)
               .replace("@@TLS_LINE@@", tls_line)
-              .replace("@@USER@@", WIN_USER))
+              .replace("@@USER@@", WIN_USER)
+              .replace("@@TOOLCHARS@@", str(DESKHAND_TOOL_CHARS)))
     job.log(f"installing Deskhand from the controller ({asset})")
     out = agent_run_ps(vmid, script, timeout=900)
     if not out or "INSTALLED" not in out:
@@ -1074,7 +1084,8 @@ def do_update(job, vmid):
               .replace("@@PORT@@", str(port))
               .replace("@@SHELL_LINE@@", "`$env:DESKHAND_ENABLE_SHELL = '1'" if shell else "")
               .replace("@@TLS_LINE@@", "`$env:DESKHAND_TLS = 'self-signed'" if tls else "")
-              .replace("@@USER@@", WIN_USER))
+              .replace("@@USER@@", WIN_USER)
+              .replace("@@TOOLCHARS@@", str(DESKHAND_TOOL_CHARS)))
     job.log(f"installing {asset}")
     run_install(job, vmid, script)
     after = read_token(vmid, refresh=True)

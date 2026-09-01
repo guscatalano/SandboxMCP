@@ -27,6 +27,9 @@
   "windows_user": "sandbox",
   "windows_password": "change-me",
 
+  "_comment_toolchars": "Cap on a single Deskhand tool result. 0.2.7+ does not truncate past this -- it stores the full text and returns a small valid envelope. Keep it equal to the agent-side MCP cap: a larger budget here only guarantees the client discards the difference.",
+  "deskhand_max_tool_chars": 150000,
+
   "github_repo": "guscatalano/Deskhand",
 
   "_comment_agents": "Optional. Seeds an AI agent installed INSIDE a sandbox (see the Agents button / install_agents tool). The keys are written to the sandbox's environment and to Hermes's .env; every sandbox also gets its own Deskhand added as an MCP server automatically, so the agent can drive the desktop it runs on. Leave empty to install unconfigured.",
