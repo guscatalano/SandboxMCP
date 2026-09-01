@@ -894,13 +894,24 @@ $env:HERMES_DASHBOARD_BASIC_AUTH_PASSWORD = '__PASS__'
         $da = New-ScheduledTaskAction -Execute 'powershell.exe' `
               -Argument ('-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "' + $runner + '"')
         $dt = New-ScheduledTaskTrigger -AtLogOn -User '@@WINUSER@@'
+        # A keepalive trigger, not just a restart-on-failure policy. The
+        # dashboard has been observed dying with STATUS_CONTROL_C_EXIT -- a
+        # console-control kill rather than a fault -- and the failure policy did
+        # not bring it back. A trigger that simply fires every five minutes does,
+        # because MultipleInstances=IgnoreNew makes the firing a no-op whenever
+        # the dashboard is already running. Cheap, and it cannot get stuck.
+        # Ten years rather than TimeSpan::MaxValue -- the scheduler rejects the
+        # latter outright with "task XML contains a value which is incorrectly
+        # formatted or out of range".
+        $rep = New-ScheduledTaskTrigger -Once -At (Get-Date) `
+               -RepetitionInterval (New-TimeSpan -Minutes 5) `
+               -RepetitionDuration (New-TimeSpan -Days 3650)
         $dp = New-ScheduledTaskPrincipal -UserId '@@WINUSER@@' -LogonType Interactive -RunLevel Limited
-        # It is a server, so no execution time limit; and bring it back if it
-        # exits on its own rather than leaving it down until the next logon.
+        # It is a server, so no execution time limit.
         $ds = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
-              -ExecutionTimeLimit ([TimeSpan]::Zero) `
+              -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew `
               -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1)
-        Register-ScheduledTask -TaskName 'HermesDashboard' -Action $da -Trigger $dt `
+        Register-ScheduledTask -TaskName 'HermesDashboard' -Action $da -Trigger @($dt, $rep) `
               -Principal $dp -Settings $ds -Force | Out-Null
 
         # Stop the previous instance and WAIT for the scheduler to agree it has
@@ -1126,8 +1137,14 @@ def run_in_guest_as_user(job, vmid, script, timeout=2400):
         "$b = (New-Object IO.StreamReader($gs)).ReadToEnd()\n"
         "Set-Content -LiteralPath '" + ps1 + "' -Value $b -Encoding UTF8\n"
         "Remove-Item -LiteralPath '" + log + "' -Force -ErrorAction SilentlyContinue\n"
+        # -WindowStyle Hidden matters more than it looks: this console is a
+        # window on the very desktop the agent automates, and Deskhand's
+        # send_keys goes to whatever currently has focus. An agent reaching for
+        # alt+F4 to dismiss a dialog will close its own console and kill its own
+        # run -- observed. A hidden console cannot take focus, so it cannot be
+        # the thing that closes.
         "$a = New-ScheduledTaskAction -Execute 'powershell.exe' "
-        "-Argument '-NoProfile -ExecutionPolicy Bypass -File \"" + ps1 + "\"'\n"
+        "-Argument '-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File \"" + ps1 + "\"'\n"
         "$p = New-ScheduledTaskPrincipal -UserId '" + WIN_USER + "' "
         "-LogonType Interactive -RunLevel Limited\n"
         "Register-ScheduledTask -TaskName 'SandboxctlAgents' -Action $a -Principal $p -Force | Out-Null\n"
