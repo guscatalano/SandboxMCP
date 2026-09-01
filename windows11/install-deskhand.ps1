@@ -98,9 +98,12 @@ $user = if ($AutoLogonUser) { $AutoLogonUser } else { $env:USERNAME }
 $action  = New-ScheduledTaskAction -Execute 'powershell.exe' `
     -Argument "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$runner`""
 $trigger = New-ScheduledTaskTrigger -AtLogOn -User $user
-# LogonType Interactive + RunLevel Limited: it must land in the user's desktop
-# session, and per Deskhand's own design it runs unelevated.
-$principal = New-ScheduledTaskPrincipal -UserId $user -LogonType Interactive -RunLevel Limited
+# LogonType Interactive so it lands in the user's desktop session, and
+# RunLevel Highest so it lands there elevated. A task started at Highest is
+# elevated without a consent prompt; without it, Deskhand's system-control and
+# UAC tools cannot write HKLM policy, and anything it launches that needs admin
+# raises a prompt on the secure desktop that no automation can answer.
+$principal = New-ScheduledTaskPrincipal -UserId $user -LogonType Interactive -RunLevel Highest
 Register-ScheduledTask -TaskName 'Deskhand' -Action $action -Trigger $trigger `
     -Principal $principal -Force | Out-Null
 Ok "task 'Deskhand' -> $((Get-ScheduledTask -TaskName Deskhand).State), runs at logon as $user"

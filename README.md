@@ -243,8 +243,13 @@ Two things worth knowing before you turn this on:
 - **The key is real, and the sandbox is not trusted.** Everything else in a
   sandbox is disposable; a provider credential is not. Use a separate key with
   its own spend limit.
-- **Anything installed in the guest runs as the sandbox user**, which is a local
-  administrator. That is fine for a throwaway VM and nowhere else.
+- **Deskhand runs elevated**, via a logon task registered at `RunLevel Highest`.
+  It has to: its system-control and UAC tools write `HKLM` policy, and an
+  unelevated process cannot obtain admin without a consent prompt on the secure
+  desktop that no automation can click. It also means installers Deskhand
+  launches inherit elevation and never raise a prompt at all -- which is what
+  makes unattended software installs work. The consequence is that the bearer
+  token is administrator on that VM.
 - **A LAN endpoint needs a hole in the isolation.** Sandboxes are blocked from
   the whole of `192.168.0.0/16` by the `sandbox` security group, so an inference
   server on your LAN is unreachable until you allow it. Keep the exception to one

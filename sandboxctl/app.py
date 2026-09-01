@@ -447,10 +447,17 @@ New-NetFirewallRule -DisplayName 'Deskhand HTTP' -Direction Inbound -Action Allo
 
 # A logon task, not a service: Deskhand drives the desktop through UI Automation,
 # which only works inside an interactive session. Session 0 has no desktop.
+#
+# RunLevel Highest, not Limited. A scheduled task started this way is elevated
+# with no consent prompt, which is the only way Deskhand's system-control and
+# UAC tools can work at all -- writing HKLM policy needs admin, and an
+# unelevated process cannot obtain it without a prompt on the secure desktop
+# that nothing is able to click. It also means installers Deskhand launches
+# inherit elevation and never raise a prompt in the first place.
 $action = New-ScheduledTaskAction -Execute 'powershell.exe' `
     -Argument ('-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "' + $runner + '"')
 $trigger = New-ScheduledTaskTrigger -AtLogOn -User '@@USER@@'
-$principal = New-ScheduledTaskPrincipal -UserId '@@USER@@' -LogonType Interactive -RunLevel Limited
+$principal = New-ScheduledTaskPrincipal -UserId '@@USER@@' -LogonType Interactive -RunLevel Highest
 Register-ScheduledTask -TaskName 'Deskhand' -Action $action -Trigger $trigger `
     -Principal $principal -Force | Out-Null
 
