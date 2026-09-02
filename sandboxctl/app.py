@@ -819,6 +819,7 @@ if ($cfg.deskhand -and $cfg.deskhand.token) {
 if ($want -contains 'hermes') {
     $hh  = Join-Path $env:LOCALAPPDATA 'hermes'
     $exe = Join-Path $hh 'bin\hermes.exe'
+    $freshInstall = -not (Test-Path $exe)
     if (-not (Test-Path $exe)) {
         # Brings its own git, python and node; user-scoped, so no elevation.
         $src = Invoke-RestMethod 'https://hermes-agent.nousresearch.com/install.ps1'
@@ -904,6 +905,8 @@ $env:HERMES_DASHBOARD_BASIC_AUTH_PASSWORD = '__PASS__'
 & "$env:LOCALAPPDATA\hermes\bin\hermes.exe" dashboard --host $ip --port __PORT__ --no-open
 '@
         $dash = $dash.Replace('__USER__', '@@WINUSER@@').Replace('__PASS__', $cfg.dashboard_password).Replace('__PORT__', '@@DASHPORT@@')
+        $prev = if (Test-Path $runner) { (Get-Content $runner -Raw) } else { '' }
+        $runnerChanged = ($prev.Trim() -ne $dash.Trim())
         Set-Content $runner -Value $dash -Encoding UTF8
         $da = New-ScheduledTaskAction -Execute 'powershell.exe' `
               -Argument ('-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "' + $runner + '"')
@@ -928,12 +931,29 @@ $env:HERMES_DASHBOARD_BASIC_AUTH_PASSWORD = '__PASS__'
         Register-ScheduledTask -TaskName 'HermesDashboard' -Action $da -Trigger @($dt, $rep) `
               -Principal $dp -Settings $ds -Force | Out-Null
 
+        # Restarting the dashboard drops whatever browser session is attached
+        # to it: the websocket closes 1006 and the server reaps the client,
+        # INTERRUPTING any turn in flight. So only restart when there is a
+        # reason to -- a fresh install, changed launcher contents, or nothing
+        # listening. Reconfiguring an already-running sandbox now leaves the
+        # open session alone; the new settings apply to sessions started after.
+        $listening = [bool](Get-NetTCPConnection -State Listen -LocalPort @@DASHPORT@@ -ErrorAction SilentlyContinue)
+        $needsRestart = ($freshInstall -or $runnerChanged -or -not $listening)
+
+        if (-not $needsRestart) {
+            Write-Output '  dashboard already running and unchanged; left alone'
+        } else {
         # Stop the previous instance and WAIT for the scheduler to agree it has
         # stopped. Start-ScheduledTask against a task the scheduler still counts
         # as Running is silently ignored -- so killing the process and starting
         # in the same breath took the dashboard down and never brought it back.
         Stop-ScheduledTask -TaskName 'HermesDashboard' -ErrorAction SilentlyContinue
-        Get-Process hermes -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+        # Only the dashboard's own process. 'Get-Process hermes | Stop-Process'
+        # also killed any agent run in flight, which is how an install could
+        # terminate the very turn that requested it.
+        Get-CimInstance Win32_Process -Filter "Name='hermes.exe'" -ErrorAction SilentlyContinue |
+            Where-Object { $_.CommandLine -like '*dashboard*' } |
+            ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
         $stopBy = (Get-Date).AddSeconds(30)
         while ((Get-ScheduledTask -TaskName 'HermesDashboard').State -eq 'Running' -and (Get-Date) -lt $stopBy) {
             Start-Sleep -Seconds 2
@@ -951,6 +971,7 @@ $env:HERMES_DASHBOARD_BASIC_AUTH_PASSWORD = '__PASS__'
         }
         if ($up) { Write-Output '  dashboard listening on @@DASHPORT@@' }
         else { Write-Output '  WARNING: dashboard did not bind @@DASHPORT@@ within two minutes' }
+        }
     }
     Write-Output 'HERMES-OK'
 }
