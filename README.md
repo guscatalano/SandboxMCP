@@ -50,6 +50,7 @@ client, and the lifecycle buttons. **Watch** opens a live view of any of them.
 | **Destroy** | Purges the VM and its disk. |
 | **Watch** | Live MJPEG of the screen, from Proxmox's VNC framebuffer *or* Deskhand's own capture. |
 | **Agents** | Install Hermes and/or opencode *inside* a sandbox, on demand, preconfigured. |
+| **Record** | Continuously records each sandbox's Proxmox console to H.264, in 8-hour chunks. |
 | **Proxy** | Every sandbox's Deskhand tools re-exported under one MCP endpoint, namespaced per sandbox. |
 
 The two watch sources are not redundant. **Proxmox VNC works when nothing is
@@ -151,6 +152,32 @@ systemctl enable --now sandboxctl
 
 Then open `http://CONTAINER:8080/`, click **Fetch Deskhand** to stage a build,
 and **Create sandbox**.
+
+## Recording what Proxmox sees
+
+Set `recordings_dir` (and install `ffmpeg`) and the controller records every
+running sandbox's console continuously, rotating an H.264 chunk every 8 hours
+and sweeping anything past `recordings_retention_days`.
+
+It records the **VNC framebuffer**, not Deskhand's capture, and that is the
+whole point: a sandbox stuck in Windows setup, sitting at a lock screen, or
+wedged behind a modal nothing can dismiss is exactly the one worth having
+footage of, and in every one of those Deskhand is unreachable.
+
+A desktop is almost entirely static, so 1 fps H.264 costs roughly **50-75 MB per
+sandbox per 8-hour chunk** -- the same frames as loose JPEGs would be about
+1.4 GB. Give it its own volume; a controller rootfs will not do:
+
+```sh
+pct set 115 -mp0 <storage>:300,mp=/recordings,backup=0
+pct reboot 115
+apt install -y ffmpeg
+```
+
+Chunks are fragmented MP4 rather than `+faststart`, so the chunk being written
+right now is playable. With 8-hour files the recording you most want to watch is
+the one still open, and `+faststart` only writes its index on close -- which
+makes exactly that file unopenable.
 
 ## Connecting an agent
 

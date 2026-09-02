@@ -25,6 +25,7 @@ import select
 import socket
 import ssl
 import struct
+import time
 import urllib.parse
 import urllib.request
 
@@ -137,10 +138,19 @@ class VncSession:
         self.canvas.save(out, "JPEG", quality=quality)
         return out.getvalue()
 
-    def frame(self, incremental=True, quality=70):
-        """One-shot: block briefly for a full update, then encode."""
+    def frame(self, incremental=True, quality=70, wait=20.0):
+        """One-shot: wait for a real update, then encode.
+
+        A full 1280x800 update does not always arrive within a second or two,
+        and returning early hands back the initial all-black canvas -- which
+        looks like a broken sandbox rather than a slow one. Keep pumping until
+        something lands or the deadline passes.
+        """
         self._got_first = bool(incremental)
-        self.pump(5.0)
+        deadline = time.monotonic() + wait
+        while time.monotonic() < deadline:
+            if self.pump(1.0):
+                break
         return self.jpeg(quality)
 
     def close(self):

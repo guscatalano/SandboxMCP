@@ -41,6 +41,7 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import live
+import recorder
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 CONFIG = json.load(open(os.path.join(HERE, "config.json")))
@@ -70,6 +71,11 @@ AGENTS_CFG = CONFIG.get("agents") or {}
 # Matches the default agent-side MCP cap, so Deskhand spills to its OutputStore
 # at the same point the client would otherwise start discarding.
 DESKHAND_TOOL_CHARS = int(CONFIG.get("deskhand_max_tool_chars") or 150000)
+
+# Console recording. Off unless a directory is configured, because it needs
+# somewhere with room -- a chunk is tens of MB and they accumulate per sandbox.
+REC_DIR = CONFIG.get("recordings_dir") or ""
+REC_RETENTION_DAYS = int(CONFIG.get("recordings_retention_days") or 14)
 
 _SSL = ssl.create_default_context()
 _SSL.check_hostname = False
@@ -389,7 +395,12 @@ $ProgressPreference = 'SilentlyContinue'
 #   * the scheduled task's powershell running run-deskhand.ps1 -> that script
 # Ending the task kills the launcher; killing only the exe leaves the launcher
 # holding run-deskhand.ps1 and the wipe still fails.
-schtasks /End /TN Deskhand 2>$null | Out-Null
+# The ScheduledTasks cmdlet, NOT schtasks.exe. Piping a native command's
+# stderr under $ErrorActionPreference='Stop' throws NativeCommandError, and
+# on a fresh sandbox this task does not exist yet -- so every first install
+# died here with 'the system cannot find the file specified'. Updates passed
+# because by then the task did exist.
+Stop-ScheduledTask -TaskName 'Deskhand' -ErrorAction SilentlyContinue
 Stop-Process -Name deskhand-http -Force -ErrorAction SilentlyContinue
 Start-Sleep -Seconds 5
 
@@ -472,7 +483,7 @@ Register-ScheduledTask -TaskName 'Deskhand' -Action $action -Trigger $trigger `
 
 Stop-Process -Name deskhand-http -Force -ErrorAction SilentlyContinue
 Start-Sleep -Seconds 2
-schtasks /Run /TN Deskhand | Out-Null
+Start-ScheduledTask -TaskName 'Deskhand' -ErrorAction SilentlyContinue
 Write-Output 'INSTALLED'
 """
 
@@ -586,6 +597,8 @@ def do_destroy(job, vmid):
                 break
     _TOKEN_CACHE.pop(vmid, None)
     clear_agent_state(vmid)
+    if RECORDER:
+        RECORDER.stop(vmid)
     job.log("destroying")
     api(f"/nodes/{NODE}/qemu/{vmid}?purge=1&destroy-unreferenced-disks=1", "DELETE", timeout=180)
     job.log("gone")
@@ -1397,6 +1410,35 @@ def do_install_agents(job, vmid, agents, opts=None):
 GH_REPO = CONFIG.get("github_repo", "guscatalano/Deskhand")
 
 
+# --------------------------------------------------------------------------
+# Console recording
+# --------------------------------------------------------------------------
+RECORDER = None
+if REC_DIR:
+    RECORDER = recorder.RecorderManager(
+        REC_DIR, api, NODE, HOST, REC_RETENTION_DAYS,
+        log=lambda m: print(m, flush=True))
+
+
+def recorder_loop():
+    """Keep recorders matched to running sandboxes, and sweep old chunks.
+
+    Polls rather than hooking create/destroy: a sandbox can also start or stop
+    outside this service (a reboot, a Proxmox-side action), and a poll notices
+    that without every path having to remember to call in.
+    """
+    last_sweep = 0.0
+    while True:
+        try:
+            RECORDER.sync(list_sandboxes())
+            if time.time() - last_sweep > 3600:
+                RECORDER.sweep()
+                last_sweep = time.time()
+        except Exception as exc:                          # noqa: BLE001
+            print(f"recorder loop: {exc}", flush=True)
+        time.sleep(60)
+
+
 def fetch_models(base_url, timeout=12):
     """Ask an OpenAI-compatible endpoint what it can serve.
 
@@ -1846,6 +1888,19 @@ pre{background:#0b0d11;border:1px solid var(--ln);border-radius:6px;padding:12px
   &mdash; but note that setting is shared with Telegram and Discord.</div>
 </div>
 
+<div class="card" id="reccard" style="display:none">
+  <div class="row" style="justify-content:space-between;flex-wrap:wrap;gap:8px">
+    <b id="rectitle"></b>
+    <button class="d" onclick="document.getElementById('reccard').style.display='none';document.getElementById('recplayer').src=''">Close</button>
+  </div>
+  <div class="warn" id="recnote" style="margin:6px 0 10px"></div>
+  <video id="recplayer" controls preload="metadata"
+         style="width:100%;max-height:520px;background:#000;border:1px solid var(--ln);border-radius:6px;display:none"></video>
+  <table style="margin-top:10px"><thead><tr>
+    <th>Started</th><th>Size</th><th></th>
+  </tr></thead><tbody id="recrows"></tbody></table>
+</div>
+
 <div class="card" id="agentcard" style="display:none">
   <b id="agenttitle"></b>
   <div class="warn" style="margin:6px 0 10px">Installs into the sandbox itself and configures it with
@@ -1925,6 +1980,7 @@ function actions(s){
   if(s.token)
     m.push(`<button class="d warnish" onclick="upd(${s.vmid})">Update Deskhand</button>`);
   m.push(`<button class="d okish" onclick="rep(${s.vmid})">${s.token?'Repair':'Finish setup'}</button>`);
+  m.push(`<button class="d" onclick="recordings(${s.vmid},'${s.name}')">Recordings</button>`);
   m.push(`<button class="d badish" onclick="destroy(${s.vmid})">Destroy</button>`);
   return `<button class="d" style="color:#a371f7;border-color:#a371f7" onclick="watch(${s.vmid},'${s.name}')">Watch</button>
     <button class="d" style="color:#58a6ff;border-color:#58a6ff" onclick="agentPanel(${s.vmid},'${s.name}')">Agents</button>
@@ -2054,6 +2110,49 @@ async function create(){
     shell:document.getElementById('shell').value==='1', tls:document.getElementById('tls').value==='1'};
   const r=await fetch('api/create',{method:'POST',body:JSON.stringify(body)});
   const d=await r.json(); jobId=d.id; poll();
+}
+// Console recordings. The chunk being written right now is playable too --
+// the recorder emits fragmented mp4 precisely so you can watch a sandbox's
+// history without waiting eight hours for the file to close.
+async function recordings(vmid,name){
+  var card=document.getElementById('reccard');
+  document.getElementById('rectitle').textContent='Console recordings: '+name+' (vmid '+vmid+')';
+  document.getElementById('recrows').innerHTML='<tr><td colspan="3">loading&hellip;</td></tr>';
+  card.style.display='block';
+  card.scrollIntoView({behavior:'smooth'});
+  try{
+    const r=await fetch('api/recordings?vmid='+vmid);
+    const d=await r.json();
+    if(!d.enabled){
+      document.getElementById('recnote').textContent='Recording is off: set recordings_dir in the controller config.';
+      document.getElementById('recrows').innerHTML=''; return;
+    }
+    var st=(d.status||{})[String(vmid)];
+    document.getElementById('recnote').textContent =
+      (st&&st.recording ? ('recording now \u00b7 '+st.frames+' frames this chunk') : 'not currently recording')
+      + ' \u00b7 8h chunks \u00b7 kept '+d.retention_days+' days'
+      + (st&&st.error ? (' \u00b7 last error: '+st.error) : '');
+    if(!d.items.length){ document.getElementById('recrows').innerHTML='<tr><td colspan="3" style="color:#8b93a1">Nothing recorded yet.</td></tr>'; return; }
+    document.getElementById('recrows').innerHTML=d.items.map(function(it){
+      var t=it.started, pretty=t.slice(0,4)+'-'+t.slice(4,6)+'-'+t.slice(6,8)+' '+t.slice(9,11)+':'+t.slice(11,13);
+      var mb=(it.size/1048576).toFixed(1)+' MB';
+      var live=(st&&st.file===it.file)?' <span class="badge">live</span>':'';
+      // q, not a backslash-escaped quote: PAGE is a non-raw python string,
+      // so a \' in this file never survives to the browser.
+      var q=String.fromCharCode(39);
+      return '<tr><td><code>'+pretty+'</code>'+live+'</td><td>'+mb+'</td>'
+        +'<td style="text-align:right">'
+        +'<button class="d" onclick="playrec('+q+it.file+q+')">Play</button> '
+        +'<a href="api/recording?file='+it.file+'" download><button class="d">Download</button></a></td></tr>';
+    }).join('');
+  }catch(e){ document.getElementById('recrows').innerHTML='<tr><td colspan="3" style="color:#f85149">'+e.message+'</td></tr>'; }
+}
+function playrec(file){
+  var v=document.getElementById('recplayer');
+  v.style.display='block';
+  v.src='api/recording?file='+file;
+  v.play().catch(function(){});
+  v.scrollIntoView({behavior:'smooth',block:'nearest'});
 }
 var agvm=null, MODEL_CTX={};
 function agentPanel(vmid,name){
@@ -2188,6 +2287,39 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, json.dumps(list_sandboxes()))
             except Exception as exc:                  # noqa: BLE001
                 return self._send(500, json.dumps({"error": str(exc)}))
+        if p.path == "/api/recordings":
+            if not RECORDER:
+                return self._send(200, json.dumps({"enabled": False, "items": []}))
+            q = urllib.parse.parse_qs(p.query)
+            vmid = q.get("vmid", [None])[0]
+            return self._send(200, json.dumps({
+                "enabled": True,
+                "retention_days": REC_RETENTION_DAYS,
+                "status": {str(k): v for k, v in RECORDER.status().items()},
+                "items": RECORDER.listing(vmid)}))
+        if p.path == "/api/recording":
+            # Serve a chunk for playback/download. Name-checked, not path-joined
+            # from user input: the filename pattern is the whole allowlist.
+            q = urllib.parse.parse_qs(p.query)
+            fn = (q.get("file", [""])[0] or "").strip()
+            if not RECORDER or not recorder.NAME_RE.match(fn):
+                return self._send(404, json.dumps({"error": "no such recording"}))
+            path = os.path.join(REC_DIR, fn)
+            if not os.path.isfile(path):
+                return self._send(404, json.dumps({"error": "no such recording"}))
+            size = os.path.getsize(path)
+            self.send_response(200)
+            self.send_header("Content-Type", "video/mp4")
+            self.send_header("Content-Length", str(size))
+            self.send_header("Content-Disposition", f'inline; filename="{fn}"')
+            self.end_headers()
+            with open(path, "rb") as fh:
+                while True:
+                    buf = fh.read(256 * 1024)
+                    if not buf:
+                        break
+                    self.wfile.write(buf)
+            return
         if p.path == "/api/models":
             q = urllib.parse.parse_qs(p.query)
             base = (q.get("base_url", [""])[0] or AGENTS_CFG.get("base_url") or "").strip()
@@ -2415,6 +2547,11 @@ if __name__ == "__main__":
     pay = ThreadingHTTPServer((PAYLOAD_LISTEN[0], int(PAYLOAD_LISTEN[1])), PayloadHandler)
     threading.Thread(target=pay.serve_forever, daemon=True).start()
     print(f"payload  listening on {PAYLOAD_LISTEN[0]}:{PAYLOAD_LISTEN[1]} (sandbox-facing, read-only)", flush=True)
+
+    if RECORDER:
+        threading.Thread(target=recorder_loop, daemon=True).start()
+        print(f"recording consoles to {REC_DIR} "
+              f"(8h chunks, {REC_RETENTION_DAYS}d retention)", flush=True)
 
     srv = ThreadingHTTPServer((LISTEN[0], int(LISTEN[1])), Handler)
     print(f"sandboxctl listening on {LISTEN[0]}:{LISTEN[1]}  template={TEMPLATE} pool={POOL}", flush=True)
