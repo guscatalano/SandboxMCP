@@ -980,6 +980,19 @@ $env:HERMES_DASHBOARD_BASIC_AUTH_PASSWORD = '__PASS__'
         while ((Get-ScheduledTask -TaskName 'HermesDashboard').State -eq 'Running' -and (Get-Date) -lt $stopBy) {
             Start-Sleep -Seconds 2
         }
+        # The dashboard spawns a backend child whose command line does NOT say
+        # 'dashboard', so killing by name orphans it still holding the port.
+        # Hermes then refuses every later start with BACKEND_PORT_IN_USE while
+        # nothing actually serves -- a dead dashboard that looks like a running
+        # one. Kill whoever owns the port, and wait for it to be free.
+        Get-NetTCPConnection -State Listen -LocalPort @@DASHPORT@@ -ErrorAction SilentlyContinue |
+            Select-Object -ExpandProperty OwningProcess -Unique |
+            ForEach-Object { Stop-Process -Id $_ -Force -ErrorAction SilentlyContinue }
+        $freeBy = (Get-Date).AddSeconds(30)
+        while ((Get-NetTCPConnection -State Listen -LocalPort @@DASHPORT@@ -ErrorAction SilentlyContinue) `
+               -and (Get-Date) -lt $freeBy) {
+            Start-Sleep -Seconds 2
+        }
         Start-ScheduledTask -TaskName 'HermesDashboard'
 
         # Report what happened, not that a start was requested. The first run
