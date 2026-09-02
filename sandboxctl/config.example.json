@@ -43,7 +43,8 @@
       "OPENROUTER_API_KEY": ""
     },
     "_comment_hermes": "Optional per-agent overrides. disable_toolsets defaults to a trim list (Hermes ships 16 toolsets, 36 KB of schema, most of it noise inside a sandbox); set [] to keep them all. mcp_result_size_chars defaults to 0.15 of the context window, capped at 150000 -- Hermes caps a single MCP result at 50000 and does not scale that to the window, which truncates large Deskhand UI trees.",
-    "hermes": { "model": "", "disable_toolsets": null, "mcp_result_size_chars": null },
+    "hermes": { "model": "", "enable_toolsets": null, "disable_toolsets": null,
+                "mcp_result_size_chars": null, "supports_vision": true, "image_input_mode": "native" },
     "opencode": { "model": "" },
     "mcp": {}
   }

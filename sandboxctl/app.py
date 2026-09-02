@@ -860,6 +860,18 @@ if ($want -contains 'hermes') {
         Write-Output ('  mcp result cap ' + $cfg.hermes.mcp_result_size_chars + ' chars')
     }
 
+    # Half of Deskhand is screenshots -- capture_screen, capture_window,
+    # capture_region, the OCR tools. Hermes will not hand a tool-returned image
+    # to the model unless it believes the model takes images AND is told to pass
+    # them through natively; without both, those calls fail rather than degrade.
+    # Auto-detection cannot see this for a custom OpenAI-compatible endpoint,
+    # so it is stated explicitly.
+    if ($cfg.hermes -and $cfg.hermes.supports_vision) {
+        & $exe config set model.supports_vision 'true' 2>&1 | Out-Null
+        & $exe config set agent.image_input_mode ($cfg.hermes.image_input_mode) 2>&1 | Out-Null
+        Write-Output ('  vision on, image_input_mode ' + $cfg.hermes.image_input_mode)
+    }
+
     if ($cfg.mcp) {
         # Deliberately NOT 'hermes mcp add': it asks whether the server needs
         # authentication and blocks forever with no console attached. 'config
@@ -882,6 +894,16 @@ if ($want -contains 'hermes') {
     # local model the schemas alone can exceed the whole context window. file,
     # terminal and code_execution are kept: here they act on the sandbox, which
     # is the point.
+    # Enable BEFORE disabling, and state both lists. 'tools disable' only ever
+    # removes, so dropping a name from the off-list does not switch it back on --
+    # the toolset stays however a previous run left it. Declaring the keep-list
+    # makes the result the same whatever state the sandbox was already in.
+    if ($cfg.hermes -and $cfg.hermes.enable_toolsets) {
+        try {
+            & $exe tools enable @($cfg.hermes.enable_toolsets) 2>&1 | Out-Null
+            Write-Output ('  toolsets on: ' + ((@($cfg.hermes.enable_toolsets)) -join ' '))
+        } catch { Write-Output ('  could not enable toolsets: ' + $_.Exception.Message) }
+    }
     if ($cfg.hermes -and $cfg.hermes.disable_toolsets) {
         $off = @($cfg.hermes.disable_toolsets) -join ' '
         if ($off) {
@@ -1245,7 +1267,9 @@ def do_install_agents(job, vmid, agents, opts=None):
     DEFAULT_OFF = ["web", "browser", "image_gen", "tts", "video", "video_gen",
                    "x_search", "stt", "homeassistant", "spotify", "yuanbao",
                    "delegation", "cronjob", "session_search", "skills", "memory",
-                   "todo", "clarify", "vision"]
+                   "todo", "clarify"]
+    # 'vision' stays ON: Deskhand is a screenshot-heavy toolset, and at ~845
+    # bytes of schema it is the cheapest entry on the list to keep.
     cfg = {
         "api_keys": dict(defaults.get("api_keys") or {}),
         "hermes": dict(defaults.get("hermes") or {}),
@@ -1281,6 +1305,12 @@ def do_install_agents(job, vmid, agents, opts=None):
     elif ctx:
         cfg["hermes"]["mcp_result_size_chars"] = max(8_000, min(150_000, int(ctx * 4 * 0.15)))
     cfg["hermes"].setdefault("disable_toolsets", DEFAULT_OFF)
+    # Deskhand is a screenshot-heavy toolset, so default this on. Set
+    # agents.hermes.supports_vision to false for a text-only model.
+    cfg["hermes"].setdefault("enable_toolsets",
+                             ["file", "terminal", "code_execution", "vision"])
+    cfg["hermes"].setdefault("supports_vision", True)
+    cfg["hermes"].setdefault("image_input_mode", "native")
 
     if base_url:
         job.log(f"inference endpoint {base_url}" + ("" if api_key else " (no key)"))
