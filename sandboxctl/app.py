@@ -2355,11 +2355,17 @@ class Handler(BaseHTTPRequestHandler):
                         e = deskhand_target()
                         jpg = live.deskhand_frame(e["ip"], e.get("port", 8791), e["token"])
                     else:
-                        sess = live.open_vnc(api, NODE, vmid, HOST)
-                        try:
-                            jpg = sess.frame(incremental=False)
-                        finally:
-                            sess.close()
+                        # Prefer the recorder's own frame. Proxmox serves one
+                        # VNC session per VM well and a second one poorly: a
+                        # screenshot opened alongside a running recorder gets
+                        # starved of framebuffer updates and comes back black.
+                        jpg = RECORDER.latest(vmid) if RECORDER else None
+                        if jpg is None:
+                            sess = live.open_vnc(api, NODE, vmid, HOST)
+                            try:
+                                jpg = sess.frame(incremental=False)
+                            finally:
+                                sess.close()
                     self.send_response(200)
                     self.send_header("Content-Type", "image/jpeg")
                     self.send_header("Cache-Control", "no-store")

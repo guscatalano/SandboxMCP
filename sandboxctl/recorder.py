@@ -45,6 +45,12 @@ class SandboxRecorder:
         self.started = None
         self.frames = 0
         self.error = None
+        # The last frame this recorder encoded. Proxmox serves one VNC session
+        # per VM well and a second one poorly -- an ad-hoc screenshot opened
+        # alongside a running recorder gets starved of updates and comes back
+        # black. Viewers read this instead of competing for the console.
+        self.last_jpeg = None
+        self.last_at = 0.0
 
     # -- lifecycle ---------------------------------------------------------
     def start(self):
@@ -118,7 +124,10 @@ class SandboxRecorder:
                 # the last frame, and a constant frame rate is what keeps the
                 # file's timeline honest against wall-clock time.
                 vnc.pump(timeout=interval)
-                proc.stdin.write(vnc.jpeg(quality=70))
+                frame = vnc.jpeg(quality=70)
+                proc.stdin.write(frame)
+                self.last_jpeg = frame
+                self.last_at = time.time()
                 self.frames += 1
                 slack = interval - (time.time() - tick)
                 if slack > 0:
@@ -162,6 +171,14 @@ class RecorderManager:
             for vmid in list(self._recorders):
                 if vmid not in want:
                     self._recorders.pop(vmid).stop(timeout=5)
+
+    def latest(self, vmid, max_age=10.0):
+        """Most recent frame from a live recorder, or None."""
+        with self._lock:
+            r = self._recorders.get(int(vmid))
+        if r and r.last_jpeg and (time.time() - r.last_at) <= max_age:
+            return r.last_jpeg
+        return None
 
     def stop(self, vmid):
         with self._lock:
