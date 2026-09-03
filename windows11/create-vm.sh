@@ -25,6 +25,11 @@
 #                 bluescreens INACCESSIBLE_BOOT_DEVICE on first boot. Install
 #                 on SATA, let provision.ps1 install the VirtIO package into
 #                 the OS, then run switch-to-virtio.sh.
+#   audio0        Windows needs an audio RENDER endpoint to exist, even headless.
+#                 Without one, anything touching the audio stack fails outright --
+#                 FL Studio dies on GetDefaultAudioEndpoint before it can render a
+#                 single sample. driver=none means no host backend; the guest just
+#                 sees a device.
 #   balloon 0     Memory ballooning before the VirtIO balloon driver exists just
 #                 makes Windows report nonsense. Enable it after the first boot
 #                 if you want it.
@@ -182,6 +187,7 @@ qm create "$VMID" \
     --cores       "$CORES" \
     --memory      "$MEMORY" \
     --balloon     0 \
+    --audio0      device=intel-hda,driver=none \
     --scsihw      virtio-scsi-single \
     --sata1       "$STORAGE:${DISK},discard=on,ssd=1" \
     --net0        "virtio,bridge=${BRIDGE},firewall=1" \
