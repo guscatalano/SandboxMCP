@@ -324,14 +324,14 @@ Each agent is seeded with:
   IPv4 and never to loopback, so a `127.0.0.1` URL is refused outright.
 
 Hermes's built-in toolsets are also trimmed on install. It ships 16 of them --
-36 KB of tool schema before Deskhand contributes its own 83 tools -- and on a
+36 KB of tool schema before Deskhand contributes its own 131 tools -- and on a
 small local model the schemas alone can exceed the whole context window. `file`,
 `terminal` and `code_execution` are kept, because inside a sandbox they act on
 the sandbox, which is the point. Set `agents.hermes.disable_toolsets` to `[]` to
 keep everything.
 
-**Pick a model with room.** 83 Deskhand tools is roughly 8k tokens of schema on
-its own. An 8k-context model cannot hold that plus a system prompt, and the
+**Pick a model with room.** 131 Deskhand tools is about 56 KB of schema, roughly
+14k tokens on its own. An 8k-context model cannot hold that plus a system prompt, and the
 agent will behave as though the tools are not there.
 
 The picker shows each model's context, and warns below 32k. Note that the
@@ -341,6 +341,89 @@ as 262,144-capable may be answering with 8,192. Ollama-style servers report the
 served window on `/api/ps`; the install passes it to Hermes as
 `model.context_length`, which is where it decides to compress history. Left to
 auto-detect it reads the ceiling and overflows.
+
+### Giving and removing tools, afterwards
+
+What the installer trims is only the starting point. Hermes keeps tools in two
+independent layers, and it helps to know which one you are editing.
+
+**Built-in toolsets** are plain names, stored per platform in
+`%LOCALAPPDATA%\hermes\config.yaml`:
+
+```yaml
+platform_toolsets:
+  cli:
+    - code_execution
+    - computer_use
+    - file
+    - kanban
+    - terminal
+    - vision
+```
+
+**MCP servers** are a separate block, each contributing its own tools:
+
+```yaml
+mcp_servers:
+  deskhand:
+    url: http://10.66.0.100:8791/mcp?token=…
+    enabled: true
+    connect_timeout: 180
+```
+
+`hermes tools --summary` folds both together — a sandbox set up by the
+controller reports `7/27` on CLI: the six toolsets above, plus `deskhand`.
+
+Change them persistently with:
+
+```sh
+hermes tools list                                   # all of them, with state
+hermes tools enable web memory
+hermes tools disable browser
+hermes tools disable deskhand:deskhand_delete_path  # one MCP tool, server:tool form
+hermes tools --platform telegram disable terminal   # toolsets are per-platform
+hermes tools                                        # interactive picker
+```
+
+Built-ins take plain names, MCP tools take `server:tool` — so you can remove a
+single destructive Deskhand tool without giving up the other 130.
+
+Or change nothing on disk and scope one run:
+
+```sh
+hermes -z "…" -t terminal,file
+```
+
+**`-t` is a whitelist, and it drops MCP too.** Naming any toolset excludes
+everything you did not name, Deskhand included — an agent invoked with
+`-t vision,file` will tell you it has no way to see or touch the screen, and it
+is telling the truth. Note that the MCP server still *connects*: the log line
+`MCP: registered 131 tool(s) from 1 server(s)` appears either way, and the
+heartbeat continues. Registration and exposure-to-the-model are different
+things, so that line is not evidence the model can see them.
+
+Used deliberately, this is the escape hatch for a small model. Hermes driving
+`qwen3-4b-ctx8k` with everything enabled hung silently for 33 minutes — no
+error, no timeout, just the heartbeat — because `cache/mcp_schema_cache.json`
+was 55,810 bytes, roughly 14k tokens of schema, against an 8,192-token window.
+The same task with `-t terminal,file` finished in about four minutes.
+
+Finally, `config.yaml` carries Hermes's own loop protection, which is separate
+from anything your inference proxy may impose:
+
+```yaml
+tool_loop_guardrails:
+  warnings_enabled: true
+  hard_stop_enabled: false
+  warn_after:      { exact_failure: 2, same_tool_failure: 3 }
+  hard_stop_after:  { same_tool_failure: 8 }
+```
+
+Worth knowing there are two such mechanisms in different places. A proxy-side
+rule that trips on *repeated tool names* will kill GUI work outright — clicking
+seven buttons in a row is seven `computer_use` calls with no user message
+between them, which is indistinguishable from a loop unless the rule looks at
+the arguments.
 
 Hermes also gets its web dashboard started as a logon task, with a password
 generated per sandbox. The sandbox row then links straight to it. opencode has
