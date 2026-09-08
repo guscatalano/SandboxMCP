@@ -59,6 +59,96 @@ on a sandbox whose Deskhand install failed — which is exactly when you need to
 see what happened. **Deskhand capture** needs a session but shows what the
 automation itself sees.
 
+## Architecture
+
+The controller is the only thing that talks to Proxmox, and the only thing a
+sandbox can talk to — on one port, in one direction.
+
+```mermaid
+graph TB
+    agent["AI agent<br/>Claude Code / Hermes"]
+
+    subgraph ctl["sandboxctl — one LXC, one Python file"]
+        mcp[":8080 · MCP + web UI<br/><i>LAN only</i>"]
+        pay[":8081 · payload<br/><i>the only port a sandbox may reach</i>"]
+        live["live.py<br/>RFB / Deskhand → MJPEG"]
+        rec["recorder.py<br/>console → H.264, 8h chunks"]
+    end
+
+    pve["Proxmox API<br/>clone · start · snapshot · destroy"]
+
+    subgraph sdn["10.66.0.0/24 — isolated SDN, NATs out"]
+        s1["sandbox 900<br/>Deskhand :8791"]
+        s2["sandbox 901<br/>Deskhand :8791"]
+    end
+
+    agent -->|MCP over HTTP| mcp
+    mcp -->|token scoped to the pool| pve
+    pve --> sdn
+    mcp -->|proxied Deskhand tools,<br/>namespaced per sandbox| s1
+    mcp --> s2
+    s1 -.->|fetch payload zip| pay
+    live -.->|framebuffer| pve
+    live -.->|capture| s1
+    rec -.-> pve
+```
+
+Note which arrows are missing. A sandbox has no route to `:8080`, so a
+compromised guest cannot enumerate its siblings, read their Deskhand tokens, or
+create and destroy VMs. It can fetch a zip from `:8081` and nothing else.
+
+### Creating a sandbox
+
+Most of the five minutes is Windows, not us — OOBE has to finish before the
+guest agent will answer, and auto-logon only takes effect on the reboot after.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant A as Agent
+    participant C as sandboxctl
+    participant P as Proxmox
+    participant G as Windows guest
+
+    A->>C: sandbox_create
+    C->>P: linked-clone the sysprepped template
+    C->>P: start
+    loop until OOBE completes
+        C->>P: qemu-guest-agent ping
+    end
+    C->>P: write auto-logon registry keys (guest exec)
+    C->>P: reboot
+    Note over G: boots into a real logged-in desktop session
+    G->>C: GET :8081/payload/deskhand.zip
+    C->>P: install Deskhand + logon task, fresh token
+    C->>G: probe /mcp with the new token
+    C-->>A: address, token, per-client MCP command
+```
+
+Deskhand needs an **interactive desktop session**, not just a running OS —
+which is why auto-logon exists at all. A service account cannot move a mouse.
+
+### Sandbox lifecycle
+
+```mermaid
+stateDiagram-v2
+    [*] --> Cloning
+    Cloning --> Booting
+    Booting --> Provisioning: guest agent answers
+    Provisioning --> Ready: Deskhand armed
+    Provisioning --> Broken: lock screen, or install failed
+    Broken --> Provisioning: repair — reissues the token
+    Ready --> Ready: update — keeps the token,<br/>connected clients stay up
+    Ready --> Destroyed: destroy
+    Broken --> Destroyed
+    Destroyed --> [*]
+```
+
+`update` and `repair` differ in exactly one way that matters to whoever is
+connected: **update preserves the sandbox's token, repair issues a new one.**
+Repair is for a machine that is already broken, so breaking clients further
+costs nothing; update is not.
+
 ## Requirements
 
 - Proxmox VE 8.x, one node with room for the VMs
@@ -289,6 +379,82 @@ Two things worth knowing before you turn this on:
   The controller's own token cannot do this -- it has no cluster firewall
   rights, deliberately -- so it is a one-time admin change.
 
+## Benchmarking with WindowsAgentArena
+
+`waa-runner/` runs [WindowsAgentArena](https://github.com/microsoft/WindowsAgentArena)
+tasks against a sandbox, so "can an agent actually use this desktop?" has a
+number rather than an anecdote. It reuses WAA's task format and evaluators but
+none of its Docker harness — the sandbox *is* the machine under test, and
+Deskhand is how the agent touches it.
+
+25 tasks are included: `clock` (4), `notepad` (2), `file_explorer` (19), in
+WAA's own OSWorld-derived schema.
+
+```bash
+python runner.py --agent hermes --tasks 'file_explorer*' \
+                 --vmid 900 --reset-snapshot clean --timeout 300 --out results/
+```
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant R as runner.py
+    participant P as Proxmox
+    participant D as Deskhand
+    participant Ag as Agent under test
+
+    R->>R: preflight — refuse in ~30s if the model endpoint is down
+    loop each task
+        R->>P: rollback to snapshot (with vmstate)
+        R->>D: poll deskhand_arm until it answers
+        R->>D: setup — launch, open, download, create_folder…
+        R->>Ag: the task instruction
+        Ag->>D: drive the desktop
+        R->>D: postconfig, then run the getters
+        R->>R: score, keeping the evidence
+    end
+    R-->>R: write results + per-task evidence
+```
+
+### Design decisions worth knowing
+
+**Snapshot with vmstate, not a cold boot.** Rollback resumes a live desktop in
+~17s. A cold boot is minutes, and multiplied across 19 tasks that is the
+difference between a coffee break and an afternoon.
+
+**A broken run must never look like a clean zero.** This is the whole reason
+the harness exists in its current shape. Failures are split:
+
+| | meaning | scored? |
+|---|---|---|
+| `error` | setup broke — the task never really ran | **no**, excluded |
+| `note` | the agent ran and the evaluator said no | yes, as 0 |
+
+An early version happily reported `0/19` for a model whose backend was
+returning HTTP 502 to every call. That number was worse than useless — it
+looked like a result. Agent-side failures (`upstream unreachable`, `no API
+key`, `HTTP 502`) now raise, and a `preflight` refuses the whole run in about
+30 seconds rather than spending an hour proving nothing.
+
+**Every pass keeps its evidence.** Getters append to an `EVIDENCE` list that is
+copied into each result, so a pass can be audited afterwards instead of taken
+on trust.
+
+**Unimplemented getters fail loudly.** Six WAA getters are deliberately absent
+(`is_details_view`, `are_files_sorted_by_modified_time`, and friends). They
+raise rather than returning `False`, because a getter that silently returns
+`False` is indistinguishable from an agent that failed.
+
+**Writes to a sandbox are chunked at 32 KB.** Anything larger stalls and dies
+with a broken pipe at ~295 seconds. Bisection put the boundary between 32 KB
+and 128 KB, and `/fs/upload` failed identically to MCP `write_file` — so it is
+a path-MTU black hole on the way in, not a Deskhand limit. `put_file()` splits
+the blob, reassembles it guest-side, and verifies the byte count.
+
+**WAA assumes the user is called `Docker`.** `rewrite_paths()` rewrites task
+paths to the local sandbox user, recursively, handling both slash directions
+and case-insensitively.
+
 ## Security model
 
 The threat to design against is a sandbox that gets compromised — that is the
@@ -341,6 +507,9 @@ sandboxctl/
   live.py                RFB client + Deskhand capture -> MJPEG
   config.example.json    copy to config.json (gitignored: holds credentials)
   sandboxctl.service     systemd unit
+waa-runner/
+  runner.py              WindowsAgentArena harness: reset, setup, score
+  tasks/                 25 task definitions (clock, notepad, file_explorer)
 windows11/
   README.md              building the template, in detail
   autounattend.xml       unattended install answer file
