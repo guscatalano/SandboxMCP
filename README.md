@@ -291,6 +291,41 @@ Hermes, `hermes -t sandboxctl -z "..."` limits a run to the sandbox tools alone
 (`hermes tools disable ...` makes it permanent, but that setting is shared with
 its Telegram and Discord surfaces).
 
+## Pointing an AI at it
+
+Hand any agent the controller's URL and it should know what to do without a
+human explaining it. One guide text is served four ways, so it reaches the
+model whichever way it arrived:
+
+| route in | what it gets |
+|---|---|
+| MCP client connects | `initialize` returns the guide as `instructions`; the client injects it into the model's context before the first tool call |
+| `curl` / fetch tool on `/` | plain text — the root serves the guide to anything that did not ask for `text/html` |
+| browser on `/` | the dashboard, with a collapsible *"If you are an AI reading this page"* block for HTML→text fetchers |
+| framework probing | `/llms.txt`, `/.well-known/agent.json` (agent card), `/.well-known/mcp.json` (drop-in `mcpServers` config) |
+
+```
+$ curl http://sandboxctl.example/
+sandboxctl -- disposable Windows 11 sandboxes for AI agents
+
+You are talking to a controller that provisions isolated Windows 11 VMs ...
+HOW TO USE IT
+  1. list_sandboxes      see what exists; each row carries a ready-made Deskhand endpoint
+  2. create_sandbox      only if you need a fresh machine (~5 min); poll job_status until done
+  3. drive it            every sandbox's Deskhand tools are listed as <name>__deskhand_*
+  4. destroy_sandbox     when you are finished -- they are disposable; that is the point
+```
+
+The MCP `instructions` field is the one that matters most: it is the only
+route that needs no discovery at all. The URL in the guide is filled from the
+`Host` header the client used, so it is right for whatever name, IP or port
+you reached the controller by.
+
+**HTTPS-only fetchers cannot reach it.** The controller speaks plain HTTP, and
+some hosted assistants upgrade every URL to HTTPS before fetching. If those
+are among the agents you want to point here, put a certificate in front of it
+(a reverse proxy, or ACME on the router).
+
 ## Running an agent inside a sandbox
 
 The **Agents** button on a sandbox (or the `install_agents` MCP tool) installs

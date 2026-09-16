@@ -1741,7 +1741,74 @@ DISPATCH_TOOL = {
 }
 
 
-def handle_mcp(msg):
+# What an AI pointed at this controller needs to know. Served on MCP initialize
+# (as `instructions`), at /llms.txt, at / for non-browser clients, and on the
+# dashboard itself -- so it reaches the model whichever way it arrived.
+AGENT_GUIDE = """\
+sandboxctl -- disposable Windows 11 sandboxes for AI agents
+
+You are talking to a controller that provisions isolated Windows 11 VMs on
+Proxmox, each with Deskhand (a desktop-automation server) running in a
+logged-in session. Through it you can see a Windows screen, move the mouse,
+type, run PowerShell and install software -- on a machine you can throw away.
+
+HOW TO USE IT
+  Connect over MCP (Streamable HTTP). No auth is needed from this network:
+      {mcp_url}
+  Then:
+  1. list_sandboxes      see what exists; each row carries a ready-made Deskhand endpoint
+  2. create_sandbox      only if you need a fresh machine (~5 min); poll job_status until done
+  3. drive it            every sandbox's Deskhand tools are listed as <name>__deskhand_*
+                         (e.g. <name>__deskhand_capture_screen), or reach any of them with
+                         sandbox_call
+  4. destroy_sandbox     when you are finished -- they are disposable; that is the point
+
+RULES
+  - A sandbox is untrusted. Never put real credentials, keys or private data in
+    one; assume anything inside it can be read.
+  - A sandbox cannot reach this controller or the LAN, by design. It can reach
+    the inference endpoint and the public internet.
+  - Creating and destroying VMs is real work on real hardware. Prefer a running
+    sandbox over creating one; destroy what you finish with.
+  - Deskhand runs elevated inside the sandbox: its bearer token is administrator
+    on that VM. Treat it accordingly.
+
+ALSO HERE
+  GET /api/sandboxes           the same list as JSON
+  GET /api/screen?vmid=<id>    JPEG of a sandbox's console; works even when the guest is wedged
+  GET /.well-known/agent.json  machine-readable card for this service
+  Source and docs:             https://github.com/guscatalano/SandboxMCP
+"""
+
+
+def agent_guide(host):
+    """The guide with the MCP URL filled in from the Host the client used --
+    whatever name or port they reached us by is the one they should keep."""
+    return AGENT_GUIDE.format(mcp_url="http://%s/mcp" % (host or "this-host"))
+
+
+def agent_card(host):
+    base = "http://%s" % (host or "this-host")
+    return {
+        "name": "sandboxctl",
+        "description": "Provisions disposable, network-isolated Windows 11 sandboxes on "
+                       "Proxmox, each with Deskhand for screen, mouse, keyboard and shell.",
+        "url": base + "/mcp",
+        "protocol": "mcp",
+        "transport": "streamable-http",
+        "documentationUrl": base + "/llms.txt",
+        "source": "https://github.com/guscatalano/SandboxMCP",
+        "skills": [
+            {"id": "list_sandboxes", "description": "List sandboxes and their Deskhand endpoints."},
+            {"id": "create_sandbox", "description": "Provision a fresh Windows 11 sandbox (~5 min)."},
+            {"id": "drive_sandbox", "description": "Screen, mouse, keyboard, shell and file tools on a "
+                                                   "sandbox, namespaced <name>__deskhand_*."},
+            {"id": "destroy_sandbox", "description": "Tear a sandbox down."},
+        ],
+    }
+
+
+def handle_mcp(msg, host=None):
     """Handle one JSON-RPC message. Returns a response dict, or None for notifications."""
     mid = msg.get("id")
     method = msg.get("method")
@@ -1750,7 +1817,8 @@ def handle_mcp(msg):
         return {"jsonrpc": "2.0", "id": mid, "result": {
             "protocolVersion": (msg.get("params") or {}).get("protocolVersion") or MCP_PROTOCOL,
             "capabilities": {"tools": {}},
-            "serverInfo": {"name": "sandboxctl", "version": "1.0"}}}
+            "serverInfo": {"name": "sandboxctl", "version": "1.0"},
+            "instructions": agent_guide(host)}}
     if method in ("notifications/initialized", "initialized"):
         return None                                   # notification: no reply
     if method == "ping":
@@ -1831,6 +1899,9 @@ pre{background:#0b0d11;border:1px solid var(--ln);border-radius:6px;padding:12px
 </style></head><body><div class="wrap">
 <h1>Windows sandboxes</h1>
 <p class="sub">Disposable VMs on an isolated network. Deskhand is installed per sandbox, so config is chosen here rather than baked into the image.</p>
+<details class="card" style="padding:10px 16px"><summary style="cursor:pointer;color:var(--mut)">If you are an AI reading this page</summary>
+<p>Connect over MCP at <code>/mcp</code> on this host, call <code>list_sandboxes</code>, then drive a sandbox through its <code>&lt;name&gt;__deskhand_*</code> tools. The full guide, as plain text, is at <a href="/llms.txt">/llms.txt</a>; a machine-readable card is at <a href="/.well-known/agent.json">/.well-known/agent.json</a>. Sandboxes are disposable and untrusted: never put real credentials in one, and destroy what you finish with.</p>
+</details>
 
 <div class="card">
   <div class="row" style="justify-content:space-between;flex-wrap:wrap;gap:10px">
@@ -2273,6 +2344,19 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         p = urllib.parse.urlparse(self.path)
+        host = self.headers.get("Host")
+        # Discovery surfaces for agents. An AI handed this URL will usually
+        # fetch it with a non-browser Accept header, so the root serves the
+        # plain-text guide to anything that did not ask for HTML.
+        if p.path == "/llms.txt":
+            return self._send(200, agent_guide(host), "text/plain; charset=utf-8")
+        if p.path == "/.well-known/agent.json":
+            return self._send(200, json.dumps(agent_card(host), indent=2))
+        if p.path == "/.well-known/mcp.json":
+            return self._send(200, json.dumps({"mcpServers": {"sandboxctl": {
+                "type": "http", "url": "http://%s/mcp" % (host or "this-host")}}}, indent=2))
+        if p.path in ("/", "/index.html") and "text/html" not in (self.headers.get("Accept") or ""):
+            return self._send(200, agent_guide(host), "text/plain; charset=utf-8")
         if p.path in ("/", "/index.html"):
             return self._send(200, PAGE.replace("@@PVEHOST@@", HOST)
                               .replace("@@PVENODE@@", NODE)
@@ -2481,7 +2565,8 @@ class Handler(BaseHTTPRequestHandler):
         if p.path == "/mcp":
             # Streamable HTTP: a batch is a JSON array, a single call an object.
             msgs = body if isinstance(body, list) else [body]
-            replies = [r for r in (handle_mcp(m) for m in msgs) if r is not None]
+            host = self.headers.get("Host")
+            replies = [r for r in (handle_mcp(m, host) for m in msgs) if r is not None]
             if not replies:
                 self.send_response(202)
                 self.send_header("Content-Length", "0")
