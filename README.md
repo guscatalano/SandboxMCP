@@ -530,6 +530,49 @@ Writes are chunked and staged to a temporary file, moved into place only once
 every chunk has landed, so a failure part-way through leaves the original
 untouched.
 
+## Claiming a sandbox
+
+Fifty sandboxes fit in the pool and a new one takes about six minutes, so the
+usual answer to "we both need one" is to have two. But sandboxes do get shared,
+and the damage worth preventing is not two people typing at once — it is an
+irreversible operation on a machine somebody else is mid-task on.
+
+```sh
+curl -s -X POST "$CTL/api/claim" -H 'Content-Type: application/json' \
+     -d '{"vmid":901,"who":"gus","purpose":"WAA baseline","minutes":90}'
+```
+
+Agents get `claim_sandbox` and `release_sandbox`. The claim shows on the
+dashboard row, in `list_sandboxes`, and in the sandbox's history.
+
+**Advisory for use, enforced for destruction.** A claim does not stop anyone
+driving the machine, reading its files or taking a screenshot. It does stop:
+
+| operation | why it is guarded |
+|---|---|
+| `destroy_sandbox` | the VM and everything on it is gone |
+| `repair_sandbox` | reissues the token, breaking every connected client |
+| `update_sandbox` | restarts Deskhand under whoever is driving |
+
+```
+refusing to destroy: gus holds VM 901 for another 89 min for WAA baseline.
+Pass force=true if you are certain, or wait for the claim to lapse.
+```
+
+`force: true` always wins — this is a courtesy between people who can talk to
+each other, not a permission system. Passing your own `who` also works, so
+reclaiming your own sandbox never needs forcing.
+
+**Claims expire on their own** (default 60 minutes, max 24 hours). A lock you
+must remember to release becomes a graveyard of stale locks held by people who
+have gone home, and then everyone learns to force past them — which leaves you
+worse off than having no locks at all. Re-claiming with the same `who` extends
+the deadline, and destroying a sandbox releases its claim.
+
+The operation this exists for is the WAA runner: it rolls a sandbox back to a
+snapshot between tasks, which silently obliterates whatever anyone else had set
+up. Claim before a benchmark run.
+
 ## What happened to this sandbox
 
 `sandbox_history` (or `GET /api/history?vmid=N`) returns a timeline, oldest

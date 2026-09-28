@@ -246,6 +246,95 @@ def _jobs_load():
 MAX_JOBS = 50
 
 # --------------------------------------------------------------------------
+# Claims
+# --------------------------------------------------------------------------
+CLAIMS_PATH = os.path.join(HERE, "claims.json")
+CLAIMS_LOCK = threading.Lock()
+CLAIM_DEFAULT_MINUTES = 60
+CLAIM_MAX_MINUTES = 24 * 60
+
+
+def _claims_load():
+    try:
+        with open(CLAIMS_PATH, encoding="utf-8") as fh:
+            return json.load(fh)
+    except Exception:                                 # noqa: BLE001
+        return {}
+
+
+def _claims_save(d):
+    tmp = CLAIMS_PATH + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(d, fh, indent=2)
+    os.replace(tmp, CLAIMS_PATH)
+
+
+def get_claim(vmid):
+    """The live claim on a sandbox, or None. Expiry is evaluated on read, so a
+    forgotten claim stops mattering without anyone tidying up."""
+    c = _claims_load().get(str(vmid))
+    if not c:
+        return None
+    if c.get("until", 0) <= time.time():
+        return None
+    c = dict(c)
+    c["minutes_left"] = max(0, int((c["until"] - time.time()) / 60))
+    return c
+
+
+def claim_sandbox(vmid, who, purpose="", minutes=CLAIM_DEFAULT_MINUTES):
+    who = (who or "").strip()[:60]
+    if not who:
+        raise ValueError("who is required -- a claim nobody can be asked about is not a claim")
+    minutes = max(1, min(int(minutes or CLAIM_DEFAULT_MINUTES), CLAIM_MAX_MINUTES))
+    held = get_claim(vmid)
+    if held and held["who"] != who:
+        raise RuntimeError(
+            f"{held['who']} holds this sandbox for another {held['minutes_left']} min"
+            + (f" ({held['purpose']})" if held.get("purpose") else "")
+            + ". Take it over with the same 'who', or pick another sandbox.")
+    entry = {"who": who, "purpose": (purpose or "").strip()[:200],
+             "since": int(time.time()), "until": int(time.time() + minutes * 60)}
+    with CLAIMS_LOCK:
+        d = _claims_load()
+        d[str(vmid)] = entry
+        _claims_save(d)
+    record_event(vmid, "claimed", f"{who}: {entry['purpose']}"[:80] if entry["purpose"] else who)
+    return entry
+
+
+def release_sandbox(vmid, who=None):
+    held = get_claim(vmid)
+    if held and who and held["who"] != who.strip():
+        raise RuntimeError(f"{held['who']} holds this claim, not {who}")
+    with CLAIMS_LOCK:
+        d = _claims_load()
+        d.pop(str(vmid), None)
+        _claims_save(d)
+    record_event(vmid, "released", (held or {}).get("who", ""))
+    return {"vmid": int(vmid), "released": bool(held)}
+
+
+def _guard_claim(vmid, action, who=None, force=False):
+    """Refuse a destructive action on someone else's live claim.
+
+    Only destroy, repair and update come through here. Everything else stays
+    advisory on purpose: a claim you cannot work around for ordinary use is a
+    claim people route around entirely.
+    """
+    held = get_claim(vmid)
+    if not held or force:
+        return
+    if who and held["who"] == who.strip():
+        return
+    raise RuntimeError(
+        f"refusing to {action}: {held['who']} holds VM {vmid} "
+        f"for another {held['minutes_left']} min"
+        + (f" for {held['purpose']}" if held.get("purpose") else "")
+        + ". Pass force=true if you are certain, or wait for the claim to lapse.")
+
+
+# --------------------------------------------------------------------------
 # History
 # --------------------------------------------------------------------------
 EVENTS_PATH = os.path.join(HERE, "events.json")
@@ -872,6 +961,10 @@ def do_destroy(job, vmid):
             if (vm("/status/current", vmid=vmid) or {}).get("status") == "stopped":
                 break
     try:
+        release_sandbox(vmid)
+    except Exception:                                 # noqa: BLE001
+        pass
+    try:
         archive_comments(vmid, (vm("/config", vmid=vmid) or {}).get("name") or "")
     except Exception:                                 # noqa: BLE001
         pass                                          # a note must never block a destroy
@@ -903,6 +996,36 @@ MCP_TOOLS = [
                         "bearer token, and a ready-to-use MCP endpoint for each one. "
                         "Use this to find a sandbox to drive."),
         "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "claim_sandbox",
+        "description": ("Say you are using a sandbox, so nobody destroys it under you. "
+                        "Advisory: it does not stop anyone driving the machine, but "
+                        "destroy_sandbox, repair_sandbox and update_sandbox will refuse "
+                        "while someone else holds it. Claims expire on their own, so a "
+                        "forgotten one is not a problem for the next person."),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "vmid": {"type": "integer"},
+                "who": {"type": "string", "description": "You. Required -- a claim nobody "
+                                                         "can be asked about is not a claim."},
+                "purpose": {"type": "string", "description": "What you are doing, so someone "
+                                                             "deciding whether to wait can tell."},
+                "minutes": {"type": "integer", "description": "How long you need it. "
+                                                              "Default 60, max 1440."},
+            },
+            "required": ["vmid", "who"],
+        },
+    },
+    {
+        "name": "release_sandbox",
+        "description": "Give up a claim early, once you have finished with the sandbox.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"vmid": {"type": "integer"}, "who": {"type": "string"}},
+            "required": ["vmid"],
+        },
     },
     {
         "name": "sandbox_history",
@@ -2191,6 +2314,11 @@ def _sandbox_view(e):
     # agent. Requires a Proxmox login, so it is a link rather than an embed.
     out["console_url"] = (f"https://{HOST}:8006/?console=kvm&novnc=1"
                           f"&vmid={e['vmid']}&node={NODE}&resize=off")
+    claim = get_claim(e["vmid"])
+    if claim:
+        out["claimed_by"] = claim["who"]
+        out["claim_purpose"] = claim.get("purpose") or ""
+        out["claim_minutes_left"] = claim["minutes_left"]
     if e.get("ip") and e.get("token"):
         out["deskhand_url"] = f"http://{e['ip']}:{port}/?token={e['token']}"
         out["mcp_url"] = f"http://{e['ip']}:{port}/mcp"
@@ -2206,6 +2334,14 @@ def mcp_call(name, args):
     # or reaches into a guest, is.
     if name not in _QUIET_TOOLS:
         record_event(args.get("vmid"), name, str(args.get("path") or args.get("agents") or "")[:80])
+    if name == "claim_sandbox":
+        return claim_sandbox(args.get("vmid"), args.get("who"),
+                             args.get("purpose"), args.get("minutes"))
+    if name == "release_sandbox":
+        vmid = args.get("vmid")
+        if vmid is None:
+            raise ValueError("vmid is required")
+        return release_sandbox(vmid, args.get("who"))
     if name == "sandbox_history":
         vmid = args.get("vmid")
         if vmid is None:
@@ -2253,6 +2389,7 @@ def mcp_call(name, args):
         vmid = args.get("vmid")
         if vmid is None:
             raise ValueError("vmid is required")
+        _guard_claim(vmid, "destroy", args.get("who"), args.get("force"))
         job = start_job(f"Destroying {vmid}", do_destroy, vmid)
         return {"job_id": job.id}
     if name == "fetch_deskhand":
@@ -2262,12 +2399,16 @@ def mcp_call(name, args):
         vmid = args.get("vmid")
         if vmid is None:
             raise ValueError("vmid is required")
+        _guard_claim(vmid, "repair (it reissues the token, breaking connected clients)",
+                     args.get("who"), args.get("force"))
         job = start_job(f"Repairing {vmid}", do_repair, vmid)
         return {"job_id": job.id}
     if name == "update_sandbox":
         vmid = args.get("vmid")
         if vmid is None:
             raise ValueError("vmid is required")
+        _guard_claim(vmid, "update (it restarts Deskhand under whoever is driving)",
+                     args.get("who"), args.get("force"))
         job = start_job(f"Updating {vmid}", do_update, vmid)
         return {"job_id": job.id}
     if name == "install_agents":
@@ -2440,6 +2581,7 @@ code{font:12px ui-monospace,Consolas,monospace;background:#0b0d11;padding:2px 6p
 a{color:var(--acc)}
 .lnk{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
 .badge{font:11px ui-monospace,Consolas,monospace;border:1px solid var(--ln);border-radius:999px;padding:1px 8px;color:var(--mut)}
+.claim{margin-left:8px;font:11px ui-monospace,Consolas,monospace;border:1px solid #d29922;color:#d29922;border-radius:999px;padding:1px 8px}
 .notes-toggle{margin-left:8px;font-size:11px;color:var(--mut);text-decoration:none;border-bottom:1px dotted var(--ln)}
 .notes-toggle:hover{color:var(--acc)}
 .notes-row>td{background:#0f131a;padding-top:12px}
@@ -2640,7 +2782,10 @@ function actions(s){
     <details class="menu"><summary>&#8943;</summary><div class="mi">${m.join('')}</div></details>`;
 }
 function row(s){
-  return `<tr><td><code>${s.vmid}</code></td><td>${s.name}
+  var claim = s.claimed_by
+    ? `<span class="claim" title="${s.claim_purpose||''}">held by ${s.claimed_by} &middot; ${s.claim_minutes_left}m</span>`
+    : '';
+  return `<tr><td><code>${s.vmid}</code></td><td>${s.name}${claim}
       <a href="#" class="notes-toggle" onclick="return toggleNotes(event,${s.vmid})"
          title="Notes on this sandbox">notes</a></td>
     <td><span class="st ${s.status==='running'?'r':'s'}"></span>${s.status}</td>
@@ -3019,7 +3164,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, json.dumps(get_comments(vmid)))
         if p.path == "/api/sandboxes":
             try:
-                return self._send(200, json.dumps(list_sandboxes()))
+                return self._send(200, json.dumps([_sandbox_view(e) for e in list_sandboxes()]))
             except Exception as exc:                  # noqa: BLE001
                 return self._send(500, json.dumps({"error": str(exc)}))
         if p.path == "/api/recordings":
@@ -3227,6 +3372,16 @@ class Handler(BaseHTTPRequestHandler):
                 return
             out = replies if isinstance(body, list) else replies[0]
             return self._send(200, json.dumps(out))
+        if p.path == "/api/claim":
+            try:
+                if body.get("release"):
+                    return self._send(200, json.dumps(
+                        release_sandbox(body.get("vmid"), body.get("who"))))
+                return self._send(200, json.dumps(claim_sandbox(
+                    body.get("vmid"), body.get("who"), body.get("purpose"),
+                    body.get("minutes"))))
+            except Exception as exc:                  # noqa: BLE001
+                return self._send(400, json.dumps({"error": str(exc)}))
         if p.path == "/api/comment":
             try:
                 entry = add_comment(body.get("vmid"), body.get("text"),
