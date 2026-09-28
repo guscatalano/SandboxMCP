@@ -246,6 +246,125 @@ def _jobs_load():
 MAX_JOBS = 50
 
 # --------------------------------------------------------------------------
+# History
+# --------------------------------------------------------------------------
+EVENTS_PATH = os.path.join(HERE, "events.json")
+EVENTS_LOCK = threading.Lock()
+MAX_EVENTS = 500              # per sandbox
+
+# Proxmox task types worth showing, mapped to something a person can read.
+_PVE_TASKS = {
+    "qmclone": "cloned from template",
+    "qmstart": "powered on",
+    "qmstop": "powered off",
+    "qmshutdown": "shut down",
+    "qmreboot": "rebooted",
+    "qmreset": "reset",
+    "qmdestroy": "destroyed",
+    "vncproxy": "screen viewed",
+    "qmsnapshot": "snapshot taken",
+    "qmrollback": "rolled back",
+}
+
+
+def _events_load():
+    try:
+        with open(EVENTS_PATH, encoding="utf-8") as fh:
+            return json.load(fh)
+    except Exception:                                 # noqa: BLE001
+        return {}
+
+
+def _events_save(d):
+    tmp = EVENTS_PATH + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(d, fh, indent=2, default=str)
+    os.replace(tmp, EVENTS_PATH)
+
+
+def record_event(vmid, what, detail=""):
+    """Note something the controller did to a sandbox.
+
+    Repeats of the same thing collapse into one entry with a count: an agent
+    driving a desktop can call the same tool hundreds of times, and a timeline
+    that lists each one is not a timeline.
+    """
+    if vmid is None:
+        return
+    try:
+        now = int(time.time())
+        with EVENTS_LOCK:
+            d = _events_load()
+            thread = d.setdefault(str(vmid), [])
+            if thread and thread[-1]["what"] == what and thread[-1].get("detail") == detail:
+                thread[-1]["count"] = thread[-1].get("count", 1) + 1
+                thread[-1]["last"] = now
+            else:
+                thread.append({"ts": now, "what": what, "detail": detail, "count": 1})
+            del thread[:-MAX_EVENTS]
+            _events_save(d)
+    except Exception:                                 # noqa: BLE001
+        pass                                          # bookkeeping never breaks work
+
+
+def _pve_events(vmid, limit=200):
+    try:
+        tasks = api(f"/nodes/{NODE}/tasks?vmid={int(vmid)}&limit={limit}") or []
+    except Exception:                                 # noqa: BLE001
+        return []
+    out = []
+    for t in tasks:
+        label = _PVE_TASKS.get(t.get("type"))
+        if not label:
+            continue
+        ok = (t.get("status") or "OK") in ("OK", "")
+        out.append({"ts": int(t.get("starttime") or 0), "what": label,
+                    "detail": "" if ok else str(t.get("status"))[:80],
+                    "source": "proxmox", "ok": ok})
+    return out
+
+
+def _guest_boot(vmid):
+    """Ask the guest when it last booted. Best effort: a wedged or powered-off
+    guest simply contributes nothing."""
+    try:
+        out = agent_run_ps(vmid, "$ProgressPreference='SilentlyContinue'\n"
+                                 "Write-Output ('BOOT|' + (Get-CimInstance Win32_OperatingSystem)"
+                                 ".LastBootUpTime.ToUniversalTime().ToString('s'))", timeout=45)
+        for line in (out or "").splitlines():
+            if line.strip().startswith("BOOT|"):
+                stamp = line.strip().split("|", 1)[1]
+                ts = int(time.mktime(time.strptime(stamp, "%Y-%m-%dT%H:%M:%S")))
+                return [{"ts": ts, "what": "windows booted", "detail": stamp,
+                         "source": "guest", "ok": True}]
+    except Exception:                                 # noqa: BLE001
+        pass
+    return []
+
+
+def sandbox_history(vmid, include_guest=True):
+    vmid = int(vmid)
+    events = [{"ts": e["ts"], "what": e["what"], "detail": e.get("detail", ""),
+               "count": e.get("count", 1), "last": e.get("last"),
+               "source": "controller", "ok": True}
+              for e in _events_load().get(str(vmid), [])]
+    events += _pve_events(vmid)
+    if include_guest:
+        events += _guest_boot(vmid)
+    events.sort(key=lambda e: e["ts"])
+    for e in events:
+        e["when"] = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(e["ts"]))
+    return {
+        "vmid": vmid,
+        "events": events,
+        "note": ("Proxmox supplies the lifecycle and screen views; the controller "
+                 "supplies what it did itself. An agent using a sandbox's Deskhand "
+                 "token talks to it directly and never passes through here, so that "
+                 "traffic cannot appear in this list."),
+    }
+
+
+# --------------------------------------------------------------------------
 # Comments
 # --------------------------------------------------------------------------
 COMMENTS_PATH = os.path.join(HERE, "comments.json")
@@ -786,6 +905,25 @@ MCP_TOOLS = [
         "inputSchema": {"type": "object", "properties": {}},
     },
     {
+        "name": "sandbox_history",
+        "description": ("What has happened to a sandbox, oldest first: cloned, powered on, "
+                        "rebooted, screen viewed, agents installed, Deskhand updated, files "
+                        "read or written, notes left. Lifecycle and screen views come from "
+                        "Proxmox; the rest is what the controller did. Calls an agent makes "
+                        "directly to a sandbox's Deskhand do not pass through the controller "
+                        "and so cannot appear."),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "vmid": {"type": "integer"},
+                "include_guest": {"type": "boolean",
+                                  "description": "Also ask the guest when it last booted. "
+                                                 "Default true; skipped silently if it cannot answer."},
+            },
+            "required": ["vmid"],
+        },
+    },
+    {
         "name": "browse_guest_file",
         "description": ("List a directory inside a sandbox THROUGH THE GUEST AGENT, which "
                         "works when Deskhand is not running -- a guest stuck in setup, at a "
@@ -1112,6 +1250,17 @@ def _ps_literal(s):
     """A PowerShell single-quoted string. Doubling the quote is the whole escape
     rule there, which is why nothing else needs encoding."""
     return "'" + str(s).replace("'", "''") + "'"
+
+
+def _vmid_for_name(name):
+    """Map a proxied tool's sandbox prefix back to its vmid, quietly."""
+    try:
+        for s in list_sandboxes():
+            if s.get("name") == name:
+                return s.get("vmid")
+    except Exception:                                 # noqa: BLE001
+        pass
+    return None
 
 
 def _check_managed(vmid):
@@ -2049,7 +2198,19 @@ def _sandbox_view(e):
     return out
 
 
+_QUIET_TOOLS = {"list_sandboxes", "job_status", "read_comments", "sandbox_history"}
+
+
 def mcp_call(name, args):
+    # Reads are not worth a timeline entry; everything that changes something,
+    # or reaches into a guest, is.
+    if name not in _QUIET_TOOLS:
+        record_event(args.get("vmid"), name, str(args.get("path") or args.get("agents") or "")[:80])
+    if name == "sandbox_history":
+        vmid = args.get("vmid")
+        if vmid is None:
+            raise ValueError("vmid is required")
+        return sandbox_history(vmid, args.get("include_guest", True))
     if name in ("browse_guest_file", "read_guest_file", "write_guest_file"):
         vmid = args.get("vmid")
         if vmid is None:
@@ -2244,6 +2405,8 @@ def handle_mcp(msg, host=None):
             if SEP in tname and not any(t["name"] == tname for t in MCP_TOOLS):
                 # Namespaced: forward to that sandbox's Deskhand and return its
                 # response untouched, so the caller sees exactly what it sent.
+                record_event(_vmid_for_name(tname.split(SEP)[0]),
+                             "deskhand tool", tname.split(SEP)[-1])
                 inner = proxy_call(tname, targs)
                 return {"jsonrpc": "2.0", "id": mid, "result": inner}
             result = mcp_call(tname, targs)
@@ -2836,6 +2999,16 @@ class Handler(BaseHTTPRequestHandler):
                                        html.escape((AGENTS_CFG.get("hermes") or {}).get("model") or "",
                                                    quote=True)),
                               "text/html; charset=utf-8")
+        if p.path == "/api/history":
+            q = urllib.parse.parse_qs(p.query)
+            vmid = (q.get("vmid") or [None])[0]
+            if vmid is None:
+                return self._send(400, json.dumps({"error": "vmid is required"}))
+            guest = (q.get("guest") or ["1"])[0] not in ("0", "false")
+            try:
+                return self._send(200, json.dumps(sandbox_history(vmid, guest)))
+            except Exception as exc:                  # noqa: BLE001
+                return self._send(400, json.dumps({"error": str(exc)}))
         if p.path == "/api/comments":
             q = urllib.parse.parse_qs(p.query)
             vmid = (q.get("vmid") or [None])[0]
@@ -2897,6 +3070,8 @@ class Handler(BaseHTTPRequestHandler):
                     {"models": [], "base_url": base, "error": str(exc)[:200]}))
         if p.path in ("/api/stream", "/api/screen"):
             q = urllib.parse.parse_qs(p.query)
+            record_event((q.get("vmid") or [None])[0],
+                         "screenshot taken" if p.path == "/api/screen" else "screen streamed")
             try:
                 vmid = _check_managed(q.get("vmid", [""])[0])
             except Exception as exc:                   # noqa: BLE001
@@ -3057,6 +3232,7 @@ class Handler(BaseHTTPRequestHandler):
                 entry = add_comment(body.get("vmid"), body.get("text"),
                                     body.get("author"), via="web",
                                     addr=self.client_address[0])
+                record_event(body.get("vmid"), "note added", entry["author"])
                 return self._send(200, json.dumps(entry))
             except Exception as exc:                  # noqa: BLE001
                 return self._send(400, json.dumps({"error": str(exc)}))

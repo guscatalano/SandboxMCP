@@ -530,6 +530,50 @@ Writes are chunked and staged to a temporary file, moved into place only once
 every chunk has landed, so a failure part-way through leaves the original
 untouched.
 
+## What happened to this sandbox
+
+`sandbox_history` (or `GET /api/history?vmid=N`) returns a timeline, oldest
+first, assembled from three sources and labelled with which one each entry came
+from.
+
+```
+2026-09-28 07:08:02  proxmox     powered on
+2026-09-28 07:11:51  proxmox     rebooted            VM quit/powerdown failed
+2026-09-28 08:23:01  guest       windows booted      2026-09-28T08:23:01
+2026-09-28 16:12:33  controller  screenshot taken
+2026-09-28 16:13:07  controller  note added          claude
+```
+
+**Proxmox** already records the lifecycle for free — clone, power on/off,
+reboot, destroy — and `vncproxy`, which is literally *someone looked at the
+screen*. Re-recording that would duplicate a log that is already authoritative,
+so the history reads it live rather than keeping its own copy. Failed tasks
+carry their error across instead of being dropped.
+
+**The controller** records what Proxmox cannot see: agents installed, Deskhand
+updated or repaired, guest files read and written, notes left, screenshots
+taken. These persist in `events.json`. Repeats collapse into one entry with a
+count, because an agent driving a desktop calls the same tool hundreds of times
+and a timeline that lists each one is not a timeline.
+
+**The guest** contributes its last boot time, asked live over the agent
+channel. A powered-off or wedged guest simply contributes nothing rather than
+failing the request.
+
+### What it cannot show
+
+An agent holding a sandbox's Deskhand token talks to it **directly** on the
+sandbox network — that traffic never passes through the controller, so it
+cannot appear here. Only Deskhand calls proxied through the controller's MCP
+endpoint are recorded. The response says so in its own `note` field, because a
+history that quietly omitted a whole channel would be worse than one that
+admits the gap.
+
+Likewise, general file *access* inside the guest is not tracked: Windows does
+not audit reads without SACLs and an audit policy, and turning that on would
+cost far more than it is worth here. What is recorded is files this controller
+itself read or wrote.
+
 ## Notes on a sandbox
 
 A sandbox outlives the session that made it. The next person -- or the next
