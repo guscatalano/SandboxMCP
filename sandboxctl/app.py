@@ -174,14 +174,73 @@ class Job:
         self.failed = False
         self.result = {}
         self.started = time.time()
+        self.vmid = None            # set once a create knows which VM it took
 
     def log(self, msg):
         self.lines.append(f"{time.strftime('%H:%M:%S')}  {msg}")
+        _jobs_save()
 
     def as_dict(self):
         return {"id": self.id, "title": self.title, "lines": self.lines,
                 "done": self.done, "failed": self.failed, "result": self.result,
+                "vmid": self.vmid,
                 "elapsed": int(time.time() - self.started)}
+
+    @classmethod
+    def from_dict(cls, d):
+        job = cls.__new__(cls)
+        job.id = d.get("id") or secrets.token_hex(6)
+        job.title = d.get("title") or ""
+        job.lines = list(d.get("lines") or [])
+        job.done = bool(d.get("done"))
+        job.failed = bool(d.get("failed"))
+        job.result = d.get("result") or {}
+        job.vmid = d.get("vmid")
+        job.started = time.time() - int(d.get("elapsed") or 0)
+        return job
+
+
+JOBS_PATH = os.path.join(HERE, "jobs.json")
+
+
+def _jobs_save():
+    """Called on every log line. Jobs are low-volume -- a create writes about
+    eight lines in six minutes -- so this costs nothing and means the record
+    survives whatever happens to the process."""
+    try:
+        with JOBS_LOCK:
+            snapshot = [j.as_dict() for j in JOBS.values()]
+        tmp = JOBS_PATH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(snapshot, fh, indent=2, default=str)
+        os.replace(tmp, JOBS_PATH)
+    except Exception:                                 # noqa: BLE001
+        pass                                          # never fail work over bookkeeping
+
+
+def _jobs_load():
+    """Restore the record at startup and close out anything left mid-flight.
+
+    A job that was not done when we stopped has no thread any more, so it can
+    never finish. Saying so -- and naming repair_sandbox -- turns a silently
+    half-built VM into a one-line explanation.
+    """
+    try:
+        with open(JOBS_PATH, encoding="utf-8") as fh:
+            saved = json.load(fh)
+    except Exception:                                 # noqa: BLE001
+        return
+    for d in saved:
+        job = Job.from_dict(d)
+        if not job.done:
+            job.done = True
+            job.failed = True
+            job.log("INTERRUPTED: the controller restarted while this job was "
+                    "running, so its worker is gone.")
+            if job.vmid:
+                job.log(f"  VM {job.vmid} may be half-provisioned -- "
+                        f"repair_sandbox({job.vmid}) finishes it.")
+        JOBS[job.id] = job
 
 
 MAX_JOBS = 50
@@ -275,6 +334,7 @@ def start_job(title, fn, *args):
             job.log(f"FAILED: {exc}")
         finally:
             job.done = True
+            _jobs_save()
     threading.Thread(target=run, daemon=True).start()
     return job
 
@@ -591,6 +651,7 @@ def do_create(job, opts):
     tried = []
     for _ in range(6):
         vmid = free_vmid(skip=tried)
+        job.vmid = vmid
         job.log(f"allocating VMID {vmid} ({name})")
         try:
             api(f"/nodes/{NODE}/qemu/{TEMPLATE}/clone", "POST", {
@@ -2868,5 +2929,9 @@ if __name__ == "__main__":
               f"(8h chunks, {REC_RETENTION_DAYS}d retention)", flush=True)
 
     srv = ThreadingHTTPServer((LISTEN[0], int(LISTEN[1])), Handler)
+    _jobs_load()
+    stale = [j for j in JOBS.values() if j.failed and any("INTERRUPTED" in l for l in j.lines)]
+    if stale:
+        print(f"  {len(stale)} job(s) were interrupted by a restart; see the dashboard", flush=True)
     print(f"sandboxctl listening on {LISTEN[0]}:{LISTEN[1]}  template={TEMPLATE} pool={POOL}", flush=True)
     srv.serve_forever()

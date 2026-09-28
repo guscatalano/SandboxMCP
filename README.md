@@ -645,6 +645,13 @@ Things that cost real time to find:
 - **Proxmox API tokens go in an `Authorization:` header.** A bare
   `PVEAPIToken=...` header reads as an anonymous request and returns 401, which
   looks exactly like a bad secret.
+- **Do not restart the controller mid-provision.** A create takes about six
+  minutes; restarting inside that window kills the worker thread and leaves a
+  VM cloned and booted with no auto-logon and no Deskhand -- a lock screen with
+  no explanation. Jobs are persisted, so the record now says
+  `INTERRUPTED ... repair_sandbox(<vmid>) finishes it` rather than vanishing,
+  and `repair_sandbox` does finish it. But the cheap fix is to look at
+  `/api/jobs` before bouncing the service.
 
 ## Layout
 
