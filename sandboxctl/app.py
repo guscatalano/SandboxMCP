@@ -786,6 +786,55 @@ MCP_TOOLS = [
         "inputSchema": {"type": "object", "properties": {}},
     },
     {
+        "name": "browse_guest_file",
+        "description": ("List a directory inside a sandbox THROUGH THE GUEST AGENT, which "
+                        "works when Deskhand is not running -- a guest stuck in setup, at a "
+                        "lock screen, or not yet provisioned. If Deskhand is up, prefer "
+                        "<sandbox>__deskhand_browse_files: it is faster and not capped."),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "vmid": {"type": "integer"},
+                "path": {"type": "string", "description": "Directory, e.g. C:\\Windows\\Panther"},
+            },
+            "required": ["vmid"],
+        },
+    },
+    {
+        "name": "read_guest_file",
+        "description": ("Read a file inside a sandbox through the guest agent, for when "
+                        "Deskhand cannot answer. Good for setup logs: "
+                        "C:\\Windows\\Panther\\setuperr.log and "
+                        "C:\\Windows\\Panther\\UnattendGC\\setupact.log explain most "
+                        "failed provisions. 4 MiB limit; binary returns base64."),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "vmid": {"type": "integer"},
+                "path": {"type": "string", "description": "Full path to the file."},
+            },
+            "required": ["vmid", "path"],
+        },
+    },
+    {
+        "name": "write_guest_file",
+        "description": ("Write a file inside a sandbox through the guest agent, for fixing a "
+                        "guest Deskhand cannot reach. Written in chunks to a temporary file "
+                        "and moved into place only once every chunk lands, so a failure "
+                        "part-way through leaves the original untouched."),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "vmid": {"type": "integer"},
+                "path": {"type": "string"},
+                "text": {"type": "string", "description": "UTF-8 content."},
+                "content_base64": {"type": "string", "description": "Binary content instead."},
+                "append": {"type": "boolean", "description": "Append rather than replace."},
+            },
+            "required": ["vmid", "path"],
+        },
+    },
+    {
         "name": "comment_sandbox",
         "description": ("Leave a note on a sandbox, so the next person or agent knows what "
                         "it is for and what you did to it. Notes are append-only and survive "
@@ -922,6 +971,147 @@ MCP_TOOLS = [
 # sandbox keeps the same token. That matters: a changed token would silently
 # break whatever MCP client is already pointed at this box.
 
+
+
+# --------------------------------------------------------------------------
+# Guest filesystem, over the agent channel
+# --------------------------------------------------------------------------
+# PowerShell's -EncodedCommand goes on a command line, so the whole script must
+# fit in it. Writes are therefore chunked; reads are capped because the result
+# comes back through the same place.
+GUEST_READ_MAX = 4 * 1024 * 1024        # 4 MiB, base64'd on the way out
+GUEST_WRITE_CHUNK = 6 * 1024            # bytes of payload per exec call
+
+
+def _guest_ps(vmid, script, timeout=180):
+    """Run PowerShell in a managed sandbox and insist on an answer.
+
+    ProgressPreference is silenced because the agent hands back PowerShell's
+    CLIXML progress stream alongside stdout, and that stream is full of
+    base64-alphabet characters -- which a lenient b64decode will happily
+    absorb into the payload.
+    """
+    _check_managed(vmid)
+    out = agent_run_ps(vmid, "$ProgressPreference='SilentlyContinue'\n" + script,
+                       timeout=timeout)
+    if out is None:
+        raise RuntimeError(
+            "the guest agent did not answer. The VM may be rebooting, or off. "
+            "This channel needs qemu-guest-agent, which is the one thing that "
+            "survives when Deskhand does not.")
+    return out
+
+
+def guest_browse(vmid, path="C:\\"):
+    """List a directory. Directories first, then files, both by name."""
+    script = (
+        "$ErrorActionPreference='Stop'\n"
+        "$p = %s\n"
+        "if (-not (Test-Path -LiteralPath $p)) { Write-Output 'ERR|not found'; exit }\n"
+        "$items = Get-ChildItem -LiteralPath $p -Force -ErrorAction SilentlyContinue |\n"
+        "  Sort-Object @{e={-not $_.PSIsContainer}}, Name |\n"
+        "  Select-Object -First 2000\n"
+        "foreach ($i in $items) {\n"
+        "  $kind = if ($i.PSIsContainer) { 'dir' } else { 'file' }\n"
+        "  $size = if ($i.PSIsContainer) { 0 } else { $i.Length }\n"
+        "  Write-Output ($kind + '|' + $size + '|' + $i.LastWriteTimeUtc.ToString('s') + '|' + $i.Name)\n"
+        "}\n" % _ps_literal(path))
+    out = _guest_ps(vmid, script)
+    if out.strip().startswith("ERR|"):
+        raise RuntimeError("path not found: " + path)
+    entries = []
+    for line in out.splitlines():
+        bits = line.strip().split("|", 3)
+        if len(bits) == 4 and bits[0] in ("dir", "file"):
+            entries.append({"kind": bits[0], "size": int(bits[1] or 0),
+                            "modified": bits[2], "name": bits[3]})
+    return {"path": path, "entries": entries, "count": len(entries)}
+
+
+def guest_read(vmid, path):
+    """Read a file as text. Binary comes back base64 with a flag."""
+    script = (
+        "$ErrorActionPreference='Stop'\n"
+        "$p = %s\n"
+        "if (-not (Test-Path -LiteralPath $p)) { Write-Output 'ERR|not found'; exit }\n"
+        "$len = (Get-Item -LiteralPath $p).Length\n"
+        "if ($len -gt %d) { Write-Output ('ERR|too large: ' + $len + ' bytes'); exit }\n"
+        "$b = [IO.File]::ReadAllBytes($p)\n"
+        "Write-Output ('OK|' + $len + '|' + [Convert]::ToBase64String($b))\n"
+        % (_ps_literal(path), GUEST_READ_MAX))
+    out = _guest_ps(vmid, script, timeout=300)
+    line = _marked_line(out)
+    if line.startswith("ERR|"):
+        raise RuntimeError(line.split("|", 1)[1] + " (" + path + ")")
+    _, size, b64 = line.split("|", 2)
+    # validate=True: anything that is not base64 is a bug to surface, not
+    # noise to quietly absorb.
+    raw = base64.b64decode(b64.strip(), validate=True)
+    try:
+        return {"path": path, "size": int(size), "text": raw.decode("utf-8")}
+    except UnicodeDecodeError:
+        return {"path": path, "size": int(size), "binary": True,
+                "base64": base64.b64encode(raw).decode()}
+
+
+def guest_write(vmid, path, text=None, content_base64=None, append=False):
+    """Write a file, in chunks, and verify the length afterwards."""
+    if content_base64:
+        blob = base64.b64decode(content_base64)
+    elif text is not None:
+        blob = text.encode("utf-8")
+    else:
+        raise ValueError("pass text or content_base64")
+
+    tmp = path + ".sbxpart"
+    first = True
+    for off in range(0, len(blob) or 1, GUEST_WRITE_CHUNK):
+        part = base64.b64encode(blob[off:off + GUEST_WRITE_CHUNK]).decode()
+        mode = "Create" if first else "Append"
+        script = (
+            "$ErrorActionPreference='Stop'\n"
+            "$d = [Convert]::FromBase64String('%s')\n"
+            "$fs = [IO.File]::Open(%s, [IO.FileMode]::%s, [IO.FileAccess]::Write)\n"
+            "$fs.Write($d, 0, $d.Length); $fs.Close()\n"
+            "Write-Output 'OK'\n" % (part, _ps_literal(tmp), mode))
+        if _marked_line(_guest_ps(vmid, script, timeout=120), ("OK",)) != "OK":
+            raise RuntimeError("chunk write failed at offset %d" % off)
+        first = False
+
+    # Swap into place only once every chunk landed, so a failure part-way
+    # through leaves the original file untouched.
+    script = (
+        "$ErrorActionPreference='Stop'\n"
+        "$t = %s; $p = %s\n"
+        "$n = (Get-Item -LiteralPath $t).Length\n"
+        "if (%s) { Get-Content -LiteralPath $t -Raw | Add-Content -LiteralPath $p -NoNewline; Remove-Item -LiteralPath $t }\n"
+        "else { Move-Item -LiteralPath $t -Destination $p -Force }\n"
+        "Write-Output ('OK|' + (Get-Item -LiteralPath $p).Length)\n"
+        % (_ps_literal(tmp), _ps_literal(path), "$true" if append else "$false"))
+    line = _marked_line(_guest_ps(vmid, script, timeout=120))
+    if not line.startswith("OK|"):
+        raise RuntimeError("could not place the file: " + line[:120])
+    return {"path": path, "written": len(blob), "size_on_disk": int(line.split("|")[1])}
+
+
+def _marked_line(out, prefixes=("OK|", "ERR|")):
+    """Pull our own marked line out of whatever else the channel returned.
+
+    The guest agent merges PowerShell's other streams into the reply, so the
+    payload has to identify itself rather than be assumed to be the whole of
+    stdout.
+    """
+    for line in (out or "").splitlines():
+        line = line.strip()
+        if any(line.startswith(p) for p in prefixes) or line in prefixes:
+            return line
+    raise RuntimeError("no result line in the guest reply: " + (out or "")[:160])
+
+
+def _ps_literal(s):
+    """A PowerShell single-quoted string. Doubling the quote is the whole escape
+    rule there, which is why nothing else needs encoding."""
+    return "'" + str(s).replace("'", "''") + "'"
 
 
 def _check_managed(vmid):
@@ -1860,6 +2050,18 @@ def _sandbox_view(e):
 
 
 def mcp_call(name, args):
+    if name in ("browse_guest_file", "read_guest_file", "write_guest_file"):
+        vmid = args.get("vmid")
+        if vmid is None:
+            raise ValueError("vmid is required")
+        if name == "browse_guest_file":
+            return guest_browse(vmid, args.get("path") or "C:\\")
+        if not args.get("path"):
+            raise ValueError("path is required")
+        if name == "read_guest_file":
+            return guest_read(vmid, args["path"])
+        return guest_write(vmid, args["path"], args.get("text"),
+                           args.get("content_base64"), bool(args.get("append")))
     if name == "comment_sandbox":
         vmid = args.get("vmid")
         if vmid is None:

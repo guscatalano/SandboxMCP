@@ -497,6 +497,39 @@ Two things worth knowing before you turn this on:
   The controller's own token cannot do this -- it has no cluster firewall
   rights, deliberately -- so it is a one-time admin change.
 
+## Files on a guest that cannot answer
+
+Every sandbox already exposes ten filesystem tools through Deskhand
+(`<name>__deskhand_read_file`, `browse_files`, `write_file`, `zip`, and so on),
+and those stay the right answer whenever Deskhand is running: faster, no size
+cap, and gated by that sandbox's own token.
+
+`browse_guest_file`, `read_guest_file` and `write_guest_file` exist for when it
+is **not** running — a guest stuck in setup, sitting at a lock screen, or not
+yet provisioned. They go over `qemu-guest-agent` instead, for the same reason
+the VNC screenshot exists: it works when nothing in the guest does.
+
+That is not hypothetical. Diagnosing a failed provision means reading
+`C:\Windows\Panther\setuperr.log` and
+`C:\Windows\Panther\UnattendGC\setupact.log` from a machine that by definition
+has no Deskhand on it.
+
+Two implementation notes, both learned the hard way:
+
+- **Not the agent's `file-read`.** That leaks a handle in the guest, which once
+  locked `C:\Deskhand` and broke updates until the VM was rebooted. Everything
+  here goes through `agent/exec`.
+- **The reply is not just stdout.** The agent merges PowerShell's other streams
+  in, and the CLIXML progress stream is full of base64-alphabet characters —
+  which a lenient `b64decode` absorbs into the payload, silently returning more
+  bytes than the file contains. A read of an 85-byte log came back as 402 bytes
+  of correct text followed by noise. The payload now identifies itself with a
+  marker line and decodes with `validate=True`.
+
+Writes are chunked and staged to a temporary file, moved into place only once
+every chunk has landed, so a failure part-way through leaves the original
+untouched.
+
 ## Notes on a sandbox
 
 A sandbox outlives the session that made it. The next person -- or the next
