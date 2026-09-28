@@ -347,6 +347,24 @@ def wait_agent(vmid, timeout=900):
     raise RuntimeError("guest agent never responded")
 
 
+def _reboot_pending(vmid):
+    """True while Windows still owes itself a reboot.
+
+    Set by the zero-day patch OOBE installs. Templates built with the current
+    provision.ps1 never see it; older ones do, and this is what stops them
+    failing fifteen minutes later inside the Deskhand install.
+    """
+    try:
+        out = agent_run_ps(
+            vmid,
+            "Write-Output (Test-Path 'HKLM:\\SOFTWARE\\Microsoft\\Windows\\"
+            "CurrentVersion\\Component Based Servicing\\RebootPending')",
+            timeout=60)
+    except Exception:
+        return False                # agent gone mid-reboot; the caller re-checks
+    return bool(out) and out.strip().lower().startswith("true")
+
+
 def wait_oobe(job, vmid, timeout=900):
     """Block until Windows setup is genuinely finished.
 
@@ -364,6 +382,14 @@ def wait_oobe(job, vmid, timeout=900):
         except Exception:
             out = None      # agent gone mid-reboot; keep waiting
         if out and out.strip().startswith("0"):
+            # SystemSetupInProgress drops to 0 before OOBE has necessarily
+            # stopped working. If OOBE installed a zero-day patch it still owes
+            # us a reboot, and the pass after that reboot clears auto-logon --
+            # so writing it now would be writing into a file about to be wiped.
+            if _reboot_pending(vmid):
+                job.log("  setup reports done but a reboot is pending; waiting it out")
+                time.sleep(20)
+                continue
             job.log("OOBE finished; letting its cleanup settle")
             time.sleep(60)
             return

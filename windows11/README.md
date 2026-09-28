@@ -252,6 +252,43 @@ this file came from. Note `findstr` is absent from this WinPE, so use `type`.
 rejects non-ASCII characters. The CSI parser reports every complaint as one
 opaque code, so anything it does not need is worth not shipping.
 
+## OOBE's zero-day patch will wipe your auto-logon
+
+Windows Setup contacts Windows Update near the end of OOBE and installs what
+the logs call a **ZDP** -- a zero-day patch. It needs a reboot, and the OOBE
+pass that runs *after* that reboot clears the auto-logon values:
+
+```
+[CloudExperienceHostBroker.exe] Detected Reboot Required after ZDP install
+[CloudExperienceHostBroker.exe] Clearing Auto-logon values per request
+```
+
+Anything that wrote auto-logon before that reboot finds it gone. The machine
+comes up with no interactive session, Deskhand has nothing to install into, and
+the console shows *"Why did my PC restart?"* -- which looks like a broken image
+but is not.
+
+The trap is that it is **intermittent**: it only happens when Microsoft has a
+patch to offer that day, so a template can clone perfectly for weeks and then
+fail on every clone with nothing changed on your side.
+
+`<ProtectYourPC>3</ProtectYourPC>` in the answer file does **not** stop it --
+that setting governs the privacy-settings page, not the ZDP fetch. The policy
+below does, and it survives `sysprep /generalize` because the Policies hive is
+not reset:
+
+```
+HKLM\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate
+    DoNotConnectToWindowsUpdateInternetLocations = 1
+  \AU  NoAutoUpdate = 1
+```
+
+`provision.ps1` sets both, so templates built with it are immune. For a
+template built before that, `sandboxctl` also refuses to write auto-logon while
+`Component Based Servicing\RebootPending` is set, so an affected image waits
+and recovers instead of failing fifteen minutes later inside the Deskhand
+install.
+
 ## Debugging from outside the guest
 
 `tools/` holds two scripts for when an install misbehaves and the guest has no

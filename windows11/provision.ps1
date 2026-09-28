@@ -41,6 +41,27 @@ if ($bl -and $bl.VolumeStatus -ne 'FullyDecrypted') {
 }
 
 # ---------------------------------------------------------------------------
+# Windows Update during OOBE
+# ---------------------------------------------------------------------------
+# OOBE contacts Windows Update and installs a "zero-day patch" before the
+# desktop appears. The ZDP requires a reboot, and the OOBE pass that runs after
+# that reboot CLEARS the auto-logon values -- so a controller that wrote them
+# before the reboot finds them gone, the sandbox comes up with no session, and
+# the Deskhand install fails into "Why did my PC restart?".
+#
+# <ProtectYourPC>3</ProtectYourPC> in the answer file does NOT prevent this; it
+# governs the privacy settings page, not the ZDP fetch. This policy does, and it
+# lives in the Policies hive, which survives sysprep /generalize.
+#
+# A template is a base image, not a machine anyone browses from: it should be
+# patched deliberately by rebuilding it, never by OOBE behind your back.
+Step 'Windows Update during OOBE'
+$wu = 'HKLM\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate'
+reg add $wu /v DoNotConnectToWindowsUpdateInternetLocations /t REG_DWORD /d 1 /f 2>&1 | Out-Null
+reg add "$wu\AU" /v NoAutoUpdate /t REG_DWORD /d 1 /f 2>&1 | Out-Null
+Ok 'ZDP disabled'
+
+# ---------------------------------------------------------------------------
 # Locate the virtio-win CD
 # ---------------------------------------------------------------------------
 # Identified by content rather than by drive letter or volume label, because
