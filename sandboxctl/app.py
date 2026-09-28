@@ -186,6 +186,76 @@ class Job:
 
 MAX_JOBS = 50
 
+# --------------------------------------------------------------------------
+# Comments
+# --------------------------------------------------------------------------
+COMMENTS_PATH = os.path.join(HERE, "comments.json")
+COMMENTS_LOCK = threading.Lock()
+MAX_COMMENTS = 200            # per sandbox; a thread is a note, not a log
+
+
+def _comments_load():
+    try:
+        with open(COMMENTS_PATH, encoding="utf-8") as fh:
+            d = json.load(fh)
+    except Exception:
+        d = {}
+    d.setdefault("active", {})
+    d.setdefault("archive", [])
+    return d
+
+
+def _comments_save(d):
+    # Write-then-swap: a reader never sees a half-written file.
+    tmp = COMMENTS_PATH + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(d, fh, indent=2)
+    os.replace(tmp, COMMENTS_PATH)
+
+
+def add_comment(vmid, text, author=None, via="web", addr=None):
+    text = (text or "").strip()
+    if not text:
+        raise ValueError("comment text is required")
+    if len(text) > 4000:
+        raise ValueError("comment too long (4000 chars max)")
+    entry = {
+        "ts": int(time.time()),
+        "author": (author or "").strip()[:60] or "anonymous",
+        "text": text,
+        "via": via,
+        "addr": addr or "",
+    }
+    with COMMENTS_LOCK:
+        d = _comments_load()
+        thread = d["active"].setdefault(str(vmid), [])
+        thread.append(entry)
+        del thread[:-MAX_COMMENTS]
+        _comments_save(d)
+    return entry
+
+
+def get_comments(vmid):
+    return _comments_load()["active"].get(str(vmid), [])
+
+
+def archive_comments(vmid, name=""):
+    """Called when a sandbox is destroyed. VMIDs are reused, so the thread must
+    not carry over to whatever lands on this vmid next."""
+    with COMMENTS_LOCK:
+        d = _comments_load()
+        thread = d["active"].pop(str(vmid), None)
+        if thread:
+            d["archive"].append({"vmid": int(vmid), "name": name,
+                                 "closed": int(time.time()), "comments": thread})
+            del d["archive"][:-200]
+            _comments_save(d)
+
+
+def get_archive(vmid=None):
+    arc = _comments_load()["archive"]
+    return [a for a in arc if vmid is None or a.get("vmid") == int(vmid)]
+
 
 def start_job(title, fn, *args):
     job = Job(title)
@@ -621,6 +691,10 @@ def do_destroy(job, vmid):
             time.sleep(3)
             if (vm("/status/current", vmid=vmid) or {}).get("status") == "stopped":
                 break
+    try:
+        archive_comments(vmid, (vm("/config", vmid=vmid) or {}).get("name") or "")
+    except Exception:                                 # noqa: BLE001
+        pass                                          # a note must never block a destroy
     _TOKEN_CACHE.pop(vmid, None)
     clear_agent_state(vmid)
     if RECORDER:
@@ -649,6 +723,36 @@ MCP_TOOLS = [
                         "bearer token, and a ready-to-use MCP endpoint for each one. "
                         "Use this to find a sandbox to drive."),
         "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "comment_sandbox",
+        "description": ("Leave a note on a sandbox, so the next person or agent knows what "
+                        "it is for and what you did to it. Notes are append-only and survive "
+                        "restarts; they are archived when the sandbox is destroyed. Say who "
+                        "you are in 'author' -- it is not verified, it is a signature."),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "vmid": {"type": "integer", "description": "Which sandbox to comment on."},
+                "text": {"type": "string", "description": "The note. 4000 chars max."},
+                "author": {"type": "string", "description": "Who is writing. Self-declared."},
+            },
+            "required": ["vmid", "text"],
+        },
+    },
+    {
+        "name": "read_comments",
+        "description": ("Read the notes left on a sandbox, oldest first. Worth doing before "
+                        "you change one you did not create. Pass archived=true to read the "
+                        "threads of sandboxes that no longer exist."),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "vmid": {"type": "integer", "description": "Which sandbox."},
+                "archived": {"type": "boolean", "description": "Read archived threads instead."},
+            },
+            "required": ["vmid"],
+        },
     },
     {
         "name": "create_sandbox",
@@ -1695,6 +1799,18 @@ def _sandbox_view(e):
 
 
 def mcp_call(name, args):
+    if name == "comment_sandbox":
+        vmid = args.get("vmid")
+        if vmid is None:
+            raise ValueError("vmid is required")
+        return add_comment(vmid, args.get("text"), args.get("author"), via="mcp")
+    if name == "read_comments":
+        vmid = args.get("vmid")
+        if vmid is None:
+            raise ValueError("vmid is required")
+        if args.get("archived"):
+            return get_archive(vmid)
+        return get_comments(vmid)
     if name == "list_sandboxes":
         return [_sandbox_view(e) for e in list_sandboxes()]
     if name == "create_sandbox":
@@ -1898,6 +2014,20 @@ code{font:12px ui-monospace,Consolas,monospace;background:#0b0d11;padding:2px 6p
 a{color:var(--acc)}
 .lnk{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
 .badge{font:11px ui-monospace,Consolas,monospace;border:1px solid var(--ln);border-radius:999px;padding:1px 8px;color:var(--mut)}
+.notes-toggle{margin-left:8px;font-size:11px;color:var(--mut);text-decoration:none;border-bottom:1px dotted var(--ln)}
+.notes-toggle:hover{color:var(--acc)}
+.notes-row>td{background:#0f131a;padding-top:12px}
+.notes{max-height:260px;overflow:auto;margin-bottom:10px}
+.note{border-left:2px solid var(--ln);padding:2px 0 6px 10px;margin-bottom:8px}
+.note .who{font-weight:600;margin-right:8px}
+.note .when{color:var(--mut);font-size:12px;margin-right:8px}
+.note .via{color:var(--mut);font-size:11px;font-family:ui-monospace,Consolas,monospace}
+.note .what{white-space:pre-wrap;margin-top:2px}
+.muted{color:var(--mut)}
+.notes-add{display:flex;gap:8px;flex-wrap:wrap}
+.notes-add input{background:#0b0d11;border:1px solid var(--ln);border-radius:6px;padding:7px 9px;color:var(--fg);font:13px inherit}
+.notes-add input:first-child{width:140px}
+.notes-add input:nth-child(2){flex:1;min-width:240px}
 details.menu{position:relative;display:inline-block}
 details.menu>summary{list-style:none;cursor:pointer;border:1px solid #30363d;border-radius:6px;padding:7px 11px;color:var(--mut);background:#161b22;font-weight:700}
 details.menu>summary::-webkit-details-marker{display:none}
@@ -2084,11 +2214,62 @@ function actions(s){
     <details class="menu"><summary>&#8943;</summary><div class="mi">${m.join('')}</div></details>`;
 }
 function row(s){
-  return `<tr><td><code>${s.vmid}</code></td><td>${s.name}</td>
+  return `<tr><td><code>${s.vmid}</code></td><td>${s.name}
+      <a href="#" class="notes-toggle" onclick="return toggleNotes(event,${s.vmid})"
+         title="Notes on this sandbox">notes</a></td>
     <td><span class="st ${s.status==='running'?'r':'s'}"></span>${s.status}</td>
     <td>${s.ip?`<code>${s.ip}</code>`:'&mdash;'}</td>
     <td><div class="lnk">${links(s)}</div></td>
-    <td style="text-align:right">${actions(s)}</td></tr>`;
+    <td style="text-align:right">${actions(s)}</td></tr>
+    <tr id="notes-${s.vmid}" class="notes-row" hidden><td colspan="6">
+      <div class="notes" id="notes-body-${s.vmid}">loading&hellip;</div>
+      <div class="notes-add">
+        <input id="notes-who-${s.vmid}" placeholder="your name" maxlength="60">
+        <input id="notes-txt-${s.vmid}" placeholder="What is this sandbox for? What did you change?"
+               onkeydown="if(event.key==='Enter')addNote(${s.vmid})">
+        <button class="d okish" onclick="addNote(${s.vmid})">Add note</button>
+      </div>
+    </td></tr>`;
+}
+
+// Notes are append-only and self-declared; the server records the channel and
+// the client address next to whatever name is typed.
+function toggleNotes(ev,vmid){
+  ev.preventDefault();
+  var tr=document.getElementById('notes-'+vmid);
+  tr.hidden=!tr.hidden;
+  if(!tr.hidden) loadNotes(vmid);
+  return false;
+}
+function fmtWhen(ts){
+  var d=new Date(ts*1000), n=Date.now()/1000, age=n-ts;
+  if(age<60) return 'just now';
+  if(age<3600) return Math.floor(age/60)+'m ago';
+  if(age<86400) return Math.floor(age/3600)+'h ago';
+  return d.toLocaleDateString()+' '+d.toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'});
+}
+function esc(s){ return String(s).replace(/[&<>"]/g, function(c){
+  return ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'})[c]; }); }
+function loadNotes(vmid){
+  var el=document.getElementById('notes-body-'+vmid);
+  fetch('api/comments?vmid='+vmid).then(function(r){return r.json();}).then(function(list){
+    if(!list.length){ el.innerHTML='<p class="muted">No notes yet. The next person here will not know what this box is for.</p>'; return; }
+    el.innerHTML=list.map(function(c){
+      return '<div class="note"><span class="who">'+esc(c.author)+'</span>'
+           + '<span class="when">'+fmtWhen(c.ts)+'</span>'
+           + '<span class="via">'+esc(c.via)+(c.addr?' &middot; '+esc(c.addr):'')+'</span>'
+           + '<div class="what">'+esc(c.text)+'</div></div>';
+    }).join('');
+  }).catch(function(){ el.textContent='could not load notes'; });
+}
+function addNote(vmid){
+  var who=document.getElementById('notes-who-'+vmid), txt=document.getElementById('notes-txt-'+vmid);
+  if(!txt.value.trim()) return;
+  fetch('api/comment',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({vmid:vmid,text:txt.value,author:who.value})})
+    .then(function(r){return r.json();})
+    .then(function(d){ if(d.error){ alert(d.error); return; } txt.value=''; loadNotes(vmid); })
+    .catch(function(){ alert('could not save the note'); });
 }
 // navigator.clipboard exists only in a SECURE context, and this UI is served
 // over plain http. Touching it throws synchronously -- before any .then()
@@ -2392,6 +2573,14 @@ class Handler(BaseHTTPRequestHandler):
                                        html.escape((AGENTS_CFG.get("hermes") or {}).get("model") or "",
                                                    quote=True)),
                               "text/html; charset=utf-8")
+        if p.path == "/api/comments":
+            q = urllib.parse.parse_qs(p.query)
+            vmid = (q.get("vmid") or [None])[0]
+            if vmid is None:
+                return self._send(400, json.dumps({"error": "vmid is required"}))
+            if (q.get("archived") or ["0"])[0] in ("1", "true"):
+                return self._send(200, json.dumps(get_archive(vmid)))
+            return self._send(200, json.dumps(get_comments(vmid)))
         if p.path == "/api/sandboxes":
             try:
                 return self._send(200, json.dumps(list_sandboxes()))
@@ -2600,6 +2789,14 @@ class Handler(BaseHTTPRequestHandler):
                 return
             out = replies if isinstance(body, list) else replies[0]
             return self._send(200, json.dumps(out))
+        if p.path == "/api/comment":
+            try:
+                entry = add_comment(body.get("vmid"), body.get("text"),
+                                    body.get("author"), via="web",
+                                    addr=self.client_address[0])
+                return self._send(200, json.dumps(entry))
+            except Exception as exc:                  # noqa: BLE001
+                return self._send(400, json.dumps({"error": str(exc)}))
         if p.path == "/api/fetch":
             job = start_job("Fetching Deskhand", do_fetch, (body.get("tag") or None))
             return self._send(200, json.dumps({"id": job.id}))

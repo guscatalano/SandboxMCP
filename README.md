@@ -497,6 +497,35 @@ Two things worth knowing before you turn this on:
   The controller's own token cannot do this -- it has no cluster firewall
   rights, deliberately -- so it is a one-time admin change.
 
+## Notes on a sandbox
+
+A sandbox outlives the session that made it. The next person -- or the next
+agent -- has no way to know what it is for, what was installed on it, or why it
+is in the state it is in. Each row carries an append-only thread for exactly
+that.
+
+```sh
+curl -s "$CTL/api/comments?vmid=901"
+curl -s -X POST "$CTL/api/comment" -H 'Content-Type: application/json'      -d '{"vmid":901,"text":"FL Studio installed; trial cannot reopen projects","author":"gus"}'
+```
+
+Agents get the same thread as MCP tools, `comment_sandbox` and `read_comments`,
+so a note left by a person is read by an agent and the other way round.
+
+Three decisions worth knowing:
+
+- **Append-only, and persisted.** Nothing edits or deletes, and the thread
+  lives in `comments.json` beside the config -- unlike jobs, which are
+  in-memory and vanish on restart.
+- **VMIDs are reused.** Destroying a sandbox archives its thread instead of
+  dropping it, so the next sandbox to land on that vmid starts clean while the
+  history survives. Read it back with `?archived=1`.
+- **Authorship is self-declared**, because the controller has no
+  authentication. The channel (`web`/`mcp`) and client address are recorded
+  next to whatever name was typed, so the record says who *claimed* to write it
+  and where it came from. That is honest; pretending to identity we cannot
+  verify would not be.
+
 ## Benchmarking with WindowsAgentArena
 
 `waa-runner/` runs [WindowsAgentArena](https://github.com/microsoft/WindowsAgentArena)
