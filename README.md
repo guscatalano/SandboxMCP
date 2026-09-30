@@ -52,6 +52,13 @@ client, and the lifecycle buttons. **Watch** opens a live view of any of them.
 | **Agents** | Install Hermes and/or opencode *inside* a sandbox, on demand, preconfigured. |
 | **Record** | Continuously records each sandbox's Proxmox console to H.264, in 8-hour chunks. |
 | **Proxy** | Every sandbox's Deskhand tools re-exported under one MCP endpoint, namespaced per sandbox. |
+| **Files** | Read, write and browse files in a sandbox over the guest agent -- so it works before Deskhand exists, and while setup is still running. |
+| **Configure** | Apply a [Groundhog](https://github.com/guscatalano/Groundhog) file: apps via winget, files, registry, environment, verification. |
+| **Template** | Build a new template in one call -- clone, settle, configure, sysprep, seal, and optionally activate. |
+| **Notes** | Per-sandbox notes with author and timestamp, so a machine says what it is for. Archived on destroy, because VMIDs are reused. |
+| **History** | What happened to a sandbox: boots, reboots, screen views, agent installs, file access. |
+| **Claim** | An advisory, self-expiring hold that guards the destructive calls, so two sessions do not collide. |
+| **Discover** | An arriving agent is told what this is, via MCP `instructions`, `/llms.txt` and `/.well-known/`. |
 
 The two watch sources are not redundant. **Proxmox VNC works when nothing is
 running in the guest** — during Windows setup, at a lock screen, on a boot loop,
