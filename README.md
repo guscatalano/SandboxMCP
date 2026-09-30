@@ -59,6 +59,7 @@ client, and the lifecycle buttons. **Watch** opens a live view of any of them.
 | **History** | What happened to a sandbox: boots, reboots, screen views, agent installs, file access. |
 | **Claim** | An advisory, self-expiring hold that guards the destructive calls, so two sessions do not collide. |
 | **Discover** | An arriving agent is told what this is, via MCP `instructions`, `/llms.txt` and `/.well-known/`. |
+| **Limits** | Hard caps on how many sandboxes exist and how many run at once. `create_sandbox` refuses at the limit; `capacity` reports the headroom. |
 
 The two watch sources are not redundant. **Proxmox VNC works when nothing is
 running in the guest** — during Windows setup, at a lock screen, on a boot loop,
@@ -864,6 +865,14 @@ VM and nowhere else.
 
 Things that cost real time to find:
 
+- **Each running sandbox costs the controller ~100 MB.** Every running one gets
+  its own `ffmpeg` console recorder, measured at ~100 MB of private memory —
+  flat once warm, and *not* reducible by encoder settings (identical across
+  resolutions, thread counts, `mbtree`/`rc-lookahead`, and `MALLOC_ARENA_MAX`).
+  Twelve running sandboxes OOM-killed a 1 GB controller, and the symptom was
+  jobs marked `INTERRUPTED`, which reads like a provisioning bug. Set
+  `max_running` to what the box can actually hold: roughly
+  `(RAM - 200 MB) / 100 MB`.
 - **`/agent/file-read` leaks its handle on Windows guests.** `qemu-ga.exe` keeps
   the file open for the rest of its life. Polling a file that way locks it
   permanently — and since `Remove-Item` deletes alphabetically, an update that

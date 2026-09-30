@@ -13,6 +13,10 @@
   "pool": "sandboxes",
   "id_range": [900, 949],
 
+  "_comment_limits": "Hard caps, both defaulting to the size of id_range (so inert until set). max_sandboxes caps how many exist; max_running caps how many run at once, which is the one that protects the controller's RAM -- each running sandbox costs roughly 100 MB for its console recorder, and twelve of them OOM-killed a 1 GB controller. create_sandbox refuses at either limit, and the recorder obeys max_running too, since a VM can be started from the Proxmox UI without this service being asked.",
+  "max_sandboxes": 12,
+  "max_running": 6,
+
   "_comment_bridge": "SDN vnet the sandboxes attach to. Isolated from the LAN, NATs outbound.",
   "bridge": "sbx0",
 

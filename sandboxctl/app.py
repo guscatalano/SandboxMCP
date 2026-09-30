@@ -54,6 +54,9 @@ TEMPLATE = int(CONFIG["template"])
 POOL = CONFIG.get("pool", "sandboxes")
 BRIDGE = CONFIG.get("bridge", "sbx0")
 ID_LO, ID_HI = CONFIG.get("id_range", [900, 949])
+# Default to the whole range, so these are inert until deliberately set.
+MAX_SANDBOXES = int(CONFIG.get("max_sandboxes") or (ID_HI - ID_LO + 1))
+MAX_RUNNING = int(CONFIG.get("max_running") or (ID_HI - ID_LO + 1))
 LISTEN = CONFIG.get("listen", ["0.0.0.0", 8080])
 # The payload is served on its OWN port, and that is the only port the
 # sandbox firewall rule allows. Sandboxes are the untrusted thing here; if
@@ -1474,6 +1477,13 @@ MCP_TOOLS = [
         },
     },
     {
+        "name": "capacity",
+        "description": ("How many sandboxes exist and how many are running, against the "
+                        "configured limits. Check this before creating one in bulk: "
+                        "create_sandbox refuses at the limit."),
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
         "name": "create_sandbox",
             "description": ("Create a new disposable Windows 11 sandbox with Deskhand installed. "
                         "Returns a job id immediately; poll job_status until done (about 5 "
@@ -2425,6 +2435,49 @@ if REC_DIR:
         log=lambda m: print(m, flush=True))
 
 
+_REC_WARNED = ""
+
+
+def capacity():
+    """How many sandboxes exist and run, against the limits.
+
+    Read from the pool rather than from a counter this service keeps, because a
+    sandbox can appear or disappear without this service doing it.
+    """
+    sb = list_sandboxes()
+    running = [s for s in sb if s.get("status") == "running"]
+    return {
+        "sandboxes": len(sb),
+        "max_sandboxes": MAX_SANDBOXES,
+        "sandboxes_left": max(0, MAX_SANDBOXES - len(sb)),
+        "running": len(running),
+        "max_running": MAX_RUNNING,
+        "running_left": max(0, MAX_RUNNING - len(running)),
+        "id_range": [ID_LO, ID_HI],
+        "note": ("Each running sandbox costs the controller roughly 100 MB for its "
+                 "console recorder, which is what max_running protects."),
+    }
+
+
+def _guard_capacity():
+    """Refuse a new sandbox at the limit, before any work is started.
+
+    Checked here rather than inside the job so the caller is told no
+    immediately, instead of getting a job id that fails several seconds later.
+    """
+    cap = capacity()
+    if cap["sandboxes"] >= MAX_SANDBOXES:
+        raise RuntimeError(
+            f"at the sandbox limit: {cap['sandboxes']} of {MAX_SANDBOXES} exist. "
+            "Destroy one you are finished with, or raise max_sandboxes in "
+            "config.json.")
+    if cap["running"] >= MAX_RUNNING:
+        raise RuntimeError(
+            f"at the running limit: {cap['running']} of {MAX_RUNNING} are running. "
+            "Each running sandbox costs the controller ~100 MB for its console "
+            "recorder. Destroy or stop one, or raise max_running in config.json.")
+
+
 def recorder_loop():
     """Keep recorders matched to running sandboxes, and sweep old chunks.
 
@@ -2435,7 +2488,24 @@ def recorder_loop():
     last_sweep = 0.0
     while True:
         try:
-            RECORDER.sync(list_sandboxes())
+            sb = list_sandboxes()
+            # The memory ceiling is per *recorder*, so it has to hold even when
+            # a VM was started from the Proxmox UI rather than through here.
+            # Lowest VMID first, so which ones get a recorder is stable and the
+            # set does not thrash between polls.
+            running = sorted((s for s in sb if s.get("status") == "running"),
+                             key=lambda s: s["vmid"])
+            if len(running) > MAX_RUNNING:
+                dropped = running[MAX_RUNNING:]
+                global _REC_WARNED
+                names = ", ".join(str(s["vmid"]) for s in dropped)
+                if names != _REC_WARNED:
+                    print(f"recorder: {len(running)} sandboxes running but max_running is "
+                          f"{MAX_RUNNING}; not recording {names}", flush=True)
+                    _REC_WARNED = names
+                keep = {s["vmid"] for s in running[:MAX_RUNNING]}
+                sb = [s for s in sb if s.get("status") != "running" or s["vmid"] in keep]
+            RECORDER.sync(sb)
             if time.time() - last_sweep > 3600:
                 RECORDER.sweep()
                 last_sweep = time.time()
@@ -2744,7 +2814,10 @@ def mcp_call(name, args):
         return get_comments(vmid)
     if name == "list_sandboxes":
         return [_sandbox_view(e) for e in list_sandboxes()]
+    if name == "capacity":
+        return capacity()
     if name == "create_sandbox":
+        _guard_capacity()
         opts = {
             "name": (args.get("name") or "").strip() or f"sandbox-{int(time.time()) % 100000}",
             "cores": int(args.get("cores") or 4),
@@ -3538,6 +3611,11 @@ class Handler(BaseHTTPRequestHandler):
             if (q.get("archived") or ["0"])[0] in ("1", "true"):
                 return self._send(200, json.dumps(get_archive(vmid)))
             return self._send(200, json.dumps(get_comments(vmid)))
+        if p.path == "/api/capacity":
+            try:
+                return self._send(200, json.dumps(capacity()))
+            except Exception as exc:                  # noqa: BLE001
+                return self._send(500, json.dumps({"error": str(exc)}))
         if p.path == "/api/sandboxes":
             try:
                 return self._send(200, json.dumps([_sandbox_view(e) for e in list_sandboxes()]))
