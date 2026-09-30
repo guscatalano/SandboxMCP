@@ -1161,6 +1161,27 @@ def provision(job, vmid, opts, configure_hw=True):
             removed = line.strip().split("|", 1)[1]
     job.log(f"removed {removed} answer file(s) holding the password in plaintext")
 
+    # Two copies of one secret: the value baked into the template account, and
+    # the config value auto-logon is written from. Sync them here -- the agent
+    # runs as SYSTEM, so this needs no knowledge of the previous value -- so
+    # that rotating the secret is a config edit, not a template rebuild.
+    setpw = agent_run_ps(
+        vmid,
+        "$ProgressPreference='SilentlyContinue'\n"
+        f"$u = Get-LocalUser -Name {_ps_literal(WIN_USER)} -ErrorAction SilentlyContinue\n"
+        "if (-not $u) { Write-Output 'PWSET|missing'; exit }\n"
+        f"Set-LocalUser -Name {_ps_literal(WIN_USER)} "
+        f"-Password (ConvertTo-SecureString {_ps_literal(WIN_PASS)} -AsPlainText -Force) "
+        "-PasswordNeverExpires $true\n"
+        "Write-Output 'PWSET|ok'",
+        timeout=120)
+    if "PWSET|ok" not in (setpw or ""):
+        raise RuntimeError(
+            f"could not set the {WIN_USER} account credential in the image. Auto-logon "
+            "would then be written with a value the account does not have, so this stops "
+            "here rather than handing back a sandbox with no session.")
+    job.log(f"account {WIN_USER}: credential synced from config")
+
     job.log("applying auto-logon")
     out = None
     for _ in range(6):
