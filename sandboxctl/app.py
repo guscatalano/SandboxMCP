@@ -246,6 +246,75 @@ def _jobs_load():
 MAX_JOBS = 50
 
 # --------------------------------------------------------------------------
+# Groundhog
+# --------------------------------------------------------------------------
+GROUNDHOG_HOME = r"C:\ProgramData\groundhog"
+GROUNDHOG_TASK = r"Groundhog\RunPending"
+
+
+def apply_groundhog(vmid, source, sha256=None, allow_http=None, allow_reboot=False,
+                    job=None):
+    """Point a sandbox at a Groundhogfile and start the apply.
+
+    Returns once the task has been kicked; the agent keeps going on its own.
+    Poll groundhog_status for the outcome.
+    """
+    source = (source or "").strip()
+    if not source:
+        raise ValueError("source is required: a path, URL or zip the agent can fetch")
+    if allow_http is None:
+        # The payload port is plain HTTP and is the only controller port a
+        # sandbox may reach, so http sources are normal here rather than a
+        # mistake to be defended against.
+        allow_http = source.lower().startswith("http://")
+
+    pending = {"source": source, "allowReboot": bool(allow_reboot),
+               "allowHttp": bool(allow_http)}
+    if sha256:
+        pending["sha256"] = sha256
+
+    # Written as bytes: a BOM makes the agent fail with "expected value at
+    # line 1 column 1", which reads like a corrupt file rather than an encoding.
+    guest_write(vmid, GROUNDHOG_HOME + r"\pending.json",
+                content_base64=base64.b64encode(
+                    json.dumps(pending, indent=2).encode("utf-8")).decode())
+    if job:
+        job.log(f"groundhog: pending.json written ({source})")
+
+    out = _guest_ps(vmid,
+                    "$ErrorActionPreference='SilentlyContinue'\n"
+                    f"schtasks.exe /Run /TN '{GROUNDHOG_TASK}' 2>&1 | Out-String\n"
+                    "Write-Output 'OK|started'", timeout=120)
+    if "OK|started" not in (out or ""):
+        raise RuntimeError("could not start " + GROUNDHOG_TASK + ": " + (out or "")[:160])
+    record_event(vmid, "groundhog apply", source[:80])
+    if job:
+        job.log("groundhog: apply started; it continues in the guest")
+    return {"vmid": int(vmid), "source": source, "started": True,
+            "note": "the agent runs in the sandbox user's session; poll groundhog_status"}
+
+
+def groundhog_status(vmid):
+    out = _guest_ps(vmid,
+                    "$ErrorActionPreference='SilentlyContinue'\n"
+                    f"$exe = '{GROUNDHOG_HOME}' + '\\bin\\groundhog-agent.exe'\n"
+                    "if (-not (Test-Path $exe)) { Write-Output 'ERR|agent not installed in this image'; exit }\n"
+                    f"$pending = Test-Path ('{GROUNDHOG_HOME}' + '\\pending.json')\n"
+                    "$s = (& $exe status 2>&1 | Out-String).Trim()\n"
+                    "Write-Output ('OK|' + $pending + '|' + ($s -replace '\r?\n', ' ~ '))",
+                    timeout=120)
+    line = _marked_line(out)
+    if line.startswith("ERR|"):
+        raise RuntimeError(line.split("|", 1)[1])
+    _, pending, status = line.split("|", 2)
+    return {"vmid": int(vmid),
+            # pending.json is deleted on success, so its absence is the signal
+            # that the apply finished rather than that nothing was asked for.
+            "pending": pending.strip().lower() == "true",
+            "status": status.strip()}
+
+
+# --------------------------------------------------------------------------
 # Claims
 # --------------------------------------------------------------------------
 CLAIMS_PATH = os.path.join(HERE, "claims.json")
@@ -950,6 +1019,13 @@ def provision(job, vmid, opts, configure_hw=True):
     _TOKEN_CACHE[vmid] = token
     job.log(f"ready: {ip}  token {token}")
 
+    if opts.get("groundhog"):
+        try:
+            apply_groundhog(vmid, opts["groundhog"], opts.get("groundhog_sha256"),
+                            None, opts.get("groundhog_allow_reboot", False), job)
+        except Exception as exc:                      # noqa: BLE001
+            job.log(f"groundhog: could not start the apply: {exc}")
+
 
 def do_destroy(job, vmid):
     vmid = _check_managed(vmid)
@@ -996,6 +1072,39 @@ MCP_TOOLS = [
                         "bearer token, and a ready-to-use MCP endpoint for each one. "
                         "Use this to find a sandbox to drive."),
         "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "apply_groundhog",
+        "description": ("Configure a sandbox from a Groundhogfile -- apps via winget, files, "
+                        "registry, environment, commands, verification. Takes a path, URL or "
+                        "zip. Serve one from the controller's payload directory and use "
+                        "http://<controller>:8081/payload/<name>, the only controller port a "
+                        "sandbox can reach. Returns once started; poll groundhog_status."),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "vmid": {"type": "integer"},
+                "source": {"type": "string", "description": "Path, URL or zip bundle."},
+                "sha256": {"type": "string", "description": "Optional, pins the source."},
+                "allow_reboot": {"type": "boolean", "description": "Let it reboot mid-apply. "
+                                                                   "Default false."},
+                "allow_http": {"type": "boolean", "description": "Defaults to true for http:// "
+                                                                 "sources, which the payload "
+                                                                 "port requires."},
+            },
+            "required": ["vmid", "source"],
+        },
+    },
+    {
+        "name": "groundhog_status",
+        "description": ("How the last Groundhog apply went on a sandbox. `pending` true means "
+                        "one is still outstanding -- the agent deletes pending.json when it "
+                        "succeeds, so its absence is how you know the apply finished."),
+        "inputSchema": {
+            "type": "object",
+            "properties": {"vmid": {"type": "integer"}},
+            "required": ["vmid"],
+        },
     },
     {
         "name": "claim_sandbox",
@@ -2334,6 +2443,17 @@ def mcp_call(name, args):
     # or reaches into a guest, is.
     if name not in _QUIET_TOOLS:
         record_event(args.get("vmid"), name, str(args.get("path") or args.get("agents") or "")[:80])
+    if name == "apply_groundhog":
+        vmid = args.get("vmid")
+        if vmid is None:
+            raise ValueError("vmid is required")
+        return apply_groundhog(vmid, args.get("source"), args.get("sha256"),
+                               args.get("allow_http"), args.get("allow_reboot", False))
+    if name == "groundhog_status":
+        vmid = args.get("vmid")
+        if vmid is None:
+            raise ValueError("vmid is required")
+        return groundhog_status(vmid)
     if name == "claim_sandbox":
         return claim_sandbox(args.get("vmid"), args.get("who"),
                              args.get("purpose"), args.get("minutes"))
@@ -2381,6 +2501,9 @@ def mcp_call(name, args):
             "port": int(args.get("port") or 8791),
             "shell": bool(args.get("shell", True)),
             "tls": bool(args.get("tls", False)),
+            "groundhog": (args.get("groundhog") or "").strip() or None,
+            "groundhog_sha256": args.get("groundhog_sha256"),
+            "groundhog_allow_reboot": bool(args.get("groundhog_allow_reboot", False)),
         }
         opts["name"] = re.sub(r"[^A-Za-z0-9-]", "-", opts["name"])[:15]
         job = start_job(f"Creating {opts['name']}", do_create, opts)

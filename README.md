@@ -546,6 +546,19 @@ delivery channel this project already has —
 
 — which is `write_guest_file`, and works before Deskhand exists.
 
+Ask for a sandbox and its configuration in one call:
+
+```json
+{"name": "devbox", "groundhog": "http://<controller>:8081/payload/dev.groundhog.yaml"}
+```
+
+The apply runs last, after Deskhand is installed and the machine is already
+drivable — so a configuration can be watched landing rather than waited through
+blind, and a Groundhogfile that fails still leaves a working sandbox. Poll
+`groundhog_status`; `pending: false` means the agent finished, because it
+deletes `pending.json` on success. `apply_groundhog` does the same for a
+sandbox that already exists.
+
 Serve a Groundhogfile from the controller's payload directory and point the
 sandbox at it:
 
