@@ -1141,6 +1141,26 @@ def provision(job, vmid, opts, configure_hw=True):
 
     wait_oobe(job, vmid)
 
+    # Sysprep's answer file survives into the image with the local admin
+    # password in plaintext, readable by BUILTIN\\Users. Windows scrubs its
+    # own copy under Panther and leaves this one alone.
+    scrub = agent_run_ps(vmid,
+                         "$ProgressPreference='SilentlyContinue'\n"
+                         "$gone = 0\n"
+                         "Get-ChildItem 'C:\\Windows\\Panther','C:\\Windows\\System32\\Sysprep' "
+                         "-Filter *.xml -Recurse -ErrorAction SilentlyContinue |\n"
+                         "  Where-Object { Select-String -Path $_.FullName -Pattern 'PlainText>true' "
+                         "-Quiet -ErrorAction SilentlyContinue } |\n"
+                         "  ForEach-Object { Remove-Item -LiteralPath $_.FullName -Force "
+                         "-ErrorAction SilentlyContinue; $gone++ }\n"
+                         "Write-Output ('SCRUBBED|' + $gone)",
+                         timeout=120)
+    removed = "?"
+    for line in (scrub or "").splitlines():
+        if line.strip().startswith("SCRUBBED|"):
+            removed = line.strip().split("|", 1)[1]
+    job.log(f"removed {removed} answer file(s) holding the password in plaintext")
+
     job.log("applying auto-logon")
     out = None
     for _ in range(6):
