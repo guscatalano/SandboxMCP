@@ -246,6 +246,169 @@ def _jobs_load():
 MAX_JOBS = 50
 
 # --------------------------------------------------------------------------
+# Template building
+# --------------------------------------------------------------------------
+SYSPREP_EXE = r"C:\Windows\System32\Sysprep\sysprep.exe"
+SYSPREP_ANSWER = r"C:\Windows\System32\Sysprep\unattend.xml"
+
+
+def wait_oobe_settled(job, vmid, timeout=1200):
+    """Block until Windows setup is finished in every sense that matters.
+
+    SystemSetupInProgress dropping to 0 is not enough on its own: OOBE may still
+    have a process running, or owe itself a reboot from a zero-day patch. A
+    machine inspected before all three are clear looks finished and is not.
+    """
+    deadline = time.time() + timeout
+    soft_deadline = time.time() + 240   # how long to insist on a quiet OOBE
+    last = ""
+    while time.time() < deadline:
+        out = agent_run_ps(vmid,
+                           "$ProgressPreference='SilentlyContinue'\n"
+                           "$sip = (Get-ItemProperty 'HKLM:\\SYSTEM\\Setup').SystemSetupInProgress\n"
+                           "$p = @(Get-Process msoobe,CloudExperienceHostBroker "
+                           "-ErrorAction SilentlyContinue).Count\n"
+                           "$rb = Test-Path 'HKLM:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\"
+                           "Component Based Servicing\\RebootPending'\n"
+                           "Write-Output ('OOBE|' + $sip + '|' + $p + '|' + $rb)", timeout=90)
+        for line in (out or "").splitlines():
+            if line.strip().startswith("OOBE|"):
+                _, sip, procs, reboot = line.strip().split("|", 3)
+                state = f"setup={sip} oobeProcs={procs} rebootPending={reboot}"
+                if state != last:
+                    job.log("  " + state)
+                    last = state
+                ready = sip.strip() in ("0", "") and reboot.strip().lower() == "false"
+                if ready and procs.strip() == "0":
+                    time.sleep(45)          # account cleanup lands just after
+                    return
+                if ready and time.time() > soft_deadline:
+                    # A build VM has nobody to log on, so an OOBE process can sit
+                    # at a screen indefinitely. Setup itself is finished and
+                    # nothing is pending, which is what matters before sealing.
+                    job.log(f"  proceeding with {procs.strip()} OOBE process(es) still up; "
+                            "setup is complete and no reboot is pending")
+                    time.sleep(30)
+                    return
+        time.sleep(15)
+    raise RuntimeError("OOBE did not settle in time")
+
+
+def do_make_template(job, opts):
+    global TEMPLATE
+    base = int(opts.get("base") or TEMPLATE)
+    name = re.sub(r"[^A-Za-z0-9-]", "-", (opts.get("name") or f"tmpl-{int(time.time()) % 100000}"))[:15]
+    vmid = free_vmid()
+    job.vmid = vmid
+    job.log(f"building template {name} as VMID {vmid}, from {base}")
+
+    # Full clone: a template that depends on the one it came from cannot outlive
+    # it, and the whole point of a new template is to retire the old one.
+    api(f"/nodes/{NODE}/qemu/{base}/clone", "POST",
+        {"newid": vmid, "name": name, "full": 1, "pool": POOL,
+         "storage": opts.get("storage") or "local-lvm"}, timeout=120)
+    wait_unlocked(vmid, timeout=1800)
+    job.log("cloned")
+
+    vm("/status/start", "POST", vmid=vmid)
+    job.log("started; waiting for the guest agent")
+    wait_agent(vmid)
+    wait_oobe_settled(job, vmid)
+    job.log("OOBE settled")
+
+    if opts.get("groundhog"):
+        # Written the same way, but run directly rather than through the logon
+        # task. A template build has nobody logged on and that task is
+        # ONLOGON /IT, so it reports 267011 and never fires. Running as SYSTEM
+        # is also the right scope here: per-user state in an image that is about
+        # to be generalized belongs in the default profile, not in whoever
+        # happened to build it.
+        apply_groundhog(vmid, opts["groundhog"], opts.get("groundhog_sha256"),
+                        None, True, job, trigger=False)
+        job.log("groundhog: applying directly (a template build has no session)")
+        out = agent_run_ps(vmid,
+                           "$ProgressPreference='SilentlyContinue'\n"
+                           "& (Join-Path $env:ProgramData 'groundhog\\bin\\groundhog-agent.exe') "
+                           "run-pending 2>&1 | Out-String",
+                           timeout=int(opts.get("groundhog_timeout") or 1800))
+        for line in (out or "").splitlines():
+            if line.strip():
+                job.log("  " + line.strip()[:140])
+        st = groundhog_status(vmid)
+        job.log("  groundhog: " + st["status"][:160])
+        # "no runs recorded" means it never ran at all, which is a failure to
+        # seal on just as much as an explicit one -- that is how an unconfigured
+        # image got sealed once already.
+        if not st["status"].lower().startswith("succeeded"):
+            raise RuntimeError("groundhog did not succeed (%s); not sealing a broken image"
+                               % st["status"][:120])
+
+    for i, step in enumerate(opts.get("steps") or [], 1):
+        job.log(f"step {i}/{len(opts['steps'])}")
+        out = agent_run_ps(vmid, "$ProgressPreference='SilentlyContinue'\n" + step, timeout=900)
+        for line in (out or "").splitlines()[:6]:
+            if line.strip():
+                job.log("  " + line.strip()[:120])
+
+    checks = agent_run_ps(vmid,
+                          "$ProgressPreference='SilentlyContinue'\n"
+                          "$u = (Get-LocalUser | Where-Object Enabled | "
+                          "Select-Object -ExpandProperty Name) -join ','\n"
+                          "$rb = Test-Path 'HKLM:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\"
+                          "Component Based Servicing\\RebootPending'\n"
+                          f"$ans = Test-Path '{SYSPREP_ANSWER}'\n"
+                          "Write-Output ('CHK|' + $u + '|' + $rb + '|' + $ans)", timeout=120)
+    for line in (checks or "").splitlines():
+        if line.strip().startswith("CHK|"):
+            _, users, reboot, answer = line.strip().split("|", 3)
+            job.log(f"  accounts: {users}")
+            job.log(f"  rebootPending={reboot} answerFile={answer}")
+            if reboot.strip().lower() == "true":
+                raise RuntimeError("a reboot is pending; sealing now would bake it into "
+                                   "every clone")
+
+    job.log("sysprep /generalize /oobe /shutdown")
+    agent_run_ps(vmid,
+                 "$ProgressPreference='SilentlyContinue'\n"
+                 f"Start-Process -FilePath '{SYSPREP_EXE}' -ArgumentList "
+                 f"'/generalize','/oobe','/shutdown','/quiet','/unattend:{SYSPREP_ANSWER}'",
+                 wait=False, timeout=60)
+    deadline = time.time() + 1800
+    while time.time() < deadline:
+        time.sleep(20)
+        if (vm("/status/current", vmid=vmid) or {}).get("status") == "stopped":
+            break
+    else:
+        raise RuntimeError("the guest did not shut down after sysprep")
+    job.log("sysprep finished; guest is down")
+
+    vm("/template", "POST", vmid=vmid, timeout=180)
+    job.log(f"converted {vmid} to a template")
+
+    result = {"vmid": vmid, "name": name, "base": base, "active": False}
+    if opts.get("activate"):
+        # Written straight to the config file: this is the one setting that
+        # decides what every future sandbox is cloned from.
+        cfg_path = os.path.join(HERE, "config.json")
+        with open(cfg_path, encoding="utf-8") as fh:
+            cfg = json.load(fh)
+        cfg["template"] = vmid
+        tmp = cfg_path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(cfg, fh, indent=2)
+        os.replace(tmp, cfg_path)
+        TEMPLATE = vmid
+        result["active"] = True
+        job.log(f"activated: new sandboxes now clone from {vmid} "
+                "(restart the service to persist across a reload)")
+    else:
+        job.log(f"not activated; set template={vmid} in config.json when you are ready")
+
+    job.result = result
+    return result
+
+
+# --------------------------------------------------------------------------
 # Groundhog
 # --------------------------------------------------------------------------
 GROUNDHOG_HOME = r"C:\ProgramData\groundhog"
@@ -253,7 +416,7 @@ GROUNDHOG_TASK = r"Groundhog\RunPending"
 
 
 def apply_groundhog(vmid, source, sha256=None, allow_http=None, allow_reboot=False,
-                    job=None):
+                    job=None, trigger=True):
     """Point a sandbox at a Groundhogfile and start the apply.
 
     Returns once the task has been kicked; the agent keeps going on its own.
@@ -280,6 +443,11 @@ def apply_groundhog(vmid, source, sha256=None, allow_http=None, allow_reboot=Fal
                     json.dumps(pending, indent=2).encode("utf-8")).decode())
     if job:
         job.log(f"groundhog: pending.json written ({source})")
+
+    if not trigger:
+        record_event(vmid, "groundhog pending", source[:80])
+        return {"vmid": int(vmid), "source": source, "started": False,
+                "note": "pending.json written; the caller runs the agent itself"}
 
     out = _guest_ps(vmid,
                     "$ErrorActionPreference='SilentlyContinue'\n"
@@ -630,6 +798,8 @@ def list_sandboxes():
         if m.get("type") != "qemu":
             continue
         vmid = m["vmid"]
+        if m.get("template"):
+            continue          # templates live in the pool to inherit clone rights
         entry = {"vmid": vmid, "name": m.get("name", ""),
                  "status": m.get("status", "?"), "ip": None, "token": None, "port": 8791}
         entry["agents"] = state.get(str(vmid)) or {}
@@ -1072,6 +1242,34 @@ MCP_TOOLS = [
                         "bearer token, and a ready-to-use MCP endpoint for each one. "
                         "Use this to find a sandbox to drive."),
         "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "generate_template",
+        "description": ("Build a new sandbox template: clone an existing one, let OOBE settle, "
+                        "optionally apply a Groundhogfile and run extra steps, then sysprep and "
+                        "seal it. Returns a job id; expect 15-30 minutes. The new template is "
+                        "created inside the sandbox pool so it inherits clone rights. Pass "
+                        "activate=true to point new sandboxes at it."),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "Name for the template. Max 15 chars."},
+                "base": {"type": "integer", "description": "Template to clone from. "
+                                                           "Defaults to the active one."},
+                "groundhog": {"type": "string", "description": "Groundhogfile to bake in -- a "
+                                                               "path, URL or zip. Reboots are "
+                                                               "allowed during a template build."},
+                "groundhog_sha256": {"type": "string"},
+                "groundhog_timeout": {"type": "integer", "description": "Seconds to allow the "
+                                                                        "apply. Default 1800."},
+                "steps": {"type": "array", "items": {"type": "string"},
+                          "description": "PowerShell run in the image before sealing, in order. "
+                                         "For things a Groundhogfile cannot express."},
+                "activate": {"type": "boolean", "description": "Point new sandboxes at it once "
+                                                               "sealed. Default false."},
+                "storage": {"type": "string", "description": "Proxmox storage. Default local-lvm."},
+            },
+        },
     },
     {
         "name": "apply_groundhog",
@@ -2443,6 +2641,14 @@ def mcp_call(name, args):
     # or reaches into a guest, is.
     if name not in _QUIET_TOOLS:
         record_event(args.get("vmid"), name, str(args.get("path") or args.get("agents") or "")[:80])
+    if name == "generate_template":
+        opts = {k: args.get(k) for k in
+                ("name", "base", "groundhog", "groundhog_sha256", "groundhog_timeout",
+                 "steps", "activate", "storage")}
+        job = start_job(f"Building template {opts.get('name') or ''}".strip(),
+                        do_make_template, opts)
+        return {"job_id": job.id,
+                "note": "poll job_status; a template build takes 15-30 minutes"}
     if name == "apply_groundhog":
         vmid = args.get("vmid")
         if vmid is None:

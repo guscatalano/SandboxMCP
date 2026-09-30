@@ -530,6 +530,46 @@ Writes are chunked and staged to a temporary file, moved into place only once
 every chunk has landed, so a failure part-way through leaves the original
 untouched.
 
+## Building a template
+
+Every template in this project used to be built by hand: clone, boot, change
+something, sysprep, templatize, repoint the config. That is how a stray
+administrator account survived four rebuilds, and how an image got sealed while
+OOBE was still mid-flight. The ordering is the whole difficulty, so it belongs
+in code.
+
+```json
+{"name": "devbox-base",
+ "groundhog": "http://<controller>:8081/payload/base.groundhog.yaml",
+ "steps": ["Remove-Item C:\Users\sandbox\Desktop\* -Recurse -Force"],
+ "activate": true}
+```
+
+`generate_template` clones a base, waits for OOBE to genuinely settle, applies a
+Groundhogfile, runs any extra PowerShell, checks the image, seals it with
+sysprep and registers it. About six minutes.
+
+Three things it does that are easy to get wrong by hand:
+
+- **Waits for OOBE properly** — `SystemSetupInProgress` clear *and* no reboot
+  pending, with a soft deadline for a lingering OOBE process that will never
+  exit because a build VM has nobody to log on. Judging any earlier reads a
+  half-built machine.
+- **Runs Groundhog directly, not through the logon task.** That task is
+  `ONLOGON /IT`; with no interactive session it reports `267011` and never
+  fires. Running as SYSTEM is also the right scope, since per-user state in an
+  image about to be generalized belongs in the default profile.
+- **Refuses to seal a broken image.** A pending reboot aborts the build, and the
+  Groundhog result must say `Succeeded` — `no runs recorded` means it never ran,
+  which is how an unconfigured template got sealed once already.
+
+The new template is created **inside the sandbox pool**, so it inherits clone
+rights from the pool ACL. A template anywhere else needs a Proxmox permission
+grant per id, which this service has no rights to write. Templates are filtered
+out of the sandbox listing.
+
+`activate` repoints new sandboxes at it; leave it off to build and test first.
+
 ## Configuring a sandbox with Groundhog
 
 A sandbox is a clean Windows box. [Groundhog](https://github.com/guscatalano/Groundhog)
