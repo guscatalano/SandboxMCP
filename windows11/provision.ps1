@@ -62,6 +62,37 @@ reg add "$wu\AU" /v NoAutoUpdate /t REG_DWORD /d 1 /f 2>&1 | Out-Null
 Ok 'ZDP disabled'
 
 # ---------------------------------------------------------------------------
+# Groundhog agent
+# ---------------------------------------------------------------------------
+# Groundhog configures a Windows machine from a declarative file. Its templated-VM
+# design is exactly this shape: install the agent once in the image with a logon
+# task, and a host then only has to drop %ProgramData%\groundhog\pending.json --
+# which the QEMU guest agent can do before Deskhand even exists. Costs ~1.8 MB and
+# nothing at runtime: run-pending is a no-op when that file is absent.
+#
+# The task is registered here with schtasks rather than `groundhog-agent
+# install-task`, because install-task takes the task's user from the CURRENT
+# process. During a template build that is SYSTEM, which would register a task
+# that never fires for the interactive user. These are install-task's own switches.
+Step 'Groundhog agent'
+$ghHome = Join-Path $env:ProgramData 'groundhog'
+$ghBin  = Join-Path $ghHome 'bin'
+New-Item -ItemType Directory -Force -Path $ghBin | Out-Null
+$ghExe  = Join-Path $ghBin 'groundhog-agent.exe'
+try {
+    $rel = Invoke-RestMethod -Uri 'https://api.github.com/repos/guscatalano/Groundhog/releases/latest' `
+                             -Headers @{ 'User-Agent' = 'sandboxctl' } -TimeoutSec 60
+    $asset = $rel.assets | Where-Object { $_.name -eq 'groundhog-agent-x64.exe' } | Select-Object -First 1
+    Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $ghExe -UseBasicParsing -TimeoutSec 180
+    $action = '"' + $ghExe + '" run-pending'
+    schtasks.exe /Create /F /TN 'Groundhog\RunPending' /SC ONLOGON /RL HIGHEST /IT `
+                 /DELAY 0000:15 /RU '@@USERNAME@@' /TR $action 2>&1 | Out-Null
+    Ok "$($rel.tag_name), logon task registered"
+} catch {
+    Warn "not installed: $($_.Exception.Message)"
+}
+
+# ---------------------------------------------------------------------------
 # Locate the virtio-win CD
 # ---------------------------------------------------------------------------
 # Identified by content rather than by drive letter or volume label, because

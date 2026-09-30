@@ -530,6 +530,63 @@ Writes are chunked and staged to a temporary file, moved into place only once
 every chunk has landed, so a failure part-way through leaves the original
 untouched.
 
+## Configuring a sandbox with Groundhog
+
+A sandbox is a clean Windows box. [Groundhog](https://github.com/guscatalano/Groundhog)
+turns it into *your* Windows box, from a declarative file — apps via winget,
+files, registry, environment, commands, and verification checks.
+
+The template carries the agent (~1.8 MB) and a logon task. That costs nothing
+when unused: `run-pending` is a no-op unless a host has dropped
+`%ProgramData%\groundhog\pending.json`. Groundhog's own design names the
+delivery channel this project already has —
+
+> a host provider only has to write it (through Hyper-V PowerShell Direct, **the
+> QEMU guest agent**, a mapped folder, ...)
+
+— which is `write_guest_file`, and works before Deskhand exists.
+
+Serve a Groundhogfile from the controller's payload directory and point the
+sandbox at it:
+
+```jsonc
+// %ProgramData%\groundhog\pending.json
+{
+  "source": "http://<controller>:8081/payload/dev.groundhog.yaml",
+  "allowHttp": true,
+  "allowReboot": false
+}
+```
+
+```
+groundhog-agent 0.5.0 applying http://.../payload/dev.groundhog.yaml
+[1/3] set HKCU\Software\Groundhog\SmokeTest\Applied
+[2/3] run: New-Item -ItemType Directory -Force -Path C:\groundhog-proof...
+[3/3] verify C:\groundhog-proof\ok.txt exists
+Succeeded: 3 steps, 2 changed
+```
+
+The agent deletes `pending.json` once it succeeds, so it will not re-apply on
+the next logon.
+
+### Three things that will bite you
+
+- **`pending.json` must not have a BOM.** PowerShell 5.1's
+  `Set-Content -Encoding utf8` writes one, and the agent fails with
+  `expected value at line 1 column 1`. Use `[IO.File]::WriteAllBytes`.
+- **`allowHttp: true` is required for the payload port**, which is plain HTTP.
+  Port 8081 is the only controller port a sandbox can reach, so a config served
+  from anywhere else on the controller will not be fetchable. Configs on an
+  HTTPS URL need no flag.
+- **Register the logon task with `schtasks`, not `groundhog-agent
+  install-task`**, when building a template non-interactively. `install-task`
+  takes the task's user from the current process, and a template build runs as
+  SYSTEM — producing a task that never fires for the interactive user. The
+  switches in `provision.ps1` are `install-task`'s own.
+
+Inline commands go under `run:` as a shorthand string or `command:`; `script:`
+is a path or URL, not a place to put code.
+
 ## Claiming a sandbox
 
 Fifty sandboxes fit in the pool and a new one takes about six minutes, so the
