@@ -1541,10 +1541,14 @@ MCP_TOOLS = [
     },
     {
         "name": "job_status",
-            "description": "Check a create_sandbox or destroy_sandbox job. Returns its log, completion state and result.",
+        "description": ("Check a create_sandbox or destroy_sandbox job. Returns its log, "
+                        "completion state and result. Jobs survive a restart; one left "
+                        "unfinished by one is marked INTERRUPTED."),
         "inputSchema": {
             "type": "object",
-            "properties": {"id": {"type": "string"}},
+            "properties": {"id": {"type": "string",
+                                  "description": "The job_id returned by create_sandbox "
+                                                 "or destroy_sandbox."}},
             "required": ["id"],
         },
     },
@@ -2772,8 +2776,10 @@ def mcp_call(name, args):
     if name == "sandbox_call":
         return proxy_call(f"{args['sandbox']}{SEP}{args['tool']}", args.get("arguments") or {})
     if name == "job_status":
+        # create_sandbox hands back "job_id", so accept that name too rather
+        # than making the caller notice the two do not match.
         with JOBS_LOCK:
-            job = JOBS.get(args.get("id"))
+            job = JOBS.get(args.get("id") or args.get("job_id"))
         if not job:
             raise ValueError("no such job")
         return job.as_dict()
