@@ -3690,9 +3690,16 @@ code{font:12px ui-monospace,Consolas,monospace;background:#0b0d11;padding:2px 6p
 a{color:var(--acc)}
 .lnk{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
 .badge{font:11px ui-monospace,Consolas,monospace;border:1px solid var(--ln);border-radius:999px;padding:1px 8px;color:var(--mut)}
-.claim{margin-left:8px;font:11px ui-monospace,Consolas,monospace;border:1px solid #d29922;color:#d29922;border-radius:999px;padding:1px 8px}
-.exp{margin-left:6px;font:11px ui-monospace,Consolas,monospace;border:1px solid #8b949e;color:#8b949e;border-radius:999px;padding:1px 8px}
-.notes-toggle{margin-left:8px;font-size:11px;color:var(--mut);text-decoration:none;border-bottom:1px dotted var(--ln)}
+/* A flex row rather than inline margins: the badges can wrap under the name
+   instead of widening the column, and each one stays on a single line. */
+.namecell{display:flex;align-items:center;gap:6px;flex-wrap:wrap;min-width:0}
+.nm{font-weight:500}
+.claim,.exp{font:11px ui-monospace,Consolas,monospace;border-radius:999px;padding:1px 8px;
+  /* Whoever claimed it chose the text, so cap it and keep the rest in title. */
+  white-space:nowrap;max-width:22ch;overflow:hidden;text-overflow:ellipsis}
+.claim{border:1px solid #d29922;color:#d29922}
+.exp{border:1px solid #8b949e;color:#8b949e}
+.notes-toggle{font-size:11px;color:var(--mut);text-decoration:none;border-bottom:1px dotted var(--ln)}
 .notes-toggle:hover{color:var(--acc)}
 .notes-row>td{background:#0f131a;padding-top:12px}
 .notes{max-height:260px;overflow:auto;margin-bottom:10px}
@@ -3892,8 +3899,10 @@ function actions(s){
     <details class="menu"><summary>&#8943;</summary><div class="mi">${m.join('')}</div></details>`;
 }
 function row(s){
+  // esc() on all of it: these land in innerHTML, and who/purpose are whatever
+  // the caller of claim_sandbox typed.
   var claim = s.claimed_by
-    ? `<span class="claim" title="${s.claim_purpose||''}">held by ${s.claimed_by} &middot; ${s.claim_minutes_left}m</span>`
+    ? `<span class="claim" title="${esc('held by ' + s.claimed_by + (s.claim_purpose ? ' \u2014 ' + s.claim_purpose : ''))}">held by ${esc(s.claimed_by)} &middot; ${esc(s.claim_minutes_left)}m</span>`
     : '';
   // A sandbox counting down to destruction should not look like one that is
   // staying. "never" is the common case and says nothing.
@@ -3901,9 +3910,9 @@ function row(s){
     ? `<span class="exp" title="Destroyed automatically when this runs out">${
          s.expires === 'expired' ? 'expired' : 'expires in ' + s.expires}</span>`
     : '';
-  return `<tr><td><code>${s.vmid}</code></td><td>${s.name}${claim}${exp}
+  return `<tr><td><code>${s.vmid}</code></td><td><div class="namecell"><span class="nm">${esc(s.name)}</span>${claim}${exp}
       <a href="#" class="notes-toggle" onclick="return toggleNotes(event,${s.vmid})"
-         title="Notes on this sandbox">notes</a></td>
+         title="Notes on this sandbox">notes</a></div></td>
     <td><span class="st ${s.status==='running'?'r':'s'}"></span>${s.status}</td>
     <td>${s.ip?`<code>${s.ip}</code>`:'&mdash;'}</td>
     <td><div class="lnk">${links(s)}</div></td>
