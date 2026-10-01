@@ -25,6 +25,7 @@ Stdlib only, on purpose: no pip, nothing to keep patched.
 """
 import base64
 import gzip
+import concurrent.futures
 import hashlib
 import html
 import json
@@ -1151,6 +1152,18 @@ def list_sandboxes():
     except Exception:
         members = []
     state = load_agent_state()
+    # Warm the token cache for every running sandbox at once. Each miss is a
+    # guest round trip of about three seconds, and in series that was the sum
+    # rather than the longest of them.
+    cold = [m["vmid"] for m in members
+            if m.get("type") == "qemu" and not m.get("template")
+            and m.get("status") == "running" and m["vmid"] not in _TOKEN_CACHE]
+    if len(cold) > 1:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+            # Bounded: enough to overlap the whole id range, few enough that the
+            # Proxmox API does not see a stampede. Failures are left to the
+            # per-sandbox path below, which already tolerates a missing token.
+            list(pool.map(lambda v: read_token(v), cold))
     for m in members:
         if m.get("type") != "qemu":
             continue
@@ -1231,13 +1244,43 @@ def read_launcher(vmid, timeout=90):
     return out or ""
 
 
+def read_config_token(vmid, timeout=90):
+    """The token out of deskhand.json, where the declarative install puts it.
+
+    Read through exec rather than /agent/file-read for the same reason
+    read_launcher does: that call leaks the handle for the life of qemu-ga.
+    """
+    out = agent_run_ps(
+        vmid,
+        "$ErrorActionPreference='SilentlyContinue'\n"
+        "$p = Join-Path $env:ProgramData 'Deskhand\\deskhand.json'\n"
+        "if (Test-Path $p) { Get-Content -Raw -LiteralPath $p }",
+        timeout=timeout)
+    if not out:
+        return None
+    try:
+        return (json.loads(out.strip()) or {}).get("token") or None
+    except Exception:                                 # noqa: BLE001
+        # Not JSON yet, or half-written mid-install. The regex is a last resort
+        # rather than the plan, so a malformed file does not become a crash.
+        m = re.search(r'"token"\s*:\s*"([^"]+)"', out)
+        return m.group(1) if m else None
+
+
 def read_token(vmid, refresh=False):
-    """Recover a sandbox's Deskhand token from its launcher, so the UI can always
-    show it. Without this the token would exist only in the creation log."""
+    """Recover a sandbox's Deskhand token, so the UI can always show it.
+
+    deskhand.json first, because that is where the declarative install puts it;
+    run-deskhand.ps1 second, because sandboxes built before that have only the
+    launcher. Without either, the token exists only in the creation log and does
+    not survive a restart of this service.
+    """
     if not refresh and vmid in _TOKEN_CACHE:
         return _TOKEN_CACHE[vmid]
-    m = re.search(r"DESKHAND_TOKEN\s*=\s*'([^']+)'", read_launcher(vmid))
-    tok = m.group(1) if m else None
+    tok = read_config_token(vmid)
+    if not tok:
+        m = re.search(r"DESKHAND_TOKEN\s*=\s*'([^']+)'", read_launcher(vmid))
+        tok = m.group(1) if m else None
     if tok:
         _TOKEN_CACHE[vmid] = tok
     return tok
