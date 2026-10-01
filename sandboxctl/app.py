@@ -1604,10 +1604,17 @@ MCP_TOOLS = [
     },
     {
         "name": "write_guest_file",
-        "description": ("Write a file inside a sandbox through the guest agent, for fixing a "
-                        "guest Deskhand cannot reach. Written in chunks to a temporary file "
-                        "and moved into place only once every chunk lands, so a failure "
-                        "part-way through leaves the original untouched."),
+        "description": ("Write a file inside a sandbox through the guest agent. Works before "
+                        "Deskhand exists and while Windows setup is still running, so it is "
+                        "also how you fix a guest nothing else can reach. Written to a "
+                        "temporary file and moved into place only once it is all there, so a "
+                        "failure part-way leaves the original untouched. "
+                        "THERE IS NO SIZE LIMIT: it splits the content up for you. Measured "
+                        "~13 s for 4 MiB, so a few MB is routine and tens of MB is fine if "
+                        "you are willing to wait. For something large AND publicly "
+                        "downloadable, prefer having the guest fetch it -- a sandbox can "
+                        "reach the internet directly, which is faster than pushing it "
+                        "through here and costs the controller nothing."),
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -3198,6 +3205,17 @@ HOW TO USE IT
                          (e.g. <name>__deskhand_capture_screen), or reach any of them with
                          sandbox_call
   4. destroy_sandbox     when you are finished -- they are disposable; that is the point
+
+GETTING FILES IN AND OUT
+  write_guest_file / read_guest_file / browse_guest_file work over the guest
+  agent, so they work before Deskhand is installed and while Windows setup is
+  still running. write_guest_file has NO SIZE LIMIT -- it splits the content up
+  itself -- and runs at roughly 4 MiB in 13 seconds, so do not go looking for a
+  way around it for a few megabytes.
+  For something large that is publicly downloadable, it is still faster to let
+  the guest fetch it: a sandbox can reach the internet, so run the download
+  inside it (deskhand_run_command, or a Groundhogfile 'files:' entry) rather
+  than pushing the bytes through this controller.
 
 RULES
   - A sandbox is untrusted. Never put real credentials, keys or private data in
