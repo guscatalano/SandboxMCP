@@ -3206,6 +3206,29 @@ HOW TO USE IT
                          sandbox_call
   4. destroy_sandbox     when you are finished -- they are disposable; that is the point
 
+SHARING IT WITH OTHER AGENTS
+  claim_sandbox / release_sandbox   an advisory, self-expiring hold. Claim one
+      before you test on it: it guards destroy, repair and update, so another
+      session cannot pull the machine out from under you. It never blocks reads
+      or screens, and force=true overrides it.
+  comment_sandbox / read_comments   say what a sandbox is for, so the next
+      person does not have to guess or leave it alone.
+  sandbox_history                   boots, reboots, screen views, agent
+      installs, file access -- for "was it always like this".
+
+HOW MANY YOU MAY HAVE
+  capacity        how many sandboxes exist and run, against the limits.
+  create_sandbox refuses at either limit rather than queueing, so check this
+  before creating several. Each running sandbox costs the controller about
+  100 MB for its console recorder, which is what the running limit protects.
+
+WHEN THEY GO AWAY
+  set_expiry      a sandbox can be destroyed automatically when its time is up.
+  create_sandbox takes expires_in_minutes; minutes=0 means NEVER, which is a
+  real choice and clears a timer already set. A sandbox under an active claim is
+  left alone until the claim lapses. This does not replace destroying what you
+  finish with -- it is the backstop for when you do not.
+
 GETTING FILES IN AND OUT
   write_guest_file / read_guest_file / browse_guest_file work over the guest
   agent, so they work before Deskhand is installed and while Windows setup is
@@ -3329,6 +3352,7 @@ a{color:var(--acc)}
 .lnk{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
 .badge{font:11px ui-monospace,Consolas,monospace;border:1px solid var(--ln);border-radius:999px;padding:1px 8px;color:var(--mut)}
 .claim{margin-left:8px;font:11px ui-monospace,Consolas,monospace;border:1px solid #d29922;color:#d29922;border-radius:999px;padding:1px 8px}
+.exp{margin-left:6px;font:11px ui-monospace,Consolas,monospace;border:1px solid #8b949e;color:#8b949e;border-radius:999px;padding:1px 8px}
 .notes-toggle{margin-left:8px;font-size:11px;color:var(--mut);text-decoration:none;border-bottom:1px dotted var(--ln)}
 .notes-toggle:hover{color:var(--acc)}
 .notes-row>td{background:#0f131a;padding-top:12px}
@@ -3532,7 +3556,13 @@ function row(s){
   var claim = s.claimed_by
     ? `<span class="claim" title="${s.claim_purpose||''}">held by ${s.claimed_by} &middot; ${s.claim_minutes_left}m</span>`
     : '';
-  return `<tr><td><code>${s.vmid}</code></td><td>${s.name}${claim}
+  // A sandbox counting down to destruction should not look like one that is
+  // staying. "never" is the common case and says nothing.
+  var exp = (s.expires && s.expires !== 'never')
+    ? `<span class="exp" title="Destroyed automatically when this runs out">${
+         s.expires === 'expired' ? 'expired' : 'expires in ' + s.expires}</span>`
+    : '';
+  return `<tr><td><code>${s.vmid}</code></td><td>${s.name}${claim}${exp}
       <a href="#" class="notes-toggle" onclick="return toggleNotes(event,${s.vmid})"
          title="Notes on this sandbox">notes</a></td>
     <td><span class="st ${s.status==='running'?'r':'s'}"></span>${s.status}</td>
