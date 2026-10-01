@@ -416,10 +416,38 @@ def do_make_template(job, opts):
 # --------------------------------------------------------------------------
 GROUNDHOG_HOME = r"C:\ProgramData\groundhog"
 GROUNDHOG_TASK = r"Groundhog\RunPending"
+GROUNDHOG_REPORT = GROUNDHOG_HOME + r"\report"
+
+
+def _header_rules(headers):
+    """Accept Groundhog's own --header spelling as well as objects.
+
+    The documented form is "host=Name: value", which is what someone reading
+    Groundhog's docs will reach for; the wire format is {host, name, value}.
+    Taking both costs a few lines and saves a caller translating by hand.
+    """
+    out = []
+    for h in headers or []:
+        if isinstance(h, dict):
+            if not all(k in h for k in ("host", "name", "value")):
+                raise ValueError("a header object needs host, name and value")
+            out.append({"host": str(h["host"]), "name": str(h["name"]),
+                        "value": str(h["value"])})
+            continue
+        text = str(h)
+        left, sep, value = text.partition(":")
+        if not sep:
+            raise ValueError(f"header {text!r} must look like 'host=Name: value'")
+        host, eq, name = left.partition("=")
+        if not eq:
+            raise ValueError(f"header {text!r} needs 'host=' so the agent knows "
+                             "which host to send it to")
+        out.append({"host": host.strip(), "name": name.strip(), "value": value.strip()})
+    return out
 
 
 def apply_groundhog(vmid, source, sha256=None, allow_http=None, allow_reboot=False,
-                    job=None, trigger=True):
+                    job=None, trigger=True, secrets=None, headers=None):
     """Point a sandbox at a Groundhogfile and start the apply.
 
     Returns once the task has been kicked; the agent keeps going on its own.
@@ -435,9 +463,20 @@ def apply_groundhog(vmid, source, sha256=None, allow_http=None, allow_reboot=Fal
         allow_http = source.lower().startswith("http://")
 
     pending = {"source": source, "allowReboot": bool(allow_reboot),
-               "allowHttp": bool(allow_http)}
+               "allowHttp": bool(allow_http),
+               # A folder sink: status.json plus agent.log, which groundhog_status
+               # reads back for per-step detail.
+               "report": [GROUNDHOG_REPORT]}
     if sha256:
         pending["sha256"] = sha256
+    if secrets:
+        # Values for ${secret:NAME} references. The agent strips them from this
+        # file as soon as it reads it, and never logs them. Deliberately not
+        # logged here either -- not the names, which are harmless, and certainly
+        # not the values.
+        pending["secrets"] = {str(k): str(v) for k, v in dict(secrets).items()}
+    if headers:
+        pending["headers"] = _header_rules(headers)
 
     # Clear the markers the last run left, which in a fresh sandbox are the
     # TEMPLATE's: generate_template applies a Groundhogfile before sealing, so
@@ -448,6 +487,8 @@ def apply_groundhog(vmid, source, sha256=None, allow_http=None, allow_reboot=Fal
               f"$h = '{GROUNDHOG_HOME}'\n"
               "Remove-Item -LiteralPath ($h + '\\pending.done.json'), "
               "($h + '\\pending.failed.json') -Force -ErrorAction SilentlyContinue\n"
+              f"Remove-Item -LiteralPath '{GROUNDHOG_REPORT}' -Recurse -Force "
+              "-ErrorAction SilentlyContinue\n"
               "Write-Output 'OK'", timeout=90)
 
     # Written as bytes: a BOM makes the agent fail with "expected value at
@@ -499,6 +540,19 @@ def groundhog_status(vmid):
     if line.startswith("ERR|"):
         raise RuntimeError(line.split("|", 1)[1])
     _, pending, done, failed, status = line.split("|", 4)
+    steps = None
+    try:
+        # status.json is small, and it is the only place per-step detail exists.
+        raw = guest_read(vmid, GROUNDHOG_REPORT + r"\status.json")
+        st = json.loads(raw.get("text") or "{}")
+        steps = [{"title": s.get("title"), "status": s.get("status"),
+                  "changed": bool(s.get("changed")), "message": s.get("message")}
+                 for s in (st.get("steps") or [])]
+        report = {"agent": st.get("agent"), "updated": st.get("updated"),
+                  "reboots": st.get("reboots"), "message": st.get("message"),
+                  "steps": steps}
+    except Exception:                                 # noqa: BLE001
+        report = None               # no sink yet, or an apply that predates one
     pending = pending.strip().lower() == "true"
     done = done.strip().lower() == "true"
     failed = failed.strip().lower() == "true"
@@ -510,10 +564,13 @@ def groundhog_status(vmid):
         outcome = "succeeded"
     else:
         outcome = "none"              # nothing was ever asked of this sandbox
-    return {"vmid": int(vmid),
-            "pending": pending,
-            "outcome": outcome,
-            "status": status.strip()}
+    out = {"vmid": int(vmid),
+           "pending": pending,
+           "outcome": outcome,
+           "status": status.strip()}
+    if report:
+        out["report"] = report
+    return out
 
 
 # --------------------------------------------------------------------------
@@ -1390,7 +1447,9 @@ def provision(job, vmid, opts, configure_hw=True):
     if opts.get("groundhog"):
         try:
             apply_groundhog(vmid, opts["groundhog"], opts.get("groundhog_sha256"),
-                            None, opts.get("groundhog_allow_reboot", False), job)
+                            None, opts.get("groundhog_allow_reboot", False), job,
+                            secrets=opts.get("groundhog_secrets"),
+                            headers=opts.get("groundhog_headers"))
         except Exception as exc:                      # noqa: BLE001
             job.log(f"groundhog: could not start the apply: {exc}")
 
@@ -1488,6 +1547,18 @@ MCP_TOOLS = [
                 "allow_http": {"type": "boolean", "description": "Defaults to true for http:// "
                                                                  "sources, which the payload "
                                                                  "port requires."},
+                "secrets": {"type": "object", "additionalProperties": {"type": "string"},
+                            "description": ("Values for ${secret:NAME} references in the "
+                                            "Groundhogfile -- a token, an API key. REQUIRED if "
+                                            "the file references any: a missing one stops the "
+                                            "run before it changes anything. The agent removes "
+                                            "them from pending.json as it reads it and never "
+                                            "logs them. Needs agent >=0.12.0, which a template "
+                                            "agent self-updates to.")},
+                "headers": {"type": "array", "items": {"type": "string"},
+                            "description": ("Headers for private sources, as "
+                                            "\"host=Name: value\". A value may itself be "
+                                            "${secret:NAME}.")},
             },
             "required": ["vmid", "source"],
         },
@@ -1680,6 +1751,34 @@ MCP_TOOLS = [
                 "tls": {"type": "boolean", "description": ("Self-signed HTTPS. Default false, and "
                                                            "leave it false for MCP: the certificate is "
                                                            "ephemeral so verifying clients reject it.")},
+                "who": {"type": "string", "description": "You, for the history and for claims."},
+                "expires_in_minutes": {"type": "integer",
+                                       "description": ("Destroy it automatically after this long. "
+                                                       "0 or omitted means never. A sandbox under "
+                                                       "an active claim is left alone until the "
+                                                       "claim lapses.")},
+                "groundhog": {"type": "string",
+                              "description": ("Optional Groundhogfile to apply once the sandbox is "
+                                              "up -- apps, files, registry, env, verification. A "
+                                              "path, URL or zip. Applied last, so a config that "
+                                              "fails still leaves a working sandbox. Serve one "
+                                              "from the payload port, the only controller port a "
+                                              "sandbox can reach.")},
+                "groundhog_sha256": {"type": "string", "description": "Optional, pins the source."},
+                "groundhog_allow_reboot": {"type": "boolean",
+                                           "description": "Let it reboot mid-apply. Default false."},
+                "groundhog_secrets": {"type": "object",
+                                      "additionalProperties": {"type": "string"},
+                                      "description": ("Values for ${secret:NAME} references in "
+                                                      "your Groundhogfile. REQUIRED if it uses "
+                                                      "any: a missing one stops the run before it "
+                                                      "changes anything. Never logged, and the "
+                                                      "agent strips them from pending.json as it "
+                                                      "reads it. A sandbox is untrusted, so use "
+                                                      "scoped or short-lived values.")},
+                "groundhog_headers": {"type": "array", "items": {"type": "string"},
+                                      "description": ("Headers for a private source, as "
+                                                      "\"host=Name: value\".")},
             },
         },
     },
@@ -3048,7 +3147,8 @@ def mcp_call(name, args):
         if vmid is None:
             raise ValueError("vmid is required")
         return apply_groundhog(vmid, args.get("source"), args.get("sha256"),
-                               args.get("allow_http"), args.get("allow_reboot", False))
+                               args.get("allow_http"), args.get("allow_reboot", False),
+                               secrets=args.get("secrets"), headers=args.get("headers"))
     if name == "groundhog_status":
         vmid = args.get("vmid")
         if vmid is None:
@@ -3113,6 +3213,8 @@ def mcp_call(name, args):
             "groundhog": (args.get("groundhog") or "").strip() or None,
             "groundhog_sha256": args.get("groundhog_sha256"),
             "groundhog_allow_reboot": bool(args.get("groundhog_allow_reboot", False)),
+            "groundhog_secrets": args.get("groundhog_secrets"),
+            "groundhog_headers": args.get("groundhog_headers"),
             "expires_in_minutes": args.get("expires_in_minutes"),
             "who": (args.get("who") or "").strip()[:60],
         }
