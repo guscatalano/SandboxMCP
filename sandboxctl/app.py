@@ -3342,6 +3342,12 @@ def _sandbox_view(e):
     # agent. Requires a Proxmox login, so it is a link rather than an embed.
     out["console_url"] = (f"https://{HOST}:8006/?console=kvm&novnc=1"
                           f"&vmid={e['vmid']}&node={NODE}&resize=off")
+    # A count, not the notes themselves: an undocumented sandbox and a
+    # well-documented one looked identical in the list.
+    try:
+        out["notes"] = len(get_comments(e["vmid"]) or [])
+    except Exception:                                 # noqa: BLE001
+        out["notes"] = 0
     exp = get_expiry(e["vmid"])
     out["expires"] = "never" if not exp else ("expired" if exp["expired"]
                                               else f"{exp['minutes_left']} min")
@@ -3700,6 +3706,21 @@ a{color:var(--acc)}
 .claim{border:1px solid #d29922;color:#d29922}
 .exp{border:1px solid #8b949e;color:#8b949e}
 .notes-toggle{font-size:11px;color:var(--mut);text-decoration:none;border-bottom:1px dotted var(--ln)}
+/* State is its own column now, so the badges wrap there instead of widening Name. */
+.statecell{display:flex;align-items:center;gap:6px;flex-wrap:wrap;min-width:0}
+/* Capacity, above the table: a limit should be visible before it refuses you. */
+.cap{display:flex;align-items:center;gap:18px;flex-wrap:wrap;padding:0 2px 14px;
+  font:12px ui-monospace,Consolas,monospace;color:var(--mut)}
+.cap .m{display:flex;align-items:center;gap:8px}
+.cap .bar{width:80px;height:5px;border-radius:3px;background:#222936;overflow:hidden}
+.cap .bar>i{display:block;height:100%;background:var(--acc)}
+.cap .bar>i.hot{background:#d29922}
+.cap .warnmsg{color:#d29922}
+tr.grouphead td{padding:14px 10px 4px;border-bottom:0;color:var(--mut);
+  font:500 11px ui-monospace,Consolas,monospace;letter-spacing:.09em;text-transform:uppercase}
+tr.dimmed td{opacity:.62}
+.tick{font:12px ui-monospace,Consolas,monospace;font-variant-numeric:tabular-nums;color:#8b949e}
+.tick.soon{color:var(--bad)}
 .notes-toggle:hover{color:var(--acc)}
 .notes-row>td{background:#0f131a;padding-top:12px}
 .notes{max-height:260px;overflow:auto;margin-bottom:10px}
@@ -3769,8 +3790,10 @@ pre{background:#0b0d11;border:1px solid var(--ln);border-radius:6px;padding:12px
   <div class="warn">TLS uses an ephemeral self-signed certificate. It changes on every boot, so MCP clients that verify certificates will reject it &mdash; leave it off unless you know you want it.</div>
 </div>
 
-<div class="card"><table id="tbl"><thead><tr>
-<th>VMID</th><th>Name</th><th>Status</th><th>Address</th><th>Open</th><th></th>
+<div class="card">
+<div class="cap" id="cap"></div>
+<table id="tbl"><thead><tr>
+<th>VMID</th><th>Name</th><th>State</th><th>Address</th><th>Open</th><th></th>
 </tr></thead><tbody id="rows"><tr><td colspan="6" style="color:#8b93a1">loading&hellip;</td></tr></tbody></table></div>
 
 <div class="card"><div class="warn">
@@ -3906,14 +3929,25 @@ function row(s){
     : '';
   // A sandbox counting down to destruction should not look like one that is
   // staying. "never" is the common case and says nothing.
-  var exp = (s.expires && s.expires !== 'never')
-    ? `<span class="exp" title="Destroyed automatically when this runs out">${
-         s.expires === 'expired' ? 'expired' : 'expires in ' + s.expires}</span>`
-    : '';
-  return `<tr><td><code>${s.vmid}</code></td><td><div class="namecell"><span class="nm">${esc(s.name)}</span>${claim}${exp}
+  // A countdown, not a label: this used to be a server-rendered string, so a
+  // row could read "33 min" with seconds left on it.
+  var exp = '';
+  if (s.expires === 'expired') {
+    exp = '<span class="exp" title="Past its expiry; the reaper takes it on its next pass">expired</span>';
+  } else if (s.expires_at) {
+    exp = `<span class="exp tick" data-until="${s.expires_at}"
+             title="Destroyed automatically when this runs out">&hellip;</span>`;
+  }
+  var n = s.notes || 0;
+  // Dim by bucket, not by claim: a claimed sandbox that is about to be reaped
+  // belongs in "expiring soon" and must not be greyed out there.
+  return `<tr class="${bucket(s) >= 2 ? 'dimmed' : ''}">
+    <td><code>${s.vmid}</code></td>
+    <td><div class="namecell"><span class="nm">${esc(s.name)}</span>
       <a href="#" class="notes-toggle" onclick="return toggleNotes(event,${s.vmid})"
-         title="Notes on this sandbox">notes</a></div></td>
-    <td><span class="st ${s.status==='running'?'r':'s'}"></span>${s.status}</td>
+         title="${n ? n+' note'+(n===1?'':'s')+' on this sandbox' : 'No notes yet'}"
+         >notes${n ? ' ' + n : ''}</a></div></td>
+    <td><div class="statecell"><span class="st ${s.status==='running'?'r':'s'}"></span>${s.status}${claim}${exp}</div></td>
     <td>${s.ip?`<code>${s.ip}</code>`:'&mdash;'}</td>
     <td><div class="lnk">${links(s)}</div></td>
     <td style="text-align:right">${actions(s)}</td></tr>
@@ -3997,18 +4031,80 @@ function copyText(t,what,extra){
   }catch(e){}
   if(!viaTextarea()) prompt((what||'Value')+' (copy it):',t);
 }
+// Which question a row answers: can I take this, is it about to vanish, is
+// someone on it, or is it not even running. Imminent destruction outranks a
+// claim, because it is the fact you have least time to act on.
+function bucket(s){
+  if(s.status!=='running') return 3;
+  var left = s.expires_minutes_left;
+  if(s.expires==='expired' || (typeof left==='number' && left<=15)) return 1;
+  return s.claimed_by ? 2 : 0;
+}
+var GROUPS=['free to take','expiring soon','held','not running'];
+
+function groupHead(i,n){
+  return '<tr class="grouphead"><td colspan="6">'+GROUPS[i]+' &middot; '+n+'</td></tr>';
+}
+
+function ticks(){
+  var now = Date.now()/1000;
+  document.querySelectorAll('.tick[data-until]').forEach(function(el){
+    var left = Math.round(parseInt(el.dataset.until,10) - now);
+    if(left <= 0){ el.textContent='expired'; el.classList.add('soon'); return; }
+    var h=Math.floor(left/3600), m=Math.floor((left%3600)/60), s=left%60;
+    var p=function(v){ return v<10?'0'+v:''+v; };
+    el.textContent = (h ? h+':'+p(m)+':'+p(s) : m+':'+p(s)) + ' left';
+    el.classList.toggle('soon', left < 15*60);
+  });
+}
+
+async function drawCapacity(){
+  try{
+    const r=await fetch('api/capacity');
+    if(!r.ok) return;
+    const c=await r.json();
+    var pct=function(a,b){ return b ? Math.min(100, Math.round(a/b*100)) : 0; };
+    var hot=function(a,b){ return b && a/b >= .8 ? ' hot' : ''; };
+    var left=c.running_left;
+    document.getElementById('cap').innerHTML =
+      '<span class="m">sandboxes <span class="bar"><i style="width:'+pct(c.sandboxes,c.max_sandboxes)+'%"></i></span> '
+        +c.sandboxes+' / '+c.max_sandboxes+'</span>'
+      +'<span class="m">running <span class="bar"><i class="'+hot(c.running,c.max_running).trim()
+        +'" style="width:'+pct(c.running,c.max_running)+'%"></i></span> '
+        +c.running+' / '+c.max_running+'</span>'
+      +(left<=1 ? '<span class="warnmsg">'+(left===0
+          ? 'no room left \u2014 create will refuse until one is destroyed or stopped'
+          : '1 slot left \u2014 each running sandbox costs the controller ~100 MB')+'</span>' : '');
+  }catch(e){ /* the list is the point; capacity is a nicety */ }
+}
+
 async function refresh(){
  try{
   const r=await fetch('api/sandboxes');
   if(!r.ok) throw new Error('HTTP '+r.status);
   const d=await r.json();
-  document.getElementById('rows').innerHTML = d.length ? d.map(row).join('')
-    : '<tr><td colspan="6" style="color:#8b93a1">No sandboxes yet.</td></tr>';
+  if(!d.length){
+    document.getElementById('rows').innerHTML =
+      '<tr><td colspan="6" style="color:#8b93a1">No sandboxes yet.</td></tr>';
+  } else {
+    var by=[[],[],[],[]];
+    d.forEach(function(s){ by[bucket(s)].push(s); });
+    var html='';
+    by.forEach(function(list,i){
+      if(!list.length) return;
+      list.sort(function(a,b){ return a.vmid-b.vmid; });
+      html += groupHead(i,list.length) + list.map(row).join('');
+    });
+    document.getElementById('rows').innerHTML = html;
+    ticks();
+  }
+  drawCapacity();
  }catch(e){
   document.getElementById('rows').innerHTML =
-    '<tr><td colspan="7" style="color:#f85149">Could not load: '+e.message+'</td></tr>';
+    '<tr><td colspan="6" style="color:#f85149">Could not load: '+e.message+'</td></tr>';
  }
 }
+setInterval(ticks, 1000);
 // The controller proxies every sandbox, so this endpoint is the one worth
 // configuring; the per-sandbox commands below are for pointing a client at a
 // single box directly.
