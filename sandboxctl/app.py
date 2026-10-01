@@ -447,6 +447,10 @@ GROUNDHOG_HOME = r"C:\ProgramData\groundhog"
 GROUNDHOG_TASK = r"Groundhog\RunPending"
 # Written by the agent's own built-in reporter on every run, so there is nothing
 # to configure and it is there for applies this controller did not start.
+# vmid -> the last outcome we saw, for the fleet list's badge. A hint, not a
+# record: the panel reads the guest. Not persisted on purpose -- a stale badge
+# that survived a restart would be worse than no badge.
+GH_LAST = {}
 GROUNDHOG_LAST_RUN = GROUNDHOG_HOME + r"\last-run"
 
 
@@ -565,11 +569,92 @@ def apply_groundhog(vmid, source, sha256=None, allow_http=None, allow_reboot=Fal
                     "Write-Output 'OK|started'", timeout=120)
     if "OK|started" not in (out or ""):
         raise RuntimeError("could not start " + GROUNDHOG_TASK + ": " + (out or "")[:160])
+    GH_LAST[int(vmid)] = "running"
     record_event(vmid, "groundhog apply", source[:80])
     if job:
         job.log("groundhog: apply started; it continues in the guest")
     return {"vmid": int(vmid), "source": source, "started": True,
             "note": "the agent runs in the sandbox user's session; poll groundhog_status"}
+
+
+def _plan_clean(text):
+    """Keep the agent's own words; drop PowerShell's error furniture.
+
+    A native program's stderr comes back wrapped in the command echoed again, a
+    squiggle underline, CategoryInfo and FullyQualifiedErrorId. None of that
+    says anything about the file somebody is trying to write.
+    """
+    out = []
+    for line in (text or "").splitlines():
+        s = line.strip()
+        if not s:
+            if out and out[-1] != "":
+                out.append("")           # keep paragraph breaks, drop runs
+            continue
+        if s.startswith(("At line:", "+ ", "+~", "~")) or s.startswith("+"):
+            continue
+        if s.startswith(("CategoryInfo", "FullyQualifiedErrorId")):
+            continue
+        if set(s) <= {"~", "+", " "}:
+            continue
+        # "groundhog-agent.exe : error: ..." -> "error: ..."
+        if ".exe : " in s:
+            s = s.split(".exe : ", 1)[1]
+        out.append(s)
+    return "\n".join(out).strip()
+
+
+def groundhog_plan(vmid, source):
+    """Run `groundhog-agent plan` in the guest. Loads everything, changes nothing.
+
+    Groundhog's own answer to "is this file valid", which beats anything this
+    controller could reimplement: it resolves extends, fetches what it must to
+    know what "latest" is, and prints the steps it would take.
+    """
+    # Only for http, so an https source keeps the protection. Our own payload
+    # port is plain http and is the only port a sandbox may reach, so a file
+    # served from here cannot be validated without this.
+    flag = " --allow-http" if source.lower().startswith("http://") else ""
+    out = _guest_ps(vmid,
+                    # Continue, not SilentlyContinue: a native program's stderr
+                    # arrives as error records, and silencing those throws away
+                    # the one line that says what is wrong with the file.
+                    "$ErrorActionPreference='Continue'\n"
+                    f"$exe = '{GROUNDHOG_HOME}' + '\\bin\\groundhog-agent.exe'\n"
+                    "if (-not (Test-Path $exe)) { Write-Output 'ERR|agent not installed'; exit }\n"
+                    f"$o = (& $exe plan {_ps_literal(source)}{flag} 2>&1 | Out-String).Trim()\n"
+                    # No delimiter: base64 cannot collide with the output the way
+                    # a '~~' sentinel collided with PowerShell's own squiggle
+                    # underline, which decoded back into a page of blank lines.
+                    "$b = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($o))\n"
+                    "Write-Output ('OK|' + $LASTEXITCODE + '|' + $b)",
+                    timeout=300)
+    line = _marked_line(out)
+    if line.startswith("ERR|"):
+        raise RuntimeError(line.split("|", 1)[1])
+    _, code, blob = line.split("|", 2)
+    text = base64.b64decode(blob.strip(), validate=True).decode("utf-8", "replace")
+    return {"vmid": int(vmid), "ok": code.strip() in ("0", ""),
+            "output": _plan_clean(text)}
+
+
+def groundhog_write_adhoc(vmid, content):
+    """Stage a typed Groundhogfile where the guest can fetch it.
+
+    The payload port is the only one a sandbox may reach, so this is the same
+    route the Deskhand install uses. The file names its secrets rather than
+    carrying them, so serving it is not a disclosure.
+    """
+    if not (content or "").strip():
+        raise ValueError("nothing to apply: the Groundhogfile is empty")
+    name = f"adhoc-{int(vmid)}.groundhog.yaml"
+    pdir = os.path.join(HERE, "payload")
+    os.makedirs(pdir, exist_ok=True)
+    tmp = os.path.join(pdir, name + ".tmp")
+    with open(tmp, "w", encoding="utf-8", newline="\n") as fh:
+        fh.write(content)
+    os.replace(tmp, os.path.join(pdir, name))
+    return f"{SELF_URL}/payload/{name}"
 
 
 def groundhog_status(vmid):
@@ -618,6 +703,7 @@ def groundhog_status(vmid):
     else:
         outcome = "none"              # nothing was ever asked of this sandbox
 
+    GH_LAST[int(vmid)] = outcome
     out = {"vmid": int(vmid),
            "pending": pending,
            "outcome": outcome,
@@ -1667,11 +1753,17 @@ def do_destroy(job, vmid):
     except Exception:                                 # noqa: BLE001
         pass
     clear_expiry(vmid)
+    GH_LAST.pop(int(vmid), None)
     # The per-sandbox Groundhogfile the install rendered. Harmless to serve,
     # but it would otherwise leave one file per sandbox ever created.
     try:
         os.remove(os.path.join(HERE, "payload",
                                f"deskhand-{int(vmid)}.groundhog.yaml"))
+    except OSError:
+        pass
+    try:                    # and anything typed into the editor for it
+        os.remove(os.path.join(HERE, "payload",
+                               f"adhoc-{int(vmid)}.groundhog.yaml"))
     except OSError:
         pass
     try:
@@ -3348,6 +3440,9 @@ def _sandbox_view(e):
         out["notes"] = len(get_comments(e["vmid"]) or [])
     except Exception:                                 # noqa: BLE001
         out["notes"] = 0
+    gh = GH_LAST.get(int(e["vmid"]))
+    if gh and gh != "none":
+        out["groundhog"] = gh
     exp = get_expiry(e["vmid"])
     out["expires"] = "never" if not exp else ("expired" if exp["expired"]
                                               else f"{exp['minutes_left']} min")
@@ -3705,6 +3800,11 @@ a{color:var(--acc)}
   white-space:nowrap;max-width:22ch;overflow:hidden;text-overflow:ellipsis}
 .claim{border:1px solid #d29922;color:#d29922}
 .exp{border:1px solid #8b949e;color:#8b949e}
+/* Groundhog outcome, as a variant of the expiry badge so it inherits the
+   one-line-and-ellipsis behaviour rather than repeating it. */
+.gh-ok{border-color:var(--ok);color:var(--ok)}
+.gh-bad{border-color:var(--bad);color:var(--bad)}
+textarea:focus-visible,select:focus-visible{outline:2px solid var(--acc);outline-offset:1px}
 .notes-toggle{font-size:11px;color:var(--mut);text-decoration:none;border-bottom:1px dotted var(--ln)}
 /* State is its own column now, so the badges wrap there instead of widening Name. */
 .statecell{display:flex;align-items:center;gap:6px;flex-wrap:wrap;min-width:0}
@@ -3836,6 +3936,43 @@ pre{background:#0b0d11;border:1px solid var(--ln);border-radius:6px;padding:12px
   </tr></thead><tbody id="recrows"></tbody></table>
 </div>
 
+<div class="card" id="ghcard" style="display:none">
+  <b id="ghtitle"></b>
+  <div class="warn" style="margin:6px 0 10px">Groundhog brings a sandbox to a declared state from
+  one file &mdash; apps, files, registry, environment, and its own health checks. It is how Deskhand
+  itself gets installed. <b>Validate</b> runs Groundhog&rsquo;s own <code>plan</code> in the guest and
+  changes nothing; <b>Apply</b> runs it for real. Name secrets in the file as
+  <code>${secret:NAME}</code> and give the values below &mdash; they are stripped from the guest as the
+  agent reads them, and never logged.</div>
+  <div id="ghstate" class="warn" style="margin:-4px 0 12px">&nbsp;</div>
+  <div class="grid" style="margin-bottom:10px">
+    <div><label>Start from</label>
+      <select id="gh_tpl" onchange="ghStarter()">
+        <option value="">(keep what is in the editor)</option>
+        <option value="internals">groundhog:windows-internals &mdash; Sysinternals, WinDbg, symbols</option>
+        <option value="sysinternals">groundhog:sysinternals only</option>
+        <option value="apps">a couple of winget apps</option>
+        <option value="file">write a config file from a secret</option>
+      </select></div>
+    <div><label>Secrets (NAME=value, one per line)</label>
+      <input id="gh_secrets" placeholder="API_TOKEN=..."></div>
+  </div>
+  <label for="gh_body">Groundhogfile</label>
+  <textarea id="gh_body" spellcheck="false" rows="14"
+    style="width:100%;font:13px/1.5 ui-monospace,Consolas,monospace;background:#0f1115;
+           color:var(--fg);border:1px solid var(--ln);border-radius:6px;padding:10px"></textarea>
+  <div style="display:flex;gap:8px;align-items:center;margin-top:10px;flex-wrap:wrap">
+    <button class="d" onclick="ghPlan()">Validate</button>
+    <button class="d" style="color:#58a6ff;border-color:#58a6ff" onclick="ghApply()">Apply</button>
+    <label style="display:flex;align-items:center;gap:6px;color:var(--mut);font-size:12px">
+      <input type="checkbox" id="gh_reboot"> allow it to reboot mid-apply</label>
+    <button class="d" onclick="document.getElementById('ghcard').style.display='none'">Close</button>
+  </div>
+  <pre id="gh_out" style="margin:12px 0 0;padding:10px;background:#0f1115;border:1px solid var(--ln);
+       border-radius:6px;font:12px/1.5 ui-monospace,Consolas,monospace;color:var(--mut);
+       white-space:pre-wrap;max-height:260px;overflow:auto">No run recorded for this sandbox yet.</pre>
+</div>
+
 <div class="card" id="agentcard" style="display:none">
   <b id="agenttitle"></b>
   <div class="warn" style="margin:6px 0 10px">Installs into the sandbox itself and configures it with
@@ -3918,6 +4055,7 @@ function actions(s){
   m.push(`<button class="d" onclick="recordings(${s.vmid},'${s.name}')">Recordings</button>`);
   m.push(`<button class="d badish" onclick="destroy(${s.vmid})">Destroy</button>`);
   return `<button class="d" style="color:#a371f7;border-color:#a371f7" onclick="watch(${s.vmid},'${s.name}')">Watch</button>
+    <button class="d" onclick="ghPanel(${s.vmid},'${esc(s.name)}')">Groundhog</button>
     <button class="d" style="color:#58a6ff;border-color:#58a6ff" onclick="agentPanel(${s.vmid},'${s.name}')">Agents</button>
     <details class="menu"><summary>&#8943;</summary><div class="mi">${m.join('')}</div></details>`;
 }
@@ -3938,6 +4076,15 @@ function row(s){
     exp = `<span class="exp tick" data-until="${s.expires_at}"
              title="Destroyed automatically when this runs out">&hellip;</span>`;
   }
+  // Named outcomes, because "not applied" and "failed" are different facts and
+  // the old badge-free row said neither.
+  var gh = '';
+  if (s.groundhog && s.groundhog !== 'none') {
+    var cls = s.groundhog === 'failed' ? 'exp gh-bad'
+            : s.groundhog === 'succeeded' ? 'exp gh-ok' : 'exp';
+    var label = s.groundhog === 'reboot-pending' ? 'needs reboot' : 'gh ' + s.groundhog;
+    gh = `<span class="${cls}" title="Groundhog: ${esc(s.groundhog)}">${esc(label)}</span>`;
+  }
   var n = s.notes || 0;
   // Dim by bucket, not by claim: a claimed sandbox that is about to be reaped
   // belongs in "expiring soon" and must not be greyed out there.
@@ -3947,7 +4094,7 @@ function row(s){
       <a href="#" class="notes-toggle" onclick="return toggleNotes(event,${s.vmid})"
          title="${n ? n+' note'+(n===1?'':'s')+' on this sandbox' : 'No notes yet'}"
          >notes${n ? ' ' + n : ''}</a></div></td>
-    <td><div class="statecell"><span class="st ${s.status==='running'?'r':'s'}"></span>${s.status}${claim}${exp}</div></td>
+    <td><div class="statecell"><span class="st ${s.status==='running'?'r':'s'}"></span>${s.status}${claim}${exp}${gh}</div></td>
     <td>${s.ip?`<code>${s.ip}</code>`:'&mdash;'}</td>
     <td><div class="lnk">${links(s)}</div></td>
     <td style="text-align:right">${actions(s)}</td></tr>
@@ -4225,6 +4372,89 @@ function playrec(file){
   v.scrollIntoView({behavior:'smooth',block:'nearest'});
 }
 var agvm=null, MODEL_CTX={};
+var ghvm=null;
+var GH_STARTERS={
+  internals:'version: 1\nextends: groundhog:windows-internals\n',
+  sysinternals:'version: 1\nextends: groundhog:sysinternals\n',
+  apps:'version: 1\napps:\n  - Git.Git\n  - Microsoft.VisualStudioCode\n'
+        +'verify:\n  - command: git --version\n',
+  file:'version: 1\nagent: ">=0.12.0"\nfiles:\n  - to: C:\\ProgramData\\example\\config.json\n'
+       +'    content: |\n      { "token": "${secret:API_TOKEN}" }\nverify:\n'
+       +'  - file: C:\\ProgramData\\example\\config.json\n'
+};
+function ghStarter(){
+  var k=document.getElementById('gh_tpl').value;
+  if(k && GH_STARTERS[k]) document.getElementById('gh_body').value=GH_STARTERS[k];
+}
+function ghPanel(vmid,name){
+  ghvm=vmid;
+  document.getElementById('ghtitle').textContent='Groundhog on '+name+' (vmid '+vmid+')';
+  var c=document.getElementById('ghcard');
+  c.style.display='block';
+  c.scrollIntoView({behavior:'smooth'});
+  if(!document.getElementById('gh_body').value.trim()){
+    document.getElementById('gh_tpl').value='internals'; ghStarter();
+  }
+  ghRefresh();
+}
+async function ghRefresh(){
+  var st=document.getElementById('ghstate'), out=document.getElementById('gh_out');
+  st.textContent='reading the last run\u2026';
+  try{
+    const r=await fetch('api/groundhog?vmid='+ghvm);
+    const d=await r.json();
+    if(d.error){ st.textContent='could not read it: '+d.error; return; }
+    var bits=['last run: '+d.outcome];
+    if(d.outcome==='reboot-pending')
+      bits.push('the apply is waiting for a restart \u2014 reboot the sandbox and it continues at the next logon');
+    if(d.failed_step) bits.push('failed at: '+d.failed_step+(d.failed_message?' \u2014 '+d.failed_message:''));
+    st.textContent=bits.join(' \u00b7 ');
+    var run=d.run;
+    if(run && run.steps && run.steps.length){
+      out.textContent=(run.agent?('agent '+run.agent+'  '+(run.updated||'')+'\n\n'):'')
+        + run.steps.map(function(s){
+            return (s.status==='done'?'  ok  ':s.status==='failed'?' FAIL ':'  ..  ')
+                   + s.title + (s.changed?'   (changed)':'')
+                   + (s.message?'\n        '+s.message:''); }).join('\n');
+    } else if(d.status){ out.textContent=d.status; }
+    else { out.textContent='No run recorded for this sandbox yet.'; }
+  }catch(e){ st.textContent='could not read it: '+e.message; }
+}
+async function ghPost(extra){
+  var body=Object.assign({
+    vmid: ghvm,
+    content: document.getElementById('gh_body').value,
+    secrets: document.getElementById('gh_secrets').value,
+    allow_reboot: document.getElementById('gh_reboot').checked
+  }, extra||{});
+  const r=await fetch('api/groundhog',{method:'POST',
+    headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+  return await r.json();
+}
+async function ghPlan(){
+  var out=document.getElementById('gh_out');
+  out.textContent='validating in the sandbox\u2026 (plan resolves extends and downloads, so give it a moment)';
+  try{
+    const d=await ghPost({plan:true});
+    if(d.error){ out.textContent='plan could not run: '+d.error; return; }
+    out.textContent=(d.ok?'valid \u2014 these are the steps it would take:\n\n':'plan rejected it:\n\n')+d.output;
+  }catch(e){ out.textContent='plan could not run: '+e.message; }
+}
+async function ghApply(){
+  var out=document.getElementById('gh_out');
+  out.textContent='applying\u2026 it runs in the sandbox, so this panel follows along.';
+  try{
+    const d=await ghPost({});
+    if(d.error){ out.textContent='could not start the apply: '+d.error; return; }
+    var n=0;
+    var poll=setInterval(async function(){
+      n++; await ghRefresh();
+      var s=document.getElementById('ghstate').textContent||'';
+      if(n>60 || /succeeded|failed|reboot-pending/.test(s)) clearInterval(poll);
+    }, 5000);
+    ghRefresh();
+  }catch(e){ out.textContent='could not start the apply: '+e.message; }
+}
 function agentPanel(vmid,name){
   agvm=vmid;
   document.getElementById('agenttitle').textContent='Install agents in '+name+' (vmid '+vmid+')';
@@ -4389,6 +4619,12 @@ class Handler(BaseHTTPRequestHandler):
                     {k: get_expiry(k) for k in _expiry_load()}))
             except Exception as exc:                  # noqa: BLE001
                 return self._send(500, json.dumps({"error": str(exc)}))
+        if p.path == "/api/groundhog":
+            try:
+                vmid = urllib.parse.parse_qs(p.query).get("vmid", [""])[0]
+                return self._send(200, json.dumps(groundhog_status(int(vmid))))
+            except Exception as exc:                  # noqa: BLE001
+                return self._send(400, json.dumps({"error": str(exc)}))
         if p.path == "/api/capacity":
             try:
                 return self._send(200, json.dumps(capacity()))
@@ -4604,6 +4840,33 @@ class Handler(BaseHTTPRequestHandler):
                 return
             out = replies if isinstance(body, list) else replies[0]
             return self._send(200, json.dumps(out))
+        if p.path == "/api/groundhog":
+            # One route, two verbs of its own: validate, or apply. Validation is
+            # separate because it is the cheap half and changes nothing.
+            try:
+                vmid = int(body.get("vmid"))
+                content = body.get("content")
+                source = (body.get("source") or "").strip()
+                if content and not source:
+                    source = groundhog_write_adhoc(vmid, content)
+                if not source:
+                    raise ValueError("pass a Groundhogfile or a source to fetch one from")
+                if body.get("plan"):
+                    return self._send(200, json.dumps(groundhog_plan(vmid, source)))
+                secrets = {}
+                for line in (body.get("secrets") or "").splitlines():
+                    line = line.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    k, sep, v = line.partition("=")
+                    if not sep:
+                        raise ValueError(f"secrets want NAME=value, got {line[:40]!r}")
+                    secrets[k.strip()] = v.strip()
+                return self._send(200, json.dumps(apply_groundhog(
+                    vmid, source, body.get("sha256"), None,
+                    bool(body.get("allow_reboot")), None, secrets=secrets or None)))
+            except Exception as exc:                  # noqa: BLE001
+                return self._send(400, json.dumps({"error": str(exc)}))
         if p.path == "/api/claim":
             try:
                 if body.get("release"):
