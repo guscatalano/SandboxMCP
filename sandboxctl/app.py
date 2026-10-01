@@ -575,6 +575,118 @@ def _guard_claim(vmid, action, who=None, force=False):
 
 
 # --------------------------------------------------------------------------
+# Expiry
+# --------------------------------------------------------------------------
+EXPIRY_PATH = os.path.join(HERE, "expiry.json")
+EXPIRY_LOCK = threading.Lock()
+# 0 means never. Opt-in on purpose: the consequence of being wrong here is a
+# destroyed VM, so a fresh install should not start reaping on its own.
+TTL_DEFAULT_MINUTES = int(CONFIG.get("default_ttl_minutes") or 0)
+TTL_MAX_MINUTES = int(CONFIG.get("max_ttl_minutes") or 60 * 24 * 30)
+REAP_POLL_SECONDS = 60
+
+
+def _expiry_load():
+    try:
+        with open(EXPIRY_PATH, encoding="utf-8") as fh:
+            return json.load(fh)
+    except Exception:                                 # noqa: BLE001
+        return {}
+
+
+def _expiry_save(d):
+    tmp = EXPIRY_PATH + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(d, fh, indent=2)
+    os.replace(tmp, EXPIRY_PATH)
+
+
+def get_expiry(vmid):
+    """The expiry for one sandbox, or None when it never expires."""
+    e = _expiry_load().get(str(vmid))
+    if not e:
+        return None
+    e = dict(e)
+    left = e["until"] - time.time()
+    e["minutes_left"] = int(left / 60)
+    e["expired"] = left <= 0
+    return e
+
+
+def set_expiry(vmid, minutes, who=""):
+    """Set, change or remove a sandbox's expiry.
+
+    minutes <= 0 (or None) means never, which is a real choice rather than an
+    absence -- it clears any existing timer.
+    """
+    vmid = int(vmid)
+    who = (who or "").strip()[:60]
+    if minutes in (None, "", "never", "infinite"):
+        minutes = 0
+    minutes = int(minutes)
+    with EXPIRY_LOCK:
+        d = _expiry_load()
+        if minutes <= 0:
+            was = d.pop(str(vmid), None)
+            _expiry_save(d)
+            if was:
+                record_event(vmid, "expiry cleared", who)
+            return {"vmid": vmid, "never": True,
+                    "note": "this sandbox will not be destroyed automatically"}
+        minutes = min(minutes, TTL_MAX_MINUTES)
+        entry = {"who": who, "since": int(time.time()),
+                 "until": int(time.time() + minutes * 60), "minutes": minutes}
+        d[str(vmid)] = entry
+        _expiry_save(d)
+    record_event(vmid, "expiry set", f"{minutes} min" + (f" by {who}" if who else ""))
+    out = dict(entry)
+    out.update({"vmid": vmid, "never": False, "minutes_left": minutes})
+    return out
+
+
+def clear_expiry(vmid):
+    """Drop the entry without logging a change -- for a sandbox that is gone."""
+    with EXPIRY_LOCK:
+        d = _expiry_load()
+        if d.pop(str(vmid), None) is not None:
+            _expiry_save(d)
+
+
+def reaper_loop():
+    """Destroy sandboxes whose time is up.
+
+    Polls rather than scheduling a timer per sandbox: the set changes without
+    this service being told, and a poll that reads the truth each time cannot
+    drift out of step with it.
+    """
+    while True:
+        time.sleep(REAP_POLL_SECONDS)
+        try:
+            live = {s["vmid"] for s in list_sandboxes()}
+            for key in list(_expiry_load()):
+                vmid = int(key)
+                if vmid not in live:
+                    clear_expiry(vmid)                # gone already
+                    continue
+                e = get_expiry(vmid)
+                if not e or not e["expired"]:
+                    continue
+                held = get_claim(vmid)
+                if held:
+                    # A claim is the more specific statement: someone says they
+                    # are using it. Reap once that lapses.
+                    print(f"reaper: VM {vmid} is expired but {held['who']} holds a claim "
+                          f"for another {held['minutes_left']} min; leaving it", flush=True)
+                    continue
+                print(f"reaper: VM {vmid} expired; destroying", flush=True)
+                record_event(vmid, "expired", "destroyed by the reaper")
+                clear_expiry(vmid)
+                start_job(f"Destroying {vmid} (expired)", do_destroy, vmid)
+        except Exception as exc:                      # noqa: BLE001
+            print(f"reaper: {exc}", flush=True)
+
+
+# --------------------------------------------------------------------------
 # History
 # --------------------------------------------------------------------------
 EVENTS_PATH = os.path.join(HERE, "events.json")
@@ -1117,6 +1229,17 @@ def do_create(job, opts):
     wait_unlocked(vmid)
     job.log("cloned from template")
 
+    # Set before provisioning, not after: a build that dies half way is exactly
+    # the case worth cleaning up on its own.
+    ttl = opts.get("expires_in_minutes")
+    if ttl is None:
+        ttl = TTL_DEFAULT_MINUTES
+    if int(ttl or 0) > 0:
+        exp = set_expiry(vmid, ttl, opts.get("who") or "create")
+        job.log(f"expires in {exp['minutes']} min unless extended")
+    else:
+        job.log("no expiry: this sandbox stays until destroyed")
+
     provision(job, vmid, opts)
 
 def provision(job, vmid, opts, configure_hw=True):
@@ -1254,6 +1377,7 @@ def do_destroy(job, vmid):
         release_sandbox(vmid)
     except Exception:                                 # noqa: BLE001
         pass
+    clear_expiry(vmid)
     try:
         archive_comments(vmid, (vm("/config", vmid=vmid) or {}).get("name") or "")
     except Exception:                                 # noqa: BLE001
@@ -1345,6 +1469,24 @@ MCP_TOOLS = [
         "inputSchema": {
             "type": "object",
             "properties": {"vmid": {"type": "integer"}},
+            "required": ["vmid"],
+        },
+    },
+    {
+        "name": "set_expiry",
+        "description": ("Set when a sandbox is destroyed automatically, or stop it expiring. "
+                        "minutes=0 (or omit it) means never, which is a real choice rather "
+                        "than an absence -- it clears any existing timer. Call it again to "
+                        "extend. A sandbox under an active claim is left alone until the "
+                        "claim lapses."),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "vmid": {"type": "integer"},
+                "minutes": {"type": "integer",
+                            "description": "Minutes from now. 0 means never expire."},
+                "who": {"type": "string", "description": "Who set it, for the history."},
+            },
             "required": ["vmid"],
         },
     },
@@ -2736,6 +2878,12 @@ def _sandbox_view(e):
     # agent. Requires a Proxmox login, so it is a link rather than an embed.
     out["console_url"] = (f"https://{HOST}:8006/?console=kvm&novnc=1"
                           f"&vmid={e['vmid']}&node={NODE}&resize=off")
+    exp = get_expiry(e["vmid"])
+    out["expires"] = "never" if not exp else ("expired" if exp["expired"]
+                                              else f"{exp['minutes_left']} min")
+    if exp:
+        out["expires_at"] = exp["until"]
+        out["expires_minutes_left"] = exp["minutes_left"]
     claim = get_claim(e["vmid"])
     if claim:
         out["claimed_by"] = claim["who"]
@@ -2775,6 +2923,12 @@ def mcp_call(name, args):
         if vmid is None:
             raise ValueError("vmid is required")
         return groundhog_status(vmid)
+    if name == "set_expiry":
+        vmid = args.get("vmid")
+        if vmid is None:
+            raise ValueError("vmid is required")
+        _check_managed(vmid)
+        return set_expiry(vmid, args.get("minutes"), args.get("who"))
     if name == "claim_sandbox":
         return claim_sandbox(args.get("vmid"), args.get("who"),
                              args.get("purpose"), args.get("minutes"))
@@ -2828,6 +2982,8 @@ def mcp_call(name, args):
             "groundhog": (args.get("groundhog") or "").strip() or None,
             "groundhog_sha256": args.get("groundhog_sha256"),
             "groundhog_allow_reboot": bool(args.get("groundhog_allow_reboot", False)),
+            "expires_in_minutes": args.get("expires_in_minutes"),
+            "who": (args.get("who") or "").strip()[:60],
         }
         opts["name"] = re.sub(r"[^A-Za-z0-9-]", "-", opts["name"])[:15]
         job = start_job(f"Creating {opts['name']}", do_create, opts)
@@ -3611,6 +3767,12 @@ class Handler(BaseHTTPRequestHandler):
             if (q.get("archived") or ["0"])[0] in ("1", "true"):
                 return self._send(200, json.dumps(get_archive(vmid)))
             return self._send(200, json.dumps(get_comments(vmid)))
+        if p.path == "/api/expiry":
+            try:
+                return self._send(200, json.dumps(
+                    {k: get_expiry(k) for k in _expiry_load()}))
+            except Exception as exc:                  # noqa: BLE001
+                return self._send(500, json.dumps({"error": str(exc)}))
         if p.path == "/api/capacity":
             try:
                 return self._send(200, json.dumps(capacity()))
@@ -3909,6 +4071,11 @@ if __name__ == "__main__":
     pay = ThreadingHTTPServer((PAYLOAD_LISTEN[0], int(PAYLOAD_LISTEN[1])), PayloadHandler)
     threading.Thread(target=pay.serve_forever, daemon=True).start()
     print(f"payload  listening on {PAYLOAD_LISTEN[0]}:{PAYLOAD_LISTEN[1]} (sandbox-facing, read-only)", flush=True)
+
+    threading.Thread(target=reaper_loop, daemon=True).start()
+    print("expiry reaper running (default "
+          + (f"{TTL_DEFAULT_MINUTES} min" if TTL_DEFAULT_MINUTES else "never")
+          + ")", flush=True)
 
     if RECORDER:
         threading.Thread(target=recorder_loop, daemon=True).start()

@@ -17,6 +17,10 @@
   "max_sandboxes": 12,
   "max_running": 6,
 
+  "_comment_ttl": "Auto-destroy sandboxes after this many minutes. 0 means never, which is the default: reaping is irreversible, so a fresh install should not start doing it on its own. Override per sandbox with create_sandbox expires_in_minutes, or afterwards with set_expiry; minutes=0 there means never. A sandbox under an active claim is left alone until the claim lapses. max_ttl_minutes caps what anyone can ask for.",
+  "default_ttl_minutes": 0,
+  "max_ttl_minutes": 43200,
+
   "_comment_bridge": "SDN vnet the sandboxes attach to. Isolated from the LAN, NATs outbound.",
   "bridge": "sbx0",
 

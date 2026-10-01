@@ -60,6 +60,7 @@ client, and the lifecycle buttons. **Watch** opens a live view of any of them.
 | **Claim** | An advisory, self-expiring hold that guards the destructive calls, so two sessions do not collide. |
 | **Discover** | An arriving agent is told what this is, via MCP `instructions`, `/llms.txt` and `/.well-known/`. |
 | **Limits** | Hard caps on how many sandboxes exist and how many run at once. `create_sandbox` refuses at the limit; `capacity` reports the headroom. |
+| **Expire** | An optional timer per sandbox — destroyed automatically when it runs out. `never` is a first-class option, and the default. |
 
 The two watch sources are not redundant. **Proxmox VNC works when nothing is
 running in the guest** — during Windows setup, at a lock screen, on a boot loop,
