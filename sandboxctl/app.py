@@ -1257,6 +1257,55 @@ for ($i = 1; $i -le 5; $i++) {{
 }}
 """
 
+# Deskhand as a Groundhogfile. Everything here is public: the token is a secret
+# reference the agent fills in from pending.json, so this can be served to the
+# guest over the payload port like any other artifact.
+DESKHAND_GROUNDHOG = """\
+version: 1
+agent: ">=0.12.0"
+
+files:
+  - from: @@PAYLOAD@@
+    sha256: @@SHA256@@
+    to: C:\\Deskhand
+    extract: true
+
+  # Not inside C:\\Deskhand: `extract: true` replaces that folder wholesale, so a
+  # config kept there would not survive the next update. Deskhand searches
+  # ProgramData, so this is found whatever the working directory is.
+  - to: C:\\ProgramData\\Deskhand\\deskhand.json
+    content: |
+      {
+        "token": "${secret:DESKHAND_TOKEN}",
+        "port": @@PORT@@,
+        "bind": "any",
+        "maxToolChars": @@TOOLCHARS@@,
+        "enableShell": @@SHELL@@,
+        "enableSessionLaunch": @@SHELL@@@@TLS_LINE@@
+      }
+
+run:
+  - command: |
+      # Open the port and register Deskhand's logon task
+      $ErrorActionPreference = 'Stop'
+      Remove-NetFirewallRule -DisplayName 'Deskhand HTTP' -ErrorAction SilentlyContinue
+      New-NetFirewallRule -DisplayName 'Deskhand HTTP' -Direction Inbound -Action Allow -Protocol TCP -LocalPort @@PORT@@ -Profile Any | Out-Null
+      $exe = Join-Path 'C:\\Deskhand' 'deskhand-http.exe'
+      if (-not (Test-Path $exe)) { throw ('deskhand-http.exe missing from the zip at ' + $exe) }
+      $action = New-ScheduledTaskAction -Execute $exe
+      $trigger = New-ScheduledTaskTrigger -AtLogOn -User '@@USER@@'
+      $principal = New-ScheduledTaskPrincipal -UserId '@@USER@@' -LogonType Interactive -RunLevel Highest
+      $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::Zero)
+      Register-ScheduledTask -TaskName 'Deskhand' -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Force | Out-Null
+      Stop-Process -Name deskhand-http -Force -ErrorAction SilentlyContinue
+      Start-ScheduledTask -TaskName 'Deskhand'
+
+verify:
+  - port: @@PORT@@
+    within: 3m
+"""
+
+
 INSTALL_PS = r"""
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
@@ -1495,10 +1544,13 @@ def provision(job, vmid, opts, configure_hw=True):
               .replace("@@TLS_LINE@@", tls_line)
               .replace("@@USER@@", WIN_USER)
               .replace("@@TOOLCHARS@@", str(DESKHAND_TOOL_CHARS)))
-    job.log(f"installing Deskhand from the controller ({asset})")
-    out = agent_run_ps(vmid, script, timeout=900)
-    if not out or "INSTALLED" not in out:
-        raise RuntimeError(f"Deskhand install failed: {(out or '')[:400]}")
+    if opts.get("deskhand_via_groundhog"):
+        install_deskhand_groundhog(job, vmid, opts, token)
+    else:
+        job.log(f"installing Deskhand from the controller ({asset})")
+        out = agent_run_ps(vmid, script, timeout=900)
+        if not out or "INSTALLED" not in out:
+            raise RuntimeError(f"Deskhand install failed: {(out or '')[:400]}")
 
     time.sleep(15)
     ip = guest_ip(vmid)
@@ -1519,6 +1571,68 @@ def provision(job, vmid, opts, configure_hw=True):
                             headers=opts.get("groundhog_headers"))
         except Exception as exc:                      # noqa: BLE001
             job.log(f"groundhog: could not start the apply: {exc}")
+
+
+def install_deskhand_groundhog(job, vmid, opts, token):
+    """Install Deskhand by applying a rendered Groundhogfile, and wait for it.
+
+    Returns nothing; raises if the apply did not succeed. The caller already
+    knows the token -- it generated it -- so nothing has to be read back.
+    """
+    if artifact_kind() != "zip":
+        raise RuntimeError("the Groundhog install path needs the zip artifact; "
+                           "stage deskhand.zip or use the scripted install")
+    asset = "deskhand.zip"
+    sha = _payload_sha256(f"{SELF_URL}/payload/{asset}")
+    if not sha:
+        raise RuntimeError("could not hash the staged deskhand.zip to pin it")
+
+    tls = ',\n        "tls": "self-signed"' if opts.get("tls") else ""
+    body = (DESKHAND_GROUNDHOG
+            .replace("@@PAYLOAD@@", f"{SELF_URL}/payload/{asset}")
+            .replace("@@SHA256@@", sha)
+            .replace("@@PORT@@", str(opts["port"]))
+            .replace("@@TOOLCHARS@@", str(DESKHAND_TOOL_CHARS))
+            .replace("@@SHELL@@", "true" if opts.get("shell") else "false")
+            .replace("@@TLS_LINE@@", tls)
+            .replace("@@USER@@", WIN_USER))
+
+    # Per sandbox, because the port and flags differ. It carries no secret, only
+    # a reference to one, so serving it from the payload port is safe.
+    name = f"deskhand-{vmid}.groundhog.yaml"
+    pdir = os.path.join(HERE, "payload")
+    os.makedirs(pdir, exist_ok=True)
+    tmp = os.path.join(pdir, name + ".tmp")
+    with open(tmp, "w", encoding="utf-8", newline="\n") as fh:
+        fh.write(body)
+    os.replace(tmp, os.path.join(pdir, name))
+
+    job.log(f"installing Deskhand via Groundhog ({asset} pinned to {sha[:12]}...)")
+    apply_groundhog(vmid, f"{SELF_URL}/payload/{name}", None, True, False, job,
+                    secrets={"DESKHAND_TOKEN": token})
+
+    deadline = time.time() + 900
+    last = ""
+    while time.time() < deadline:
+        time.sleep(15)
+        try:
+            st = groundhog_status(vmid)
+        except Exception:                             # noqa: BLE001
+            continue                                  # agent busy or mid-restart
+        if st["outcome"] != last:
+            job.log(f"  groundhog: {st['outcome']}")
+            last = st["outcome"]
+        if st["outcome"] == "succeeded":
+            for s in (st.get("run") or {}).get("steps") or []:
+                job.log(f"    {s['status']}: {str(s['title'])[:90]}")
+            return
+        if st["outcome"] == "failed":
+            raise RuntimeError("Deskhand install failed at step %r: %s"
+                               % (st.get("failed_step"), st.get("failed_message")))
+        if st["outcome"] == "reboot-pending":
+            raise RuntimeError("the Deskhand install wants a restart, which this "
+                               "path does not expect; investigate before retrying")
+    raise RuntimeError("the Deskhand Groundhog apply did not finish in 15 minutes")
 
 
 def do_destroy(job, vmid):
@@ -1832,6 +1946,13 @@ MCP_TOOLS = [
                                                            "leave it false for MCP: the certificate is "
                                                            "ephemeral so verifying clients reject it.")},
                 "who": {"type": "string", "description": "You, for the history and for claims."},
+                "deskhand_via_groundhog": {"type": "boolean",
+                                           "description": ("Install Deskhand by applying a "
+                                                           "Groundhogfile rather than a scripted "
+                                                           "step: declarative, resumable, and "
+                                                           "verified by its own port check. "
+                                                           "Needs the zip artifact. Default "
+                                                           "false while it earns its place.")},
                 "expires_in_minutes": {"type": "integer",
                                        "description": ("Destroy it automatically after this long. "
                                                        "0 or omitted means never. A sandbox under "
@@ -3301,6 +3422,7 @@ def mcp_call(name, args):
             "groundhog_allow_reboot": bool(args.get("groundhog_allow_reboot", False)),
             "groundhog_secrets": args.get("groundhog_secrets"),
             "groundhog_headers": args.get("groundhog_headers"),
+            "deskhand_via_groundhog": bool(args.get("deskhand_via_groundhog", False)),
             "expires_in_minutes": args.get("expires_in_minutes"),
             "who": (args.get("who") or "").strip()[:60],
         }
