@@ -1667,6 +1667,13 @@ def do_destroy(job, vmid):
     except Exception:                                 # noqa: BLE001
         pass
     clear_expiry(vmid)
+    # The per-sandbox Groundhogfile the install rendered. Harmless to serve,
+    # but it would otherwise leave one file per sandbox ever created.
+    try:
+        os.remove(os.path.join(HERE, "payload",
+                               f"deskhand-{int(vmid)}.groundhog.yaml"))
+    except OSError:
+        pass
     try:
         archive_comments(vmid, (vm("/config", vmid=vmid) or {}).get("name") or "")
     except Exception:                                 # noqa: BLE001
