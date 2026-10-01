@@ -3952,7 +3952,7 @@ pre{background:#0b0d11;border:1px solid var(--ln);border-radius:6px;padding:12px
         <option value="internals">groundhog:windows-internals &mdash; Sysinternals, WinDbg, symbols</option>
         <option value="sysinternals">groundhog:sysinternals only</option>
         <option value="apps">a couple of winget apps</option>
-        <option value="file">write a config file from a secret</option>
+        <option value="secret">pass a secret into the environment</option>
       </select></div>
     <div><label>Secrets (NAME=value, one per line)</label>
       <input id="gh_secrets" placeholder="API_TOKEN=..."></div>
@@ -4373,14 +4373,37 @@ function playrec(file){
 }
 var agvm=null, MODEL_CTX={};
 var ghvm=null;
+// A newline with no escape anywhere: a template literal holding a real one.
+// Every multi-line string below uses this or a backtick literal. Escape
+// sequences are avoided on purpose here: PAGE is a non-raw Python string, so
+// a backslash-n typed in this block is turned into a real line break before
+// the browser ever sees it, which is a syntax error inside a quoted string.
+var NL = `
+`;
 var GH_STARTERS={
-  internals:'version: 1\nextends: groundhog:windows-internals\n',
-  sysinternals:'version: 1\nextends: groundhog:sysinternals\n',
-  apps:'version: 1\napps:\n  - Git.Git\n  - Microsoft.VisualStudioCode\n'
-        +'verify:\n  - command: git --version\n',
-  file:'version: 1\nagent: ">=0.12.0"\nfiles:\n  - to: C:\\ProgramData\\example\\config.json\n'
-       +'    content: |\n      { "token": "${secret:API_TOKEN}" }\nverify:\n'
-       +'  - file: C:\\ProgramData\\example\\config.json\n'
+  internals: `version: 1
+extends: groundhog:windows-internals
+`,
+  sysinternals: `version: 1
+extends: groundhog:sysinternals
+`,
+  apps: `version: 1
+apps:
+  - Git.Git
+  - Microsoft.VisualStudioCode
+verify:
+  - command: git --version
+`,
+  // Single quotes, not a backtick literal: ${...} inside a template literal is
+  // read as an interpolation, and this starter exists precisely to show a
+  // secret reference. An array joined by NL needs no escape of any kind.
+  secret: ['version: 1',
+           'agent: ">=0.12.0"',
+           'env:',
+           '  EXAMPLE_TOKEN: "${secret:API_TOKEN}"',
+           'verify:',
+           '  - command: if (-not $env:EXAMPLE_TOKEN) { exit 1 }',
+           ''].join(NL)
 };
 function ghStarter(){
   var k=document.getElementById('gh_tpl').value;
@@ -4399,23 +4422,24 @@ function ghPanel(vmid,name){
 }
 async function ghRefresh(){
   var st=document.getElementById('ghstate'), out=document.getElementById('gh_out');
-  st.textContent='reading the last run\u2026';
+  st.textContent='reading the last run...';
   try{
     const r=await fetch('api/groundhog?vmid='+ghvm);
     const d=await r.json();
     if(d.error){ st.textContent='could not read it: '+d.error; return; }
     var bits=['last run: '+d.outcome];
     if(d.outcome==='reboot-pending')
-      bits.push('the apply is waiting for a restart \u2014 reboot the sandbox and it continues at the next logon');
-    if(d.failed_step) bits.push('failed at: '+d.failed_step+(d.failed_message?' \u2014 '+d.failed_message:''));
-    st.textContent=bits.join(' \u00b7 ');
+      bits.push('waiting for a restart - reboot the sandbox and it continues at the next logon');
+    if(d.failed_step) bits.push('failed at: '+d.failed_step+(d.failed_message?' - '+d.failed_message:''));
+    st.textContent=bits.join(' - ');
     var run=d.run;
     if(run && run.steps && run.steps.length){
-      out.textContent=(run.agent?('agent '+run.agent+'  '+(run.updated||'')+'\n\n'):'')
-        + run.steps.map(function(s){
-            return (s.status==='done'?'  ok  ':s.status==='failed'?' FAIL ':'  ..  ')
-                   + s.title + (s.changed?'   (changed)':'')
-                   + (s.message?'\n        '+s.message:''); }).join('\n');
+      var head = run.agent ? ('agent '+run.agent+'  '+(run.updated||'')+NL+NL) : '';
+      out.textContent = head + run.steps.map(function(s){
+        var mark = s.status==='done' ? '  ok  ' : s.status==='failed' ? ' FAIL ' : '  ..  ';
+        return mark + s.title + (s.changed?'   (changed)':'')
+               + (s.message ? NL+'        '+s.message : '');
+      }).join(NL);
     } else if(d.status){ out.textContent=d.status; }
     else { out.textContent='No run recorded for this sandbox yet.'; }
   }catch(e){ st.textContent='could not read it: '+e.message; }
@@ -4433,16 +4457,16 @@ async function ghPost(extra){
 }
 async function ghPlan(){
   var out=document.getElementById('gh_out');
-  out.textContent='validating in the sandbox\u2026 (plan resolves extends and downloads, so give it a moment)';
+  out.textContent='validating in the sandbox... plan resolves extends and downloads, so give it a moment.';
   try{
     const d=await ghPost({plan:true});
     if(d.error){ out.textContent='plan could not run: '+d.error; return; }
-    out.textContent=(d.ok?'valid \u2014 these are the steps it would take:\n\n':'plan rejected it:\n\n')+d.output;
+    out.textContent=(d.ok ? 'valid - these are the steps it would take:' : 'plan rejected it:')+NL+NL+d.output;
   }catch(e){ out.textContent='plan could not run: '+e.message; }
 }
 async function ghApply(){
   var out=document.getElementById('gh_out');
-  out.textContent='applying\u2026 it runs in the sandbox, so this panel follows along.';
+  out.textContent='applying... it runs in the sandbox, so this panel follows along.';
   try{
     const d=await ghPost({});
     if(d.error){ out.textContent='could not start the apply: '+d.error; return; }
