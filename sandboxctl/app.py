@@ -25,6 +25,7 @@ Stdlib only, on purpose: no pip, nothing to keep patched.
 """
 import base64
 import gzip
+import hashlib
 import html
 import json
 import os
@@ -333,7 +334,7 @@ def do_make_template(job, opts):
                            "$ProgressPreference='SilentlyContinue'\n"
                            "& (Join-Path $env:ProgramData 'groundhog\\bin\\groundhog-agent.exe') "
                            "run-pending 2>&1 | Out-String",
-                           timeout=int(opts.get("groundhog_timeout") or 1800))
+                           timeout=int(opts.get("groundhog_timeout") or 7200))
         for line in (out or "").splitlines():
             if line.strip():
                 job.log("  " + line.strip()[:140])
@@ -369,6 +370,34 @@ def do_make_template(job, opts):
             if reboot.strip().lower() == "true":
                 raise RuntimeError("a reboot is pending; sealing now would bake it into "
                                    "every clone")
+
+    # Forget this build's Groundhog state before sealing. Without it every clone
+    # inherits pending.done.json (so groundhog_status reports a success nothing
+    # asked for), the download cache, and -- worse -- one shared per-machine
+    # secret salt. Unconditional: the state may have come from an earlier
+    # template in the chain rather than from this build.
+    gh_clean = agent_run_ps(vmid,
+                            "$ProgressPreference='SilentlyContinue'\n"
+                            "$exe = Join-Path $env:ProgramData "
+                            "'groundhog\\bin\\groundhog-agent.exe'\n"
+                            "if (-not (Test-Path $exe)) { Write-Output 'CLEAN|absent'; exit }\n"
+                            "& $exe update 2>&1 | Out-String | Out-Null\n"
+                            "$o = (& $exe clean 2>&1 | Out-String).Trim()\n"
+                            "Write-Output ('CLEAN|' + $LASTEXITCODE + '|' + "
+                            "($o -replace '\r?\n', ' ~ '))", timeout=600)
+    line = ""
+    for l in (gh_clean or "").splitlines():
+        if l.strip().startswith("CLEAN|"):
+            line = l.strip()
+    if line.startswith("CLEAN|absent"):
+        job.log("groundhog: agent not in this image, nothing to clean")
+    elif line.startswith("CLEAN|0"):
+        job.log("groundhog: state cleaned (needs agent >=0.13.0); clones start fresh")
+    else:
+        # Not fatal: a sealed template with leftover state is wrong but usable,
+        # and failing the whole build over it would be worse.
+        job.log(f"WARNING: groundhog clean did not report success: {line[:160]}")
+        job.log("  clones will inherit this build's groundhog state and secret salt")
 
     job.log("sysprep /generalize /oobe /shutdown")
     agent_run_ps(vmid,
@@ -416,7 +445,25 @@ def do_make_template(job, opts):
 # --------------------------------------------------------------------------
 GROUNDHOG_HOME = r"C:\ProgramData\groundhog"
 GROUNDHOG_TASK = r"Groundhog\RunPending"
-GROUNDHOG_REPORT = GROUNDHOG_HOME + r"\report"
+# Written by the agent's own built-in reporter on every run, so there is nothing
+# to configure and it is there for applies this controller did not start.
+GROUNDHOG_LAST_RUN = GROUNDHOG_HOME + r"\last-run"
+
+
+def _payload_sha256(url):
+    """The hash of a payload file we serve ourselves, or None if it is not ours."""
+    try:
+        name = os.path.basename(urllib.parse.urlparse(url).path)
+        full = os.path.join(HERE, "payload", name)
+        if not name or not os.path.isfile(full):
+            return None
+        h = hashlib.sha256()
+        with open(full, "rb") as fh:
+            for block in iter(lambda: fh.read(1024 * 1024), b""):
+                h.update(block)
+        return h.hexdigest()
+    except Exception:                                 # noqa: BLE001
+        return None
 
 
 def _header_rules(headers):
@@ -464,9 +511,14 @@ def apply_groundhog(vmid, source, sha256=None, allow_http=None, allow_reboot=Fal
 
     pending = {"source": source, "allowReboot": bool(allow_reboot),
                "allowHttp": bool(allow_http),
-               # A folder sink: status.json plus agent.log, which groundhog_status
-               # reads back for per-step detail.
-               "report": [GROUNDHOG_REPORT]}
+               }
+    if not sha256 and source.lower().startswith("http://"):
+        # allow_http applies to every download in the run, not only this source,
+        # so pin what we can. Ours is on local disk; hashing it costs nothing and
+        # the caller does not have to care.
+        sha256 = _payload_sha256(source)
+        if sha256 and job:
+            job.log(f"groundhog: pinned the source to sha256 {sha256[:12]}...")
     if sha256:
         pending["sha256"] = sha256
     if secrets:
@@ -478,16 +530,18 @@ def apply_groundhog(vmid, source, sha256=None, allow_http=None, allow_reboot=Fal
     if headers:
         pending["headers"] = _header_rules(headers)
 
-    # Clear the markers the last run left, which in a fresh sandbox are the
-    # TEMPLATE's: generate_template applies a Groundhogfile before sealing, so
-    # every clone inherits a pending.done.json and would otherwise report that
-    # build's success as its own.
+    # Clear what the last run left, which in a fresh sandbox is the TEMPLATE's:
+    # generate_template applies a Groundhogfile before sealing, so every clone
+    # inherits a pending.done.json and a last-run folder, and would otherwise
+    # report that build's success -- and its steps -- as its own. last-run goes
+    # too, or a status check taken before the agent's first write describes the
+    # previous run as though it were this one.
     _guest_ps(vmid,
               "$ErrorActionPreference='SilentlyContinue'\n"
               f"$h = '{GROUNDHOG_HOME}'\n"
               "Remove-Item -LiteralPath ($h + '\\pending.done.json'), "
               "($h + '\\pending.failed.json') -Force -ErrorAction SilentlyContinue\n"
-              f"Remove-Item -LiteralPath '{GROUNDHOG_REPORT}' -Recurse -Force "
+              "Remove-Item -LiteralPath ($h + '\\last-run') -Recurse -Force "
               "-ErrorAction SilentlyContinue\n"
               "Write-Output 'OK'", timeout=90)
 
@@ -540,23 +594,21 @@ def groundhog_status(vmid):
     if line.startswith("ERR|"):
         raise RuntimeError(line.split("|", 1)[1])
     _, pending, done, failed, status = line.split("|", 4)
-    steps = None
+    run = None
     try:
-        # status.json is small, and it is the only place per-step detail exists.
-        raw = guest_read(vmid, GROUNDHOG_REPORT + r"\status.json")
-        st = json.loads(raw.get("text") or "{}")
-        steps = [{"title": s.get("title"), "status": s.get("status"),
-                  "changed": bool(s.get("changed")), "message": s.get("message")}
-                 for s in (st.get("steps") or [])]
-        report = {"agent": st.get("agent"), "updated": st.get("updated"),
-                  "reboots": st.get("reboots"), "message": st.get("message"),
-                  "steps": steps}
+        raw = guest_read(vmid, GROUNDHOG_LAST_RUN + r"\status.json")
+        run = json.loads(raw.get("text") or "{}") or None
     except Exception:                                 # noqa: BLE001
-        report = None               # no sink yet, or an apply that predates one
+        run = None                  # never applied, or an agent older than 0.12
     pending = pending.strip().lower() == "true"
     done = done.strip().lower() == "true"
     failed = failed.strip().lower() == "true"
-    if pending:
+    # status.json is the authority when it exists: file names cannot distinguish a
+    # run that is still going from one that is waiting for a restart, and both
+    # leave pending.json in place.
+    if run and run.get("status"):
+        outcome = str(run["status"])
+    elif pending:
         outcome = "running"
     elif failed:
         outcome = "failed"
@@ -564,12 +616,27 @@ def groundhog_status(vmid):
         outcome = "succeeded"
     else:
         outcome = "none"              # nothing was ever asked of this sandbox
+
     out = {"vmid": int(vmid),
            "pending": pending,
            "outcome": outcome,
            "status": status.strip()}
-    if report:
-        out["report"] = report
+    if run:
+        steps = [{"title": s.get("title"), "status": s.get("status"),
+                  "changed": bool(s.get("changed")), "message": s.get("message")}
+                 for s in (run.get("steps") or [])]
+        out["run"] = {"agent": run.get("agent"), "updated": run.get("updated"),
+                      "reboots": run.get("reboots"), "message": run.get("message"),
+                      "steps": steps}
+        # Name the step that went wrong rather than making the caller scan.
+        bad = next((s for s in steps if s.get("status") == "failed"), None)
+        if bad:
+            out["failed_step"] = bad.get("title")
+            out["failed_message"] = bad.get("message")
+        if outcome == "reboot-pending":
+            out["note"] = ("the apply needs a restart to continue and allow_reboot was "
+                           "false, so the agent is waiting: reboot the sandbox and it "
+                           "resumes at the next logon. It is not stuck.")
     return out
 
 
@@ -1518,8 +1585,16 @@ MCP_TOOLS = [
                                                                "path, URL or zip. Reboots are "
                                                                "allowed during a template build."},
                 "groundhog_sha256": {"type": "string"},
-                "groundhog_timeout": {"type": "integer", "description": "Seconds to allow the "
-                                                                        "apply. Default 1800."},
+                "groundhog_timeout": {"type": "integer",
+                                      "description": ("Seconds to allow the apply. Default "
+                                                      "7200. Windows features and "
+                                                      "capabilities are serviced from Windows "
+                                                      "Update unless the Groundhogfile gives a "
+                                                      "`source:`, and NetFx3 or OpenSSH.Server "
+                                                      "is roughly 30 minutes each on a fresh "
+                                                      "Windows 11 VM -- which is exactly what "
+                                                      "baking a base layer is for, so allow "
+                                                      "for it.")},
                 "steps": {"type": "array", "items": {"type": "string"},
                           "description": "PowerShell run in the image before sealing, in order. "
                                          "For things a Groundhogfile cannot express."},
@@ -1554,7 +1629,10 @@ MCP_TOOLS = [
                                             "run before it changes anything. The agent removes "
                                             "them from pending.json as it reads it and never "
                                             "logs them. Needs agent >=0.12.0, which a template "
-                                            "agent self-updates to.")},
+                                            "agent self-updates to. A per-VM value is the right "
+                                            "use: it is born and dies with the sandbox. A "
+                                            "long-lived API key is NOT -- anything in a sandbox "
+                                            "can read it once written, and it outlives the VM.")},
                 "headers": {"type": "array", "items": {"type": "string"},
                             "description": ("Headers for private sources, as "
                                             "\"host=Name: value\". A value may itself be "
@@ -1565,10 +1643,12 @@ MCP_TOOLS = [
     },
     {
         "name": "groundhog_status",
-        "description": ("How the last Groundhog apply went on a sandbox. `outcome` is one of "
-                        "running, succeeded, failed or none -- read from which of "
-                        "pending.json / pending.done.json / pending.failed.json the agent has "
-                        "left behind, so it is still right after a reboot mid-apply."),
+        "description": ("How the last Groundhog apply went on a sandbox. `outcome` is "
+                        "running, succeeded, failed, reboot-pending or none, with `run.steps` "
+                        "giving each step's title and state and `failed_step` naming the one "
+                        "that broke. reboot-pending means the apply needs a restart to "
+                        "continue and allow_reboot was false: reboot the sandbox and it "
+                        "resumes at the next logon -- it is not stuck."),
         "inputSchema": {
             "type": "object",
             "properties": {"vmid": {"type": "integer"}},
@@ -1774,8 +1854,11 @@ MCP_TOOLS = [
                                                       "any: a missing one stops the run before it "
                                                       "changes anything. Never logged, and the "
                                                       "agent strips them from pending.json as it "
-                                                      "reads it. A sandbox is untrusted, so use "
-                                                      "scoped or short-lived values.")},
+                                                      "reads it. A per-VM value is the right use: "
+                                                      "it is born and dies with the sandbox. A "
+                                                      "long-lived API key is NOT -- anything in a "
+                                                      "sandbox can read it once written, and it "
+                                                      "outlives the VM.")},
                 "groundhog_headers": {"type": "array", "items": {"type": "string"},
                                       "description": ("Headers for a private source, as "
                                                       "\"host=Name: value\".")},
@@ -1808,7 +1891,10 @@ MCP_TOOLS = [
         "description": ("Install an AI agent INSIDE a sandbox (hermes, opencode, or both) and "
                         "configure it with the controller's API keys and that sandbox's own "
                         "Deskhand as an MCP server, so it can drive the desktop it runs on. "
-                        "On demand: Hermes alone is a ~2 GB install. Returns a job id."),
+                        "On demand: Hermes alone is a ~2 GB install. Returns a job id. "
+                        "NOTE: this writes the controller's API keys into an untrusted VM, "
+                        "where anything running can read them, and they outlive the sandbox. "
+                        "Use scoped or short-lived keys, not your main ones."),
         "inputSchema": {
             "type": "object",
             "properties": {
