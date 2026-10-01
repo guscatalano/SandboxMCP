@@ -1745,7 +1745,24 @@ MCP_TOOLS = [
 # fit in it. Writes are therefore chunked; reads are capped because the result
 # comes back through the same place.
 GUEST_READ_MAX = 4 * 1024 * 1024        # 4 MiB, base64'd on the way out
-GUEST_WRITE_CHUNK = 6 * 1024            # bytes of payload per exec call
+# Bytes of payload per exec call. This is a throughput setting, not a size
+# limit -- guest_write chunks and loops, so there is no cap on the file.
+#
+# The ceiling is the Windows command line, 32767 characters, and the payload is
+# nowhere near its own size by the time it gets there: agent_run_ps sends the
+# script as -EncodedCommand, so it is UTF-16'd (x2) then base64'd (x4/3). That
+# is 2.667x on the whole script, which is this payload's base64 plus about 200
+# characters of wrapper, so the real budget is roughly 32767 / 2.667 = 12280
+# script characters: about 9 KiB of payload.
+#
+# Measured through write_guest_file on a live guest: 8192 bytes works, 12288
+# fails. Going over does not fail usefully either -- the oversized exec is
+# refused, agent_run_ps returns None, and the caller is told "the guest agent
+# did not answer", which reads like a rebooting VM.
+GUEST_WRITE_CHUNK = 8 * 1024
+# Payload per agent file-write call. PVE caps the content parameter at 61440
+# characters; with encode=0 that is our own base64, so 61440 * 3/4 of payload.
+GUEST_FW_CHUNK = 45 * 1024              # = 46080, exactly the 61440-char cap
 
 
 def _guest_ps(vmid, script, timeout=180):
@@ -1819,6 +1836,72 @@ def guest_read(vmid, path):
                 "base64": base64.b64encode(raw).decode()}
 
 
+def _fw(vmid, path, blob):
+    """One agent file-write. encode=0 so the agent writes our base64 verbatim.
+
+    Raises on anything at all, so the caller can fall back to the exec path
+    rather than this becoming the only way to write a file.
+    """
+    vm("/agent/file-write", "POST", vmid=vmid, timeout=120, data=[
+        ("file", path), ("encode", 0),
+        ("content", base64.b64encode(blob).decode())])
+
+
+def _guest_write_fast(vmid, path, blob, append):
+    """Write via the guest agent's file-write, or raise so the caller falls back.
+
+    Parts are zero-padded because they are joined in name order, and 'p-10'
+    sorts before 'p-2'.
+    """
+    tmp = path + ".sbxpart"
+    if len(blob) <= GUEST_FW_CHUNK:
+        _fw(vmid, tmp, blob)
+    else:
+        part_dir = path + ".sbxparts"
+        _guest_ps(vmid,
+                  "$ErrorActionPreference='Stop'\n"
+                  "$d = %s\n"
+                  "if (Test-Path -LiteralPath $d) { Remove-Item -LiteralPath $d -Recurse -Force }\n"
+                  "New-Item -ItemType Directory -Path $d | Out-Null\n"
+                  "Write-Output 'OK'" % _ps_literal(part_dir), timeout=120)
+        n = 0
+        for off in range(0, len(blob), GUEST_FW_CHUNK):
+            _fw(vmid, "%s\\p-%06d" % (part_dir, n), blob[off:off + GUEST_FW_CHUNK])
+            n += 1
+        # One exec to join them, whatever the file's size.
+        out = _guest_ps(vmid,
+                        "$ErrorActionPreference='Stop'\n"
+                        "$d = %s; $t = %s\n"
+                        "$fs = [IO.File]::Open($t, 'Create', 'Write')\n"
+                        "Get-ChildItem -LiteralPath $d -Filter 'p-*' | Sort-Object Name | "
+                        "ForEach-Object { $b = [IO.File]::ReadAllBytes($_.FullName); "
+                        "$fs.Write($b, 0, $b.Length) }\n"
+                        "$fs.Close()\n"
+                        "Remove-Item -LiteralPath $d -Recurse -Force\n"
+                        "Write-Output ('OK|' + (Get-Item -LiteralPath $t).Length)"
+                        % (_ps_literal(part_dir), _ps_literal(tmp)), timeout=300)
+        line = _marked_line(out)
+        if int(line.split("|")[1]) != len(blob):
+            raise RuntimeError("joined parts came to the wrong length")
+    return _guest_place(vmid, path, tmp, append, len(blob))
+
+
+def _guest_place(vmid, path, tmp, append, written):
+    """Move the staged file into place, so a failure leaves the original alone."""
+    script = (
+        "$ErrorActionPreference='Stop'\n"
+        "$t = %s; $p = %s\n"
+        "if (%s) { Get-Content -LiteralPath $t -Raw | Add-Content -LiteralPath $p -NoNewline; "
+        "Remove-Item -LiteralPath $t }\n"
+        "else { Move-Item -LiteralPath $t -Destination $p -Force }\n"
+        "Write-Output ('OK|' + (Get-Item -LiteralPath $p).Length)\n"
+        % (_ps_literal(tmp), _ps_literal(path), "$true" if append else "$false"))
+    line = _marked_line(_guest_ps(vmid, script, timeout=180))
+    if not line.startswith("OK|"):
+        raise RuntimeError("could not place the file: " + line[:120])
+    return {"path": path, "written": written, "size_on_disk": int(line.split("|")[1])}
+
+
 def guest_write(vmid, path, text=None, content_base64=None, append=False):
     """Write a file, in chunks, and verify the length afterwards."""
     if content_base64:
@@ -1827,6 +1910,15 @@ def guest_write(vmid, path, text=None, content_base64=None, append=False):
         blob = text.encode("utf-8")
     else:
         raise ValueError("pass text or content_base64")
+
+    # Preferred path: content in the request body rather than a command line.
+    # Falls back rather than failing, because an old PVE or a tightened token
+    # should cost throughput, not the ability to write a file at all.
+    try:
+        return _guest_write_fast(vmid, path, blob, append)
+    except Exception as exc:                          # noqa: BLE001
+        print(f"guest_write: file-write path unavailable on {vmid} ({exc}); "
+              "falling back to exec chunks", flush=True)
 
     tmp = path + ".sbxpart"
     first = True
