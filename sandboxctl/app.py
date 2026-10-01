@@ -518,7 +518,8 @@ def apply_groundhog(vmid, source, sha256=None, allow_http=None, allow_reboot=Fal
         # the caller does not have to care.
         sha256 = _payload_sha256(source)
         if sha256 and job:
-            job.log(f"groundhog: pinned the source to sha256 {sha256[:12]}...")
+            job.log("groundhog: pinned the Groundhogfile to sha256 "
+                    f"{sha256[:12]}...")
     if sha256:
         pending["sha256"] = sha256
     if secrets:
@@ -1544,7 +1545,17 @@ def provision(job, vmid, opts, configure_hw=True):
               .replace("@@TLS_LINE@@", tls_line)
               .replace("@@USER@@", WIN_USER)
               .replace("@@TOOLCHARS@@", str(DESKHAND_TOOL_CHARS)))
-    if opts.get("deskhand_via_groundhog"):
+    # Default: let Groundhog do it. The Groundhogfile fetches the zip, so an
+    # installation staged with the MSI keeps the scripted path rather than
+    # failing where it used to work.
+    via_gh = opts.get("deskhand_via_groundhog")
+    if via_gh is None:
+        via_gh = True
+    if via_gh and kind != "zip":
+        job.log(f"installing Deskhand with the scripted path ({asset}): "
+                "the Groundhog route needs the zip artifact")
+        via_gh = False
+    if via_gh:
         install_deskhand_groundhog(job, vmid, opts, token)
     else:
         job.log(f"installing Deskhand from the controller ({asset})")
@@ -1579,9 +1590,6 @@ def install_deskhand_groundhog(job, vmid, opts, token):
     Returns nothing; raises if the apply did not succeed. The caller already
     knows the token -- it generated it -- so nothing has to be read back.
     """
-    if artifact_kind() != "zip":
-        raise RuntimeError("the Groundhog install path needs the zip artifact; "
-                           "stage deskhand.zip or use the scripted install")
     asset = "deskhand.zip"
     sha = _payload_sha256(f"{SELF_URL}/payload/{asset}")
     if not sha:
@@ -1607,7 +1615,7 @@ def install_deskhand_groundhog(job, vmid, opts, token):
         fh.write(body)
     os.replace(tmp, os.path.join(pdir, name))
 
-    job.log(f"installing Deskhand via Groundhog ({asset} pinned to {sha[:12]}...)")
+    job.log(f"installing Deskhand via Groundhog; {asset} pinned to {sha[:12]}...")
     apply_groundhog(vmid, f"{SELF_URL}/payload/{name}", None, True, False, job,
                     secrets={"DESKHAND_TOKEN": token})
 
@@ -1623,7 +1631,17 @@ def install_deskhand_groundhog(job, vmid, opts, token):
             job.log(f"  groundhog: {st['outcome']}")
             last = st["outcome"]
         if st["outcome"] == "succeeded":
-            for s in (st.get("run") or {}).get("steps") or []:
+            steps = (st.get("run") or {}).get("steps") or []
+            if not steps:
+                # The outcome can land from the done marker a moment before the
+                # agent finishes writing status.json. The job log is the audit
+                # trail, so ask once more rather than recording nothing.
+                time.sleep(5)
+                try:
+                    steps = (groundhog_status(vmid).get("run") or {}).get("steps") or []
+                except Exception:                     # noqa: BLE001
+                    steps = []
+            for s in steps:
                 job.log(f"    {s['status']}: {str(s['title'])[:90]}")
             return
         if st["outcome"] == "failed":
@@ -1947,12 +1965,14 @@ MCP_TOOLS = [
                                                            "ephemeral so verifying clients reject it.")},
                 "who": {"type": "string", "description": "You, for the history and for claims."},
                 "deskhand_via_groundhog": {"type": "boolean",
-                                           "description": ("Install Deskhand by applying a "
-                                                           "Groundhogfile rather than a scripted "
-                                                           "step: declarative, resumable, and "
-                                                           "verified by its own port check. "
-                                                           "Needs the zip artifact. Default "
-                                                           "false while it earns its place.")},
+                                           "description": ("How Deskhand gets installed. Default "
+                                                           "true: a Groundhogfile, which is "
+                                                           "declarative, reruns only what "
+                                                           "changed, and is verified by its own "
+                                                           "port check. Set false for the older "
+                                                           "scripted install. Ignored when the "
+                                                           "staged artifact is the MSI, which "
+                                                           "always uses the scripted path.")},
                 "expires_in_minutes": {"type": "integer",
                                        "description": ("Destroy it automatically after this long. "
                                                        "0 or omitted means never. A sandbox under "
@@ -3422,7 +3442,9 @@ def mcp_call(name, args):
             "groundhog_allow_reboot": bool(args.get("groundhog_allow_reboot", False)),
             "groundhog_secrets": args.get("groundhog_secrets"),
             "groundhog_headers": args.get("groundhog_headers"),
-            "deskhand_via_groundhog": bool(args.get("deskhand_via_groundhog", False)),
+            # None means "decide in provision", which is how the default can be
+            # true without a caller passing false being ignored.
+            "deskhand_via_groundhog": args.get("deskhand_via_groundhog"),
             "expires_in_minutes": args.get("expires_in_minutes"),
             "who": (args.get("who") or "").strip()[:60],
         }
