@@ -338,13 +338,13 @@ def do_make_template(job, opts):
             if line.strip():
                 job.log("  " + line.strip()[:140])
         st = groundhog_status(vmid)
-        job.log("  groundhog: " + st["status"][:160])
-        # "no runs recorded" means it never ran at all, which is a failure to
-        # seal on just as much as an explicit one -- that is how an unconfigured
-        # image got sealed once already.
-        if not st["status"].lower().startswith("succeeded"):
-            raise RuntimeError("groundhog did not succeed (%s); not sealing a broken image"
-                               % st["status"][:120])
+        job.log(f"  groundhog: {st['outcome']} -- {st['status'][:140]}")
+        # Anything but an explicit success is a refusal to seal. "none" means it
+        # never ran at all, which is how an unconfigured image got sealed once
+        # already, and is just as disqualifying as a failure.
+        if st["outcome"] != "succeeded":
+            raise RuntimeError("groundhog did not succeed (%s: %s); not sealing a broken image"
+                               % (st["outcome"], st["status"][:120]))
 
     for i, step in enumerate(opts.get("steps") or [], 1):
         job.log(f"step {i}/{len(opts['steps'])}")
@@ -439,6 +439,17 @@ def apply_groundhog(vmid, source, sha256=None, allow_http=None, allow_reboot=Fal
     if sha256:
         pending["sha256"] = sha256
 
+    # Clear the markers the last run left, which in a fresh sandbox are the
+    # TEMPLATE's: generate_template applies a Groundhogfile before sealing, so
+    # every clone inherits a pending.done.json and would otherwise report that
+    # build's success as its own.
+    _guest_ps(vmid,
+              "$ErrorActionPreference='SilentlyContinue'\n"
+              f"$h = '{GROUNDHOG_HOME}'\n"
+              "Remove-Item -LiteralPath ($h + '\\pending.done.json'), "
+              "($h + '\\pending.failed.json') -Force -ErrorAction SilentlyContinue\n"
+              "Write-Output 'OK'", timeout=90)
+
     # Written as bytes: a BOM makes the agent fail with "expected value at
     # line 1 column 1", which reads like a corrupt file rather than an encoding.
     guest_write(vmid, GROUNDHOG_HOME + r"\pending.json",
@@ -466,22 +477,42 @@ def apply_groundhog(vmid, source, sha256=None, allow_http=None, allow_reboot=Fal
 
 
 def groundhog_status(vmid):
+    """What the last apply did, from the agent and from the pending file's fate.
+
+    The agent renames pending.json rather than deleting it -- pending.done.json
+    on success, pending.failed.json on failure -- so which one is there is the
+    outcome, and it is still there after a reboot the agent did not survive.
+    """
     out = _guest_ps(vmid,
                     "$ErrorActionPreference='SilentlyContinue'\n"
-                    f"$exe = '{GROUNDHOG_HOME}' + '\\bin\\groundhog-agent.exe'\n"
+                    f"$h = '{GROUNDHOG_HOME}'\n"
+                    "$exe = $h + '\\bin\\groundhog-agent.exe'\n"
                     "if (-not (Test-Path $exe)) { Write-Output 'ERR|agent not installed in this image'; exit }\n"
-                    f"$pending = Test-Path ('{GROUNDHOG_HOME}' + '\\pending.json')\n"
+                    "$p = Test-Path ($h + '\\pending.json')\n"
+                    "$d = Test-Path ($h + '\\pending.done.json')\n"
+                    "$f = Test-Path ($h + '\\pending.failed.json')\n"
                     "$s = (& $exe status 2>&1 | Out-String).Trim()\n"
-                    "Write-Output ('OK|' + $pending + '|' + ($s -replace '\r?\n', ' ~ '))",
+                    "Write-Output ('OK|' + $p + '|' + $d + '|' + $f + '|' "
+                    "+ ($s -replace '\r?\n', ' ~ '))",
                     timeout=120)
     line = _marked_line(out)
     if line.startswith("ERR|"):
         raise RuntimeError(line.split("|", 1)[1])
-    _, pending, status = line.split("|", 2)
+    _, pending, done, failed, status = line.split("|", 4)
+    pending = pending.strip().lower() == "true"
+    done = done.strip().lower() == "true"
+    failed = failed.strip().lower() == "true"
+    if pending:
+        outcome = "running"
+    elif failed:
+        outcome = "failed"
+    elif done:
+        outcome = "succeeded"
+    else:
+        outcome = "none"              # nothing was ever asked of this sandbox
     return {"vmid": int(vmid),
-            # pending.json is deleted on success, so its absence is the signal
-            # that the apply finished rather than that nothing was asked for.
-            "pending": pending.strip().lower() == "true",
+            "pending": pending,
+            "outcome": outcome,
             "status": status.strip()}
 
 
@@ -1463,9 +1494,10 @@ MCP_TOOLS = [
     },
     {
         "name": "groundhog_status",
-        "description": ("How the last Groundhog apply went on a sandbox. `pending` true means "
-                        "one is still outstanding -- the agent deletes pending.json when it "
-                        "succeeds, so its absence is how you know the apply finished."),
+        "description": ("How the last Groundhog apply went on a sandbox. `outcome` is one of "
+                        "running, succeeded, failed or none -- read from which of "
+                        "pending.json / pending.done.json / pending.failed.json the agent has "
+                        "left behind, so it is still right after a reboot mid-apply."),
         "inputSchema": {
             "type": "object",
             "properties": {"vmid": {"type": "integer"}},
