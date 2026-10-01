@@ -62,6 +62,66 @@ reg add "$wu\AU" /v NoAutoUpdate /t REG_DWORD /d 1 /f 2>&1 | Out-Null
 Ok 'ZDP disabled'
 
 # ---------------------------------------------------------------------------
+# Clock
+# ---------------------------------------------------------------------------
+# A sandbox with a wrong clock timestamps every log, file and recording wrongly,
+# which makes correlating them with the host useless. Measured on this fleet
+# before this existed: every clone exactly 7 hours behind, for the sandbox's
+# whole life.
+#
+# The VM must also be created with localtime=0 (sandboxctl does this): Proxmox
+# starts QEMU with -rtc base=localtime for win11, and a UTC guest then reads the
+# host's local time as UTC. This section is the in-guest half.
+Step 'Clock'
+
+# UTC throughout, so "local time" and UTC are the same thing and the RTC base
+# cannot be misread.
+tzutil /s 'UTC' 2>&1 | Out-Null
+
+# The hardware clock holds UTC. Honoured when Windows reads the RTC; NOT when it
+# writes it, so this is a nicety and the resync task below is the guarantee.
+reg add 'HKLM\SYSTEM\CurrentControlSet\Control\TimeZoneInformation' `
+    /v RealTimeIsUniversal /t REG_DWORD /d 1 /f 2>&1 | Out-Null
+
+# The Hyper-V integration time provider is present in this image and enabled,
+# but it syncs from a Hyper-V host and there is none under KVM. Disable it so
+# w32time does not weigh a dead source.
+reg add 'HKLM\SYSTEM\CurrentControlSet\Services\W32Time\TimeProviders\VMICTimeProvider' `
+    /v Enabled /t REG_DWORD /d 0 /f 2>&1 | Out-Null
+
+# Permit a correction of any size. The default caps it at 54000 s, and the error
+# this fixes was 25200 s with a cold clock able to be worse.
+reg add 'HKLM\SYSTEM\CurrentControlSet\Services\W32Time\Config' `
+    /v MaxPosPhaseCorrection /t REG_DWORD /d 0xFFFFFFFF /f 2>&1 | Out-Null
+reg add 'HKLM\SYSTEM\CurrentControlSet\Services\W32Time\Config' `
+    /v MaxNegPhaseCorrection /t REG_DWORD /d 0xFFFFFFFF /f 2>&1 | Out-Null
+reg add 'HKLM\SYSTEM\CurrentControlSet\Services\W32Time\TimeProviders\NtpClient' `
+    /v SpecialPollInterval /t REG_DWORD /d 900 /f 2>&1 | Out-Null
+
+# w32time is trigger-started and stops itself when Windows thinks it is idle,
+# which on a non-domain machine is most of the time.
+sc.exe triggerinfo w32time delete 2>&1 | Out-Null
+sc.exe config w32time start= auto 2>&1 | Out-Null
+
+# A sandbox reaches the internet but not a domain, so public NTP it is. 0x9 is
+# client mode plus "honour SpecialPollInterval".
+w32tm /config /manualpeerlist:'time.cloudflare.com,0x9 time.google.com,0x9 pool.ntp.org,0x9' `
+      /syncfromflags:MANUAL /update 2>&1 | Out-Null
+
+# The safety net. w32time will not correct a large error on its own -- it keeps
+# reporting "Local CMOS Clock" and leaves the clock wrong -- so force it at every
+# boot, several times, because the network may not be up on the first attempt.
+$resync = 'Start-Service w32time; Start-Sleep 15; foreach($i in 1..6){ & w32tm /resync /force; Start-Sleep 10 }'
+$rAction = New-ScheduledTaskAction -Execute 'powershell.exe' `
+    -Argument ('-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -Command "' + $resync + '"')
+$rPrincipal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
+$rSettings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable
+Register-ScheduledTask -TaskName 'SandboxTimeResync' -Force `
+    -Action $rAction -Trigger (New-ScheduledTaskTrigger -AtStartup) `
+    -Principal $rPrincipal -Settings $rSettings | Out-Null
+Ok 'UTC, NTP peers set, resync at boot'
+
+# ---------------------------------------------------------------------------
 # Groundhog agent
 # ---------------------------------------------------------------------------
 # Groundhog configures a Windows machine from a declarative file. Its templated-VM

@@ -1592,6 +1592,11 @@ def provision(job, vmid, opts, configure_hw=True):
         vm("/config", "PUT", vmid=vmid, data={
             "net0": f"virtio={mac},bridge={BRIDGE},firewall=1",
             "cores": opts["cores"], "memory": opts["memory"],
+            # base=utc, not the localtime default Proxmox picks for win11: the
+            # guest's timezone is UTC, so a local-time RTC reads as exactly the
+            # host's UTC offset behind -- seven hours here. Takes effect on a
+            # cold boot, since the RTC base is a QEMU argument.
+            "localtime": 0,
             "description": "SANDBOX - disposable, not backed up. Created by sandboxctl."})
 
     if (vm("/status/current", vmid=vmid) or {}).get("status") != "running":
