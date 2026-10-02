@@ -1,0 +1,16 @@
+# Everything for driving native debugging from an agent: Heisenberg and the
+# tools it wraps, plus opencode to drive it.
+#
+# Combining with extends rather than copying: run and verify steps accumulate
+# base-first, so each layer keeps its own health checks and this file adds only
+# what the combination needs.
+version: 1
+agent: ">=0.11.0"
+
+extends:
+  - http://@@SELF@@/payload/lib-heisenberg.groundhog.yaml
+  - http://@@SELF@@/payload/lib-opencode.groundhog.yaml
+
+verify:
+  - file: C:\Tools\Heisenberg\heisenberg.exe
+  - file: C:\Tools\opencode\opencode.exe

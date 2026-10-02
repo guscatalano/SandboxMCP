@@ -1,0 +1,26 @@
+# Heisenberg: a Windows debugging MCP server, plus the toolchain it drives.
+#
+# extends windows-internals because Heisenberg wraps those tools rather than
+# bundling them -- cdb, gflags, Procmon, TTD, symbols, crash dumps. Installing
+# the exe alone gives you a server that reports ToolNotInstalled for most of
+# what it offers.
+#
+# Those features are serviced from Windows Update, so this is slow on a fresh
+# VM: allow a long timeout, or bake it into a template once with
+# generate_template and let clones skip the wait.
+version: 1
+agent: ">=0.11.0"
+
+extends: groundhog:windows-internals
+
+files:
+  - from: github:guscatalano/Heisenberg@latest/heisenberg.exe
+    to: C:\Tools\Heisenberg\heisenberg.exe
+
+path:
+  - dir: C:\Tools\Heisenberg
+    scope: machine
+
+verify:
+  - file: C:\Tools\Heisenberg\heisenberg.exe
+  - command: if (-not (Get-Command heisenberg.exe -ErrorAction SilentlyContinue)) { exit 1 }

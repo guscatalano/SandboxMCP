@@ -1,0 +1,22 @@
+# opencode, from its own release zip.
+#
+# No sha256: without one the agent follows whatever "latest" serves now, which
+# is what you want for a tool you are testing against the newest build. Pin it
+# if you need two sandboxes to agree on a version.
+#
+# extract replaces C:\Tools\opencode as a whole, so nothing is left over from a
+# previous version -- and a failed unpack leaves the old one intact.
+version: 1
+agent: ">=0.11.0"
+
+files:
+  - from: github:sst/opencode@latest/opencode-windows-x64.zip
+    to: C:\Tools\opencode
+    extract: true
+
+path:
+  - dir: C:\Tools\opencode
+    scope: machine
+
+verify:
+  - file: C:\Tools\opencode\opencode.exe

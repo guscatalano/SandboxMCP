@@ -1,0 +1,25 @@
+# Hermes, via the vendor's own installer.
+#
+# A run step rather than files+run, because the installer brings its own git,
+# python and node and decides where they go. It is a ~2 GB download, hence the
+# 60m timeout: the default would stop it part-way and call it a failure.
+#
+# API keys are NOT here. Hermes reads them from .env, and a key written into a
+# disposable VM can be read by anything inside it and outlives the VM -- so pass
+# a scoped or short-lived one as a secret if you need it, rather than baking
+# your main key into a profile.
+version: 1
+agent: ">=0.12.0"
+
+run:
+  - command: |
+      # Install Hermes from the vendor script
+      $ErrorActionPreference = 'Stop'
+      $src = Invoke-RestMethod 'https://hermes-agent.nousresearch.com/install.ps1'
+      $f = Join-Path $env:TEMP 'hermes-install.ps1'
+      Set-Content -LiteralPath $f -Value $src -Encoding UTF8
+      & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $f
+    timeout: 60m
+
+verify:
+  - command: if (-not (Get-Command hermes -ErrorAction SilentlyContinue)) { exit 1 }

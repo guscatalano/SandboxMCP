@@ -1,0 +1,16 @@
+# Every agent and tool this fleet knows how to install, in one apply.
+#
+# Slow and large on purpose -- Hermes alone is ~2 GB and the Windows features
+# under windows-internals are serviced from Windows Update. This is the profile
+# to bake into a template with generate_template, not one to apply per sandbox
+# and wait on.
+#
+# Deskhand is deliberately absent: every sandbox already has it, installed with
+# its own per-VM token before anything here runs.
+version: 1
+agent: ">=0.12.0"
+
+extends:
+  - http://@@SELF@@/payload/lib-heisenberg.groundhog.yaml
+  - http://@@SELF@@/payload/lib-opencode.groundhog.yaml
+  - http://@@SELF@@/payload/lib-hermes.groundhog.yaml
