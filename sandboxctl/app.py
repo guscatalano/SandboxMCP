@@ -3299,7 +3299,17 @@ def capacity():
     Read from the pool rather than from a counter this service keeps, because a
     sandbox can appear or disappear without this service doing it.
     """
-    sb = list_sandboxes()
+    # Membership, not list_sandboxes(): counting needs a vmid and a status, and
+    # the listing pays a guest round trip per uncached token to get things this
+    # does not use. That made the "is there room" endpoint slowest exactly when
+    # several creates were in flight.
+    try:
+        members = api(f"/pools/{POOL}").get("members") or []
+    except Exception:                                 # noqa: BLE001
+        members = []
+    sb = [{"vmid": m["vmid"], "status": m.get("status")}
+          for m in members
+          if m.get("type") == "qemu" and not m.get("template")]
     running = [s for s in sb if s.get("status") == "running"]
     # A sandbox mid-create is neither running nor in the pool yet, so without
     # counting reservations four simultaneous creates all pass a limit that none
@@ -3331,8 +3341,11 @@ def capacity():
         "max_running": MAX_RUNNING,
         "running_left": max(0, MAX_RUNNING - live),
         "id_range": [ID_LO, ID_HI],
-        "note": ("Each running sandbox costs the controller roughly 100 MB for its "
-                 "console recorder, which is what max_running protects."),
+        "note": ("Each running sandbox costs the controller roughly 180 MB for its "
+                 "console recorder -- measured on warm ones, which settle higher "
+                 "than the ~130 MB a freshly started one shows. That is what "
+                 "max_running protects, and six of them OOM-killed a 1 GB "
+                 "controller at a 1013 MB peak."),
     }
 
 

@@ -866,14 +866,14 @@ VM and nowhere else.
 
 Things that cost real time to find:
 
-- **Each running sandbox costs the controller ~100 MB.** Every running one gets
-  its own `ffmpeg` console recorder, measured at ~100 MB of private memory —
+- **Each running sandbox costs the controller ~180 MB.** Every running one gets
+  its own `ffmpeg` console recorder, measured at ~180 MB of private memory —
   flat once warm, and *not* reducible by encoder settings (identical across
   resolutions, thread counts, `mbtree`/`rc-lookahead`, and `MALLOC_ARENA_MAX`).
   Twelve running sandboxes OOM-killed a 1 GB controller, and the symptom was
   jobs marked `INTERRUPTED`, which reads like a provisioning bug. Set
   `max_running` to what the box can actually hold: roughly
-  `(RAM - 200 MB) / 100 MB`.
+  `(RAM - 140 MB) / 180 MB`.
 - **`/agent/file-read` leaks its handle on Windows guests.** `qemu-ga.exe` keeps
   the file open for the rest of its life. Polling a file that way locks it
   permanently — and since `Remove-Item` deletes alphabetically, an update that

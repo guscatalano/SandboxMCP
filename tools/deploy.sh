@@ -30,7 +30,8 @@ if n is None:
     print('unreported')            # an older controller: do not guess
 else:
     print(n)
-" 2>/dev/null || echo unreachable)
+" 2>/dev/null | tail -1 || true)
+running="${running:-unreachable}"
 
 if [ "$running" != "0" ]; then
   if [ "$running" = "unreadable" ] || [ "$running" = "unreachable" ] || [ "$running" = "unreported" ]; then
