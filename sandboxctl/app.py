@@ -3999,6 +3999,41 @@ a{color:var(--acc)}
 .gh-bad{border-color:var(--bad);color:var(--bad)}
 textarea:focus-visible,select:focus-visible{outline:2px solid var(--acc);outline-offset:1px}
 .notes-toggle{font-size:11px;color:var(--mut);text-decoration:none;border-bottom:1px dotted var(--ln)}
+/* ---- control bay: state in the row, controls here ---- */
+.bay-id{display:flex;align-items:baseline;gap:12px;flex-wrap:wrap;padding-bottom:10px;
+  border-bottom:1px solid var(--ln);margin-bottom:10px}
+.bay-who em{font-style:normal;font:600 15px ui-monospace,Consolas,monospace;color:var(--acc);
+  margin-right:8px}
+.bay-who span{font-size:17px;font-weight:600}
+.bay-meta{font-size:12px;color:var(--mut)}
+.bay-close{margin-left:auto;font-size:12px;color:var(--mut)}
+.bay-sum{display:grid;gap:1px;background:var(--ln);border:1px solid var(--ln);margin-bottom:12px}
+.bay-sum .r{background:#0f1115;display:grid;grid-template-columns:104px minmax(0,1fr);gap:12px;
+  padding:7px 11px;font:12px ui-monospace,Consolas,monospace;align-items:baseline}
+.bay-sum .r dt{color:var(--mut);font-size:10px;letter-spacing:.12em;text-transform:uppercase}
+.bay-sum .r dd{margin:0;color:#c9d1d9;overflow-wrap:anywhere}
+.bay-sum .r dd b{color:var(--fg);font-weight:600}
+.bay-sum .r dd .ok{color:var(--ok)} .bay-sum .r dd .bad{color:var(--bad)}
+.bay-sum .r dd .wrn{color:#d29922} .bay-sum .r dd .nil{color:var(--mut)}
+.bay-keys{display:flex;flex-wrap:wrap;gap:5px;padding-bottom:12px;border-bottom:1px solid var(--ln)}
+.bay-keys .k{font:600 11.5px ui-sans-serif,system-ui,sans-serif;letter-spacing:.08em;
+  background:#1b2130;color:var(--fg);border:1px solid var(--ln);border-radius:4px;
+  padding:6px 11px;cursor:pointer;position:relative}
+.bay-keys .k:hover{border-color:#3a4252}
+.bay-keys .k[aria-selected=true]{background:#13283d;color:#bfe4f5;border-color:var(--acc)}
+.bay-keys .k[disabled]{opacity:.35;cursor:not-allowed}
+.bay-keys .k.danger{color:#f09a94;border-color:#6b2a28;background:#2a1312}
+.bay-keys .k.danger:hover{border-color:var(--bad);color:#ffd9d5}
+.bay-keys .k .dot{display:inline-block;width:6px;height:6px;border-radius:50%;margin-left:7px;
+  vertical-align:1px}
+.bay-keys .k .dot.ok{background:var(--ok)} .bay-keys .k .dot.wrn{background:#d29922}
+.bay-keys .k .dot.bad{background:var(--bad)}
+.bay-keys .k.sep{margin-left:auto}
+.bay-host{padding-top:12px}
+.bay-host > .card{background:none;border:0;border-radius:0;padding:0;margin:0}
+.bay-host > .card[style*="display:none"]{display:none!important}
+.sel-mark{color:var(--acc);font:12px ui-monospace,Consolas,monospace}
+tr.picked td{background:#13283d}
 /* State is its own column now, so the badges wrap there instead of widening Name. */
 .statecell{display:flex;align-items:center;gap:6px;flex-wrap:wrap;min-width:0}
 /* Capacity, above the table: a limit should be visible before it refuses you. */
@@ -4114,6 +4149,19 @@ pre{background:#0b0d11;border:1px solid var(--ln);border-radius:6px;padding:12px
   <code>hermes -t sandboxctl -z "&hellip;"</code> (also works with <code>--tui</code>).
   To make that permanent instead, <code>hermes tools disable web browser terminal file code_execution</code>
   &mdash; but note that setting is shared with Telegram and Discord.</div>
+</div>
+
+<div class="card" id="baycard" style="display:none">
+  <div class="bay-id">
+    <span class="bay-who"><em id="bay-vm"></em><span id="bay-nm"></span></span>
+    <span class="bay-meta mono" id="bay-meta"></span>
+    <a href="#" class="bay-close" onclick="bayClose();return false">close</a>
+  </div>
+  <!-- One line per action. Reading status does not need a mode switch; only the
+       framebuffer and the editors need room. -->
+  <div class="bay-sum" id="bay-sum"></div>
+  <div class="bay-keys" id="bay-keys"></div>
+  <div class="bay-host" id="bay-host"></div>
 </div>
 
 <div class="card" id="reccard" style="display:none">
@@ -4296,7 +4344,8 @@ function row(s){
   var n = s.notes || 0;
   // Dim by bucket, not by claim: a claimed sandbox that is about to be reaped
   // belongs in "expiring soon" and must not be greyed out there.
-  return `<tr class="${bucket(s) >= 2 ? 'dimmed' : ''}">
+  return `<tr class="${bucket(s) >= 2 ? 'dimmed' : ''}${baySel === s.vmid ? ' picked' : ''}"
+      onclick="baySelect(${s.vmid})" style="cursor:pointer">
     <td><code>${s.vmid}</code></td>
     <td><div class="namecell"><span class="nm">${esc(s.name)}</span>
       <a href="#" class="notes-toggle" onclick="return toggleNotes(event,${s.vmid})"
@@ -4305,7 +4354,8 @@ function row(s){
     <td><div class="statecell"><span class="st ${s.status==='running'?'r':'s'}"></span>${s.status}${claim}${exp}${gh}</div></td>
     <td>${s.ip?`<code>${s.ip}</code>`:'&mdash;'}</td>
     <td><div class="lnk">${links(s)}</div></td>
-    <td style="text-align:right">${actions(s)}</td></tr>
+    <td style="text-align:right"><span class="sel-mark">${
+        baySel === s.vmid ? '\u25B8 open' : ''}</span></td></tr>
     <tr id="notes-${s.vmid}" class="notes-row" hidden><td colspan="6">
       <div class="notes" id="notes-body-${s.vmid}">loading&hellip;</div>
       <div class="notes-add">
@@ -4451,6 +4501,12 @@ async function refresh(){
       html += groupHead(i,list.length) + list.map(row).join('');
     });
     document.getElementById('rows').innerHTML = html;
+    bayFleet = {};
+    d.forEach(function(s){ bayFleet[s.vmid] = s; });
+    // A sandbox that has gone takes the bay with it rather than leaving it
+    // describing something that no longer exists.
+    if (baySel !== null && !bayFleet[baySel]) bayClose();
+    else if (baySel !== null) bayRender();
     ticks();
   }
   drawCapacity();
@@ -4612,6 +4668,147 @@ async function releaseRow(vmid){
     refresh();
   }catch(e){ alert('Could not release it: '+e.message); }
 }
+// ---- control bay ------------------------------------------------------
+// The row says what a sandbox IS; everything you can do to it lives here. One
+// mode at a time, so a live framebuffer never shares the space with an editor.
+var BAY_Q = String.fromCharCode(39);   // an apostrophe, unescapable
+var baySel = null;        // vmid, or null when the bay is closed
+var bayFleet = {};        // vmid -> the last row we saw, for the summary strip
+var bayMode = null;
+// id -> [label, which relocated panel it shows, how to run it when it has none]
+var BAY_ACTIONS = [
+  ['watch',  'WATCH',      'watchcard'],
+  ['gh',     'GROUNDHOG',  'ghcard'],
+  ['agt',    'AGENTS',     'agentcard'],
+  ['rec',    'RECORDINGS', 'reccard'],
+  ['mcp',    'ENDPOINT',   null],
+  ['notes',  'NOTES',      null],
+  ['repair', 'REPAIR',     null],
+  ['upd',    'UPDATE',     null],
+  ['destroy','DESTROY',    null]
+];
+
+function bayClose(){
+  baySel = null; bayMode = null;
+  document.getElementById('baycard').style.display = 'none';
+  refresh();
+}
+
+function baySelect(vmid){
+  var first = baySel === null;
+  baySel = vmid;
+  var c = document.getElementById('baycard');
+  c.style.display = 'block';
+  bayRender();
+  // Only scroll on the first open: re-selecting while reading should not yank
+  // the page around.
+  if (first) c.scrollIntoView({behavior:'smooth', block:'nearest'});
+  refresh();
+}
+
+function baySummary(s){
+  function row(k, v){ return '<div class="r"><dt>'+k+'</dt><dd>'+v+'</dd></div>'; }
+  var out = '';
+  out += row('Console', s.ip
+    ? '<b>'+esc(s.ip)+'</b> &middot; Deskhand '+(s.port||8791)
+      +(s.token ? ' <span class="ok">reachable</span>' : ' <span class="bad">no token</span>')
+    : '<span class="nil">not running &mdash; no address</span>');
+  var gh = s.groundhog || 'none';
+  var ghc = gh === 'succeeded' ? 'ok' : gh === 'failed' ? 'bad'
+          : gh === 'reboot-pending' ? 'wrn' : 'nil';
+  out += row('Groundhog', '<span class="'+ghc+'">'+esc(gh === 'none' ? 'nothing applied' : gh)+'</span>');
+  out += row('Expiry', s.expires === 'never'
+    ? '<span class="nil">never &mdash; stays until destroyed</span>'
+    : (s.expires === 'expired' ? '<span class="bad">expired</span>'
+       : '<span class="wrn">'+esc(s.expires)+' left</span>'));
+  out += row('Claim', s.claimed_by
+    ? esc('held by '+s.claimed_by+(s.claim_purpose ? ' \u2014 '+s.claim_purpose : ''))
+    : '<span class="nil">unclaimed &mdash; free to take</span>');
+  out += row('Notes', s.notes ? '<b>'+s.notes+'</b> on this sandbox'
+                              : '<span class="nil">none yet</span>');
+  return out;
+}
+
+function bayRender(){
+  if (baySel === null) return;
+  var s = bayFleet[baySel] || {vmid: baySel, name: String(baySel)};
+  document.getElementById('bay-vm').textContent = s.vmid;
+  document.getElementById('bay-nm').textContent = s.name || '';
+  document.getElementById('bay-meta').textContent =
+    (s.status || '') + (s.ip ? '  \u00b7  ' + s.ip : '');
+  document.getElementById('bay-sum').innerHTML = baySummary(s);
+
+  var running = s.status === 'running';
+  document.getElementById('bay-keys').innerHTML = BAY_ACTIONS.map(function(a){
+    var id = a[0], label = a[1];
+    // A key only lights when there is something to say, which is what a menu
+    // could never do for the items it hides.
+    var dot = '';
+    if (id === 'gh' && s.groundhog && s.groundhog !== 'none')
+      dot = '<span class="dot '+(s.groundhog === 'failed' ? 'bad'
+            : s.groundhog === 'succeeded' ? 'ok' : 'wrn')+'"></span>';
+    if (id === 'notes' && s.notes) dot = '<span class="dot wrn"></span>';
+    // Nothing that needs a live guest is offered on a stopped one.
+    var dead = !running && ['watch','agt','mcp','upd'].indexOf(id) >= 0;
+    return '<button class="k'+(id === 'destroy' ? ' danger' : '')
+      + (id === 'repair' ? ' sep' : '')+'"'
+      + ' aria-selected="'+(bayMode === id)+'"'
+      + (dead ? ' disabled' : '')
+      + ' onclick="bayRun(' + BAY_Q + id + BAY_Q + ')">'+label+dot+'</button>';
+  }).join('');
+}
+
+function bayShowPanel(which){
+  // The relocated panels: show one, hide the rest. Their own code still owns
+  // what is inside them.
+  BAY_ACTIONS.forEach(function(a){
+    if (!a[2]) return;
+    var el = document.getElementById(a[2]);
+    if (el) el.style.display = (a[2] === which) ? 'block' : 'none';
+  });
+}
+
+function bayRun(id){
+  if (baySel === null) return;
+  var s = bayFleet[baySel] || {};
+  var name = s.name || String(baySel);
+  var spec = null;
+  BAY_ACTIONS.forEach(function(a){ if (a[0] === id) spec = a; });
+  if (!spec) return;
+
+  if (spec[2]){                       // a mode: show its panel
+    bayMode = id;
+    bayShowPanel(spec[2]);
+    if (id === 'watch')  watch(baySel, name);
+    if (id === 'gh')     ghPanel(baySel, name);
+    if (id === 'agt')    agentPanel(baySel, name);
+    if (id === 'rec')    recordings(baySel, name);
+    bayRender();
+    return;
+  }
+  // The rest act rather than open: no panel, no mode selected.
+  bayMode = null; bayShowPanel(null); bayRender();
+  if (id === 'mcp')    copyMcp('claude', name, s.ip, s.port || 8791, s.token);
+  if (id === 'notes')  { var r = document.getElementById('notes-'+baySel);
+                         if (r) { r.hidden = false; loadNotes(baySel);
+                                  r.scrollIntoView({behavior:'smooth', block:'nearest'}); } }
+  if (id === 'repair') rep(baySel);
+  if (id === 'upd')    upd(baySel);
+  if (id === 'destroy')destroy(baySel);
+}
+
+// Relocate the existing panels into the bay once, at load. Their markup and
+// handlers are untouched -- only where they appear changes.
+function bayAdopt(){
+  var host = document.getElementById('bay-host');
+  if (!host) return;
+  BAY_ACTIONS.forEach(function(a){
+    if (!a[2]) return;
+    var el = document.getElementById(a[2]);
+    if (el && el.parentNode !== host){ el.style.display = 'none'; host.appendChild(el); }
+  });
+}
+
 var ghvm=null;
 // A newline with no escape anywhere: a template literal holding a real one.
 // Every multi-line string below uses this or a backtick literal. Escape
@@ -4838,7 +5035,7 @@ async function resume(){
     if(!running) jobId=null;
   }catch(e){}
 }
-showHub(); refresh(); payload(); resume(); setInterval(()=>{if(!jobId){refresh();payload();}},10000);
+bayAdopt(); showHub(); refresh(); payload(); resume(); setInterval(()=>{if(!jobId){refresh();payload();}},10000);
 </script></body></html>"""
 
 
