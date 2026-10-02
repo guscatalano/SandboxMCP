@@ -1650,23 +1650,28 @@ def do_create(job, opts):
     else:
         raise RuntimeError("could not find a free VMID")
     wait_unlocked(vmid)
-    # The VM exists now, so pool membership can see it and the reservation has
-    # done its job.
-    release_vmid(vmid)
     job.log("cloned from template")
 
-    # Set before provisioning, not after: a build that dies half way is exactly
-    # the case worth cleaning up on its own.
-    ttl = opts.get("expires_in_minutes")
-    if ttl is None:
-        ttl = TTL_DEFAULT_MINUTES
-    if int(ttl or 0) > 0:
-        exp = set_expiry(vmid, ttl, opts.get("who") or "create")
-        job.log(f"expires in {exp['minutes']} min unless extended")
-    else:
-        job.log("no expiry: this sandbox stays until destroyed")
+    # The reservation is held until the whole create finishes, not just until the
+    # clone exists. Allocation stops needing it the moment the VM joins the pool,
+    # but capacity does not: for the next five minutes the VM is in the pool and
+    # stopped, so counting only running sandboxes would let four more creates
+    # through while four were already on their way up.
+    try:
+        # Set before provisioning, not after: a build that dies half way is
+        # exactly the case worth cleaning up on its own.
+        ttl = opts.get("expires_in_minutes")
+        if ttl is None:
+            ttl = TTL_DEFAULT_MINUTES
+        if int(ttl or 0) > 0:
+            exp = set_expiry(vmid, ttl, opts.get("who") or "create")
+            job.log(f"expires in {exp['minutes']} min unless extended")
+        else:
+            job.log("no expiry: this sandbox stays until destroyed")
 
-    provision(job, vmid, opts)
+        provision(job, vmid, opts)
+    finally:
+        release_vmid(vmid)
 
 def provision(job, vmid, opts, configure_hw=True):
     """Bring a cloned-but-unfinished sandbox all the way up.
@@ -1842,8 +1847,20 @@ def install_deskhand_groundhog(job, vmid, opts, token):
     os.replace(tmp, os.path.join(pdir, name))
 
     job.log(f"installing Deskhand via Groundhog; {asset} pinned to {sha[:12]}...")
-    apply_groundhog(vmid, f"{SELF_URL}/payload/{name}", None, True, False, job,
-                    secrets={"DESKHAND_TOKEN": token})
+    # The agent is often still coming back from the auto-logon reboot, and under
+    # concurrency that window is longer. Only the agent-unavailable case is
+    # retried: a bad Groundhogfile or a missing artifact should fail at once.
+    for attempt in range(1, 7):
+        try:
+            apply_groundhog(vmid, f"{SELF_URL}/payload/{name}", None, True, False, job,
+                            secrets={"DESKHAND_TOKEN": token})
+            break
+        except Exception as exc:                      # noqa: BLE001
+            if "did not answer" not in str(exc) or attempt == 6:
+                raise
+            job.log(f"  the guest agent is not back yet; retrying ({attempt}/6)")
+            time.sleep(20)
+            wait_agent(vmid, timeout=180)
 
     deadline = time.time() + 900
     last = ""
@@ -3288,12 +3305,25 @@ def capacity():
     # counting reservations four simultaneous creates all pass a limit that none
     # of them would pass a minute later. They are counted toward both totals
     # because each one is about to be a running sandbox.
+    # Counted from JOBS itself, not from /api/jobs, which returns only the 20
+    # most recent and so can report nothing running while an older job still is.
+    # Anything deciding whether it is safe to restart needs the real number.
+    with JOBS_LOCK:
+        jobs_running = sum(1 for j in JOBS.values() if not j.done)
     with _VMID_LOCK:
-        creating = len(_VMID_INFLIGHT)
+        pending = set(_VMID_INFLIGHT)
+    # A reserved id is in the pool once its clone lands, so count only the ones
+    # the listing cannot see -- otherwise a sandbox being provisioned is counted
+    # as both a member and a reservation.
+    known = {s["vmid"] for s in sb}
+    creating = len(pending - known)
     total = len(sb) + creating
-    live = len(running) + creating
+    # Reserved-but-stopped is about to be running, so it counts toward the
+    # running limit even though the listing says otherwise.
+    live = len(running) + len(pending - {s["vmid"] for s in running})
     return {
         "creating": creating,
+        "jobs_running": jobs_running,
         "sandboxes": total,
         "max_sandboxes": MAX_SANDBOXES,
         "sandboxes_left": max(0, MAX_SANDBOXES - total),
