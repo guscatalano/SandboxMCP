@@ -309,10 +309,13 @@ def do_make_template(job, opts):
 
     # Full clone: a template that depends on the one it came from cannot outlive
     # it, and the whole point of a new template is to retire the old one.
-    api(f"/nodes/{NODE}/qemu/{base}/clone", "POST",
-        {"newid": vmid, "name": name, "full": 1, "pool": POOL,
-         "storage": opts.get("storage") or "local-lvm"}, timeout=120)
-    wait_unlocked(vmid, timeout=1800)
+    try:
+        api(f"/nodes/{NODE}/qemu/{base}/clone", "POST",
+            {"newid": vmid, "name": name, "full": 1, "pool": POOL,
+             "storage": opts.get("storage") or "local-lvm"}, timeout=120)
+        wait_unlocked(vmid, timeout=1800)
+    finally:
+        release_vmid(vmid)
     job.log("cloned")
 
     vm("/status/start", "POST", vmid=vmid)
@@ -1351,21 +1354,41 @@ def read_token(vmid, refresh=False):
     return tok
 
 
+# Ids handed out but whose VM does not exist yet. Pool membership cannot see
+# these -- that is the whole problem -- so they are tracked here and counted as
+# taken until the clone has either succeeded or failed.
+_VMID_LOCK = threading.Lock()
+_VMID_INFLIGHT = set()
+
+
 def free_vmid(skip=()):
-    """Lowest free id in the sandbox range, judged from pool membership.
+    """Reserve the lowest free id in the sandbox range.
 
     Deliberately NOT from /cluster/resources: this service's token can only see
     its own pool, so that call would need read access to every guest on the
     cluster. The range is reserved for sandboxes, so pool membership is the
     right source -- and if something outside the pool has squatted an id, the
     clone fails and do_create simply tries the next one.
+
+    The reservation is the important part. Membership does not list a VM that is
+    still being cloned, so without it two overlapping creates are told the same
+    id and then fight over one guest. Release it with release_vmid once the VM
+    exists, or once it is certain it never will.
     """
-    used = {m["vmid"] for m in (api(f"/pools/{POOL}").get("members") or [])}
-    used |= set(skip)
-    for i in range(ID_LO, ID_HI + 1):
-        if i not in used:
-            return i
+    with _VMID_LOCK:
+        used = {m["vmid"] for m in (api(f"/pools/{POOL}").get("members") or [])}
+        used |= set(skip) | _VMID_INFLIGHT
+        for i in range(ID_LO, ID_HI + 1):
+            if i not in used:
+                _VMID_INFLIGHT.add(i)
+                return i
     raise RuntimeError(f"no free VMID in {ID_LO}-{ID_HI}")
+
+
+def release_vmid(vmid):
+    """Give a reservation back. Safe to call for an id that was never reserved."""
+    with _VMID_LOCK:
+        _VMID_INFLIGHT.discard(int(vmid))
 
 
 def wait_unlocked(vmid, timeout=600):
@@ -1622,10 +1645,14 @@ def do_create(job, opts):
             if "already exists" not in str(exc).lower() and "config file" not in str(exc).lower():
                 raise
             job.log(f"  {vmid} is taken by something outside the pool; trying the next")
+            release_vmid(vmid)        # it is not ours; do not hold the slot
             tried.append(vmid)
     else:
         raise RuntimeError("could not find a free VMID")
     wait_unlocked(vmid)
+    # The VM exists now, so pool membership can see it and the reservation has
+    # done its job.
+    release_vmid(vmid)
     job.log("cloned from template")
 
     # Set before provisioning, not after: a build that dies half way is exactly
@@ -3257,13 +3284,22 @@ def capacity():
     """
     sb = list_sandboxes()
     running = [s for s in sb if s.get("status") == "running"]
+    # A sandbox mid-create is neither running nor in the pool yet, so without
+    # counting reservations four simultaneous creates all pass a limit that none
+    # of them would pass a minute later. They are counted toward both totals
+    # because each one is about to be a running sandbox.
+    with _VMID_LOCK:
+        creating = len(_VMID_INFLIGHT)
+    total = len(sb) + creating
+    live = len(running) + creating
     return {
-        "sandboxes": len(sb),
+        "creating": creating,
+        "sandboxes": total,
         "max_sandboxes": MAX_SANDBOXES,
-        "sandboxes_left": max(0, MAX_SANDBOXES - len(sb)),
-        "running": len(running),
+        "sandboxes_left": max(0, MAX_SANDBOXES - total),
+        "running": live,
         "max_running": MAX_RUNNING,
-        "running_left": max(0, MAX_RUNNING - len(running)),
+        "running_left": max(0, MAX_RUNNING - live),
         "id_range": [ID_LO, ID_HI],
         "note": ("Each running sandbox costs the controller roughly 100 MB for its "
                  "console recorder, which is what max_running protects."),
