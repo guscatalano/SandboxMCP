@@ -3334,6 +3334,9 @@ def capacity():
     return {
         "creating": creating,
         "jobs_running": jobs_running,
+        # The status bar names what every clone comes from: the one fact
+        # that explains a whole fleet behaving the same way.
+        "template": TEMPLATE,
         "sandboxes": total,
         "max_sandboxes": MAX_SANDBOXES,
         "sandboxes_left": max(0, MAX_SANDBOXES - total),
@@ -3972,14 +3975,71 @@ PAGE = """<!doctype html><html><head><meta charset="utf-8">
 <title>Sandboxes</title><meta name="viewport" content="width=device-width,initial-scale=1">
 <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAzMiAzMiI+PHJlY3Qgd2lkdGg9IjMyIiBoZWlnaHQ9IjMyIiByeD0iNyIgZmlsbD0iIzE1MTkyMiIvPjxyZWN0IHg9IjUiIHk9IjgiIHdpZHRoPSIyMiIgaGVpZ2h0PSIxNSIgcng9IjIuNSIgZmlsbD0iIzRhOWVmZiIvPjxyZWN0IHg9IjkiIHk9IjI1IiB3aWR0aD0iMTQiIGhlaWdodD0iMi41IiByeD0iMS4yNSIgZmlsbD0iIzJhMzI0MiIvPjxjaXJjbGUgY3g9IjIyLjUiIGN5PSIxMi41IiByPSIyLjYiIGZpbGw9IiMzZmI5NTAiLz48L3N2Zz4=">
 <style>
-:root{--bg:#0f1115;--fg:#e6e6e6;--mut:#8b93a1;--ln:#252a33;--acc:#4a9eff;--ok:#3fb950;--bad:#f85149}
+:root{
+  /* Glass Deck. Night ground, bezel panels, one cyan for "the system is
+     speaking" and amber/red kept strictly for caution and warning, so a
+     coloured thing on this page always means the same kind of thing. */
+  --bg:#0A1214;--bezel:#101D20;--panel:#0C181B;
+  --fg:#DCE9E7;--mut:#7E9A9B;--dimmer:#55706F;
+  --ln:#1F3A3F;--ln2:#2C4F55;--ln3:#3D6A72;
+  --acc:#3FA9E0;--ok:#5FD08A;--warn:#F2A43A;--bad:#FF5247;--mag:#D98BD0;
+  --sans:'Saira Condensed','Arial Narrow',Arial,sans-serif;
+  --mono:'IBM Plex Mono',ui-monospace,Consolas,monospace;
+}
 *{box-sizing:border-box}
-body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.5 ui-sans-serif,system-ui,Segoe UI,sans-serif}
+body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.5 var(--sans)}
+code,.mono{font-family:var(--mono);font-variant-numeric:tabular-nums}
+/* The controller status bar: what you are connected to, before anything else. */
+.deck-top{display:flex;justify-content:space-between;align-items:center;gap:16px;flex-wrap:wrap;
+  padding:7px 14px;border:1px solid var(--ln2);border-bottom:0;
+  background:linear-gradient(#132326,#0D1A1D);
+  font-family:var(--mono);font-size:11px;letter-spacing:.06em;color:var(--mut)}
+.deck-top b{color:var(--acc);font-weight:500}
+.deck-top .cau{color:var(--warn)}
 .wrap{max-width:1000px;margin:0 auto;padding:24px}
 h1{font-size:20px;margin:0 0 4px}.sub{color:var(--mut);margin:0 0 24px}
-.card{background:#151922;border:1px solid var(--ln);border-radius:8px;padding:16px;margin-bottom:20px}
-table{width:100%;border-collapse:collapse}th,td{text-align:left;padding:8px 10px;border-bottom:1px solid var(--ln)}
-th{color:var(--mut);font-weight:500;font-size:12px;text-transform:uppercase;letter-spacing:.04em}
+.card{background:var(--bezel);border:1px solid var(--ln2);border-radius:0;padding:14px;
+  margin-bottom:18px}
+/* The fleet card joins the status bar above it rather than floating free. */
+.card.deck{border-top:0;margin-bottom:18px;padding:0}
+.card.deck table{margin:0}
+/* Order declaratively. Moving four nested card blocks by hand is how a closing
+   div goes missing; this cannot lose one. Fleet, then the bay that answers it,
+   then the setup cards nobody reads twice. */
+.wrap{display:flex;flex-direction:column}
+.wrap>h1{order:0} .wrap>.sub{order:1} .wrap>details{order:2}
+.wrap>.deck-top{order:3} .wrap>.card.deck{order:4}
+.wrap>#baycard{order:5} .wrap>#legendcard{order:6}
+.wrap>#connectcard{order:7} .wrap>#createcard{order:8} .wrap>#buildcard{order:9}
+.wrap>#reccard,.wrap>#ghcard,.wrap>#agentcard,.wrap>#watchcard{order:10}
+.wrap>#jobcard{order:11}
+h1{font-weight:700;letter-spacing:-.01em}
+.sub{color:var(--mut)}
+/* ---- gauges: a number with a redline says what a bar cannot ---- */
+.gauges{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));
+  border-bottom:1px solid var(--ln)}
+.gauge{padding:10px 14px 12px;border-right:1px solid var(--ln)}
+.gauge:last-child{border-right:0}
+.g-l{font-size:11px;letter-spacing:.2em;text-transform:uppercase;color:var(--mut);
+  display:flex;justify-content:space-between;align-items:baseline}
+.g-v{font-size:27px;font-weight:600;line-height:1.05;margin:2px 0 7px}
+.g-v small{font-size:13px;font-weight:400;color:var(--mut);margin-left:4px}
+.g-v.cau{color:var(--warn)} .g-v.crit{color:var(--bad)}
+.g-t{height:9px;background:#071012;border:1px solid var(--ln2);position:relative;overflow:hidden}
+.g-t>i{position:absolute;inset:1px auto 1px 1px;background:var(--acc)}
+.g-t>i.cau{background:var(--warn)} .g-t>i.crit{background:var(--bad)}
+.g-ticks{position:absolute;inset:0;display:flex}
+.g-ticks i{flex:1;border-right:1px solid rgba(10,18,20,.85)}
+.g-ticks i:last-child{border-right:0}
+.g-red{position:absolute;top:-2px;bottom:-2px;right:0;width:2px;background:var(--bad)}
+.g-f{font-size:11px;letter-spacing:.08em;color:var(--mut);margin-top:6px}
+.g-f b{color:var(--warn);font-weight:500}
+.g-f b.crit{color:var(--bad)}
+table{width:100%;border-collapse:collapse}
+th,td{text-align:left;padding:8px 12px;border-bottom:1px solid var(--ln)}
+tbody tr:hover td{background:#0F1E21}
+th{color:#5F7C7F;font-weight:500;font-size:10.5px;text-transform:uppercase;letter-spacing:.18em;
+  background:var(--panel)}
 code{font:12px ui-monospace,Consolas,monospace;background:#0b0d11;padding:2px 6px;border-radius:4px;color:#c9d1d9}
 a{color:var(--acc)}
 .lnk{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
@@ -3991,7 +4051,7 @@ a{color:var(--acc)}
 .claim,.exp{font:11px ui-monospace,Consolas,monospace;border-radius:999px;padding:1px 8px;
   /* Whoever claimed it chose the text, so cap it and keep the rest in title. */
   white-space:nowrap;max-width:22ch;overflow:hidden;text-overflow:ellipsis}
-.claim{border:1px solid #d29922;color:#d29922}
+.claim{border:1px solid var(--warn);color:var(--warn)}
 .exp{border:1px solid #8b949e;color:#8b949e}
 /* Groundhog outcome, as a variant of the expiry badge so it inherits the
    one-line-and-ellipsis behaviour rather than repeating it. */
@@ -4008,13 +4068,13 @@ textarea:focus-visible,select:focus-visible{outline:2px solid var(--acc);outline
 .bay-meta{font-size:12px;color:var(--mut)}
 .bay-close{margin-left:auto;font-size:12px;color:var(--mut)}
 .bay-sum{display:grid;gap:1px;background:var(--ln);border:1px solid var(--ln);margin-bottom:12px}
-.bay-sum .r{background:#0f1115;display:grid;grid-template-columns:104px minmax(0,1fr);gap:12px;
+.bay-sum .r{background:var(--panel);display:grid;grid-template-columns:104px minmax(0,1fr);gap:12px;
   padding:7px 11px;font:12px ui-monospace,Consolas,monospace;align-items:baseline}
 .bay-sum .r dt{color:var(--mut);font-size:10px;letter-spacing:.12em;text-transform:uppercase}
 .bay-sum .r dd{margin:0;color:#c9d1d9;overflow-wrap:anywhere}
 .bay-sum .r dd b{color:var(--fg);font-weight:600}
 .bay-sum .r dd .ok{color:var(--ok)} .bay-sum .r dd .bad{color:var(--bad)}
-.bay-sum .r dd .wrn{color:#d29922} .bay-sum .r dd .nil{color:var(--mut)}
+.bay-sum .r dd .wrn{color:var(--warn)} .bay-sum .r dd .nil{color:var(--mut)}
 .bay-keys{display:flex;flex-wrap:wrap;gap:5px;padding-bottom:12px;border-bottom:1px solid var(--ln)}
 .bay-keys .k{font:600 11.5px ui-sans-serif,system-ui,sans-serif;letter-spacing:.08em;
   background:#1b2130;color:var(--fg);border:1px solid var(--ln);border-radius:4px;
@@ -4026,7 +4086,7 @@ textarea:focus-visible,select:focus-visible{outline:2px solid var(--acc);outline
 .bay-keys .k.danger:hover{border-color:var(--bad);color:#ffd9d5}
 .bay-keys .k .dot{display:inline-block;width:6px;height:6px;border-radius:50%;margin-left:7px;
   vertical-align:1px}
-.bay-keys .k .dot.ok{background:var(--ok)} .bay-keys .k .dot.wrn{background:#d29922}
+.bay-keys .k .dot.ok{background:var(--ok)} .bay-keys .k .dot.wrn{background:var(--warn)}
 .bay-keys .k .dot.bad{background:var(--bad)}
 .bay-keys .k.sep{margin-left:auto}
 .bay-host{padding-top:12px}
@@ -4042,8 +4102,8 @@ tr.picked td{background:#13283d}
 .cap .m{display:flex;align-items:center;gap:8px}
 .cap .bar{width:80px;height:5px;border-radius:3px;background:#222936;overflow:hidden}
 .cap .bar>i{display:block;height:100%;background:var(--acc)}
-.cap .bar>i.hot{background:#d29922}
-.cap .warnmsg{color:#d29922}
+.cap .bar>i.hot{background:var(--warn)}
+.cap .warnmsg{color:var(--warn)}
 tr.grouphead td{padding:14px 10px 4px;border-bottom:0;color:var(--mut);
   font:500 11px ui-monospace,Consolas,monospace;letter-spacing:.09em;text-transform:uppercase}
 tr.dimmed td{opacity:.62}
@@ -4068,14 +4128,15 @@ details.menu>summary::-webkit-details-marker{display:none}
 .mi{display:flex;position:absolute;right:0;top:115%;z-index:30;flex-direction:column;gap:6px;background:#161b22;border:1px solid var(--ln);border-radius:8px;padding:8px;min-width:226px;text-align:left;box-shadow:0 10px 30px rgba(0,0,0,.6)}
 /* .d with no inline colour is the destructive style; menu entries are not. */
 .mi button.d{width:100%;text-align:left;color:#c9d1d9;border-color:#30363d}
-.mi button.d.warnish{color:#d29922;border-color:#d29922}
-.mi button.d.okish{color:#3fb950;border-color:#3fb950}
-.mi button.d.badish{color:#f85149;border-color:#f85149}
+.mi button.d.warnish{color:var(--warn);border-color:var(--warn)}
+.mi button.d.okish{color:var(--ok);border-color:var(--ok)}
+.mi button.d.badish{color:var(--bad);border-color:var(--bad)}
 label.opt{display:inline-flex;align-items:center;gap:7px;white-space:nowrap;color:var(--fg);font-size:14px;text-transform:none;letter-spacing:0}
 label.opt input{width:auto;margin:0}
 .cred{text-align:left;font:12px/1.6 ui-sans-serif,system-ui,sans-serif;color:var(--mut);padding:2px 4px 8px;border-bottom:1px solid var(--ln);margin-bottom:4px}
 .cred code{font-size:11px}
-button{background:var(--acc);color:#08111f;border:0;border-radius:6px;padding:8px 14px;font-weight:600;cursor:pointer}
+button{background:var(--acc);color:#06181F;border:0;border-radius:0;padding:8px 15px;
+  font:700 12.5px/1 var(--sans);letter-spacing:.1em;text-transform:uppercase;cursor:pointer}
 button.d{background:transparent;color:var(--bad);border:1px solid var(--bad);padding:5px 10px;font-weight:500}
 button:disabled{opacity:.5;cursor:not-allowed}
 label{display:block;color:var(--mut);font-size:12px;margin-bottom:4px}
@@ -4086,14 +4147,21 @@ pre{background:#0b0d11;border:1px solid var(--ln);border-radius:6px;padding:12px
 .st{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:6px}
 .st.r{background:var(--ok)}.st.s{background:var(--mut)}
 .warn{color:var(--mut);font-size:12px;margin-top:8px}
-</style></head><body><div class="wrap">
+</style>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<!-- Fallbacks are load-bearing: this is a LAN tool and these come from the
+     internet. Arial Narrow and Consolas hold close enough shapes that a failed
+     fetch reads as plain rather than broken. -->
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Saira+Condensed:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap">
+</head><body><div class="wrap">
 <h1>Windows sandboxes</h1>
 <p class="sub">Disposable VMs on an isolated network. Deskhand is installed per sandbox, so config is chosen here rather than baked into the image.</p>
 <details class="card" style="padding:10px 16px"><summary style="cursor:pointer;color:var(--mut)">If you are an AI reading this page</summary>
 <p>Connect over MCP at <code>/mcp</code> on this host, call <code>list_sandboxes</code>, then drive a sandbox through its <code>&lt;name&gt;__deskhand_*</code> tools. The full guide, as plain text, is at <a href="/llms.txt">/llms.txt</a>; a machine-readable card is at <a href="/.well-known/agent.json">/.well-known/agent.json</a>. Sandboxes are disposable and untrusted: never put real credentials in one, and destroy what you finish with.</p>
 </details>
 
-<div class="card">
+<div class="card" id="buildcard">
   <div class="row" style="justify-content:space-between;flex-wrap:wrap;gap:10px">
     <div><b>Deskhand build</b><div class="warn" id="pay">checking&hellip;</div></div>
     <div class="row">
@@ -4104,7 +4172,7 @@ pre{background:#0b0d11;border:1px solid var(--ln);border-radius:6px;padding:12px
   <div class="warn">This is what <b>Create</b> installs, and what <b>Update</b> rolls out to an existing sandbox.</div>
 </div>
 
-<div class="card">
+<div class="card" id="createcard">
   <div class="grid">
     <div><label>Name</label><input id="name" placeholder="auto"></div>
     <div><label>Cores</label><input id="cores" type="number" value="4" min="1" max="16"></div>
@@ -4118,29 +4186,35 @@ pre{background:#0b0d11;border:1px solid var(--ln);border-radius:6px;padding:12px
   <div class="warn">TLS uses an ephemeral self-signed certificate. It changes on every boot, so MCP clients that verify certificates will reject it &mdash; leave it off unless you know you want it.</div>
 </div>
 
-<div class="card">
-<div class="cap" id="cap"></div>
+<div class="deck-top">
+  <span>SANDBOXCTL &middot; CTL <b id="dk-host">&mdash;</b> &middot; TMPL <b id="dk-tmpl">&mdash;</b></span>
+  <span id="dk-right">&nbsp;</span>
+</div>
+<div class="card deck">
+<div class="gauges" id="cap"></div>
 <table id="tbl"><thead><tr>
 <th>VMID</th><th>Name</th><th>State</th><th>Address</th><th>Open</th><th></th>
-</tr></thead><tbody id="rows"><tr><td colspan="6" style="color:#8b93a1">loading&hellip;</td></tr></tbody></table></div>
+</tr></thead><tbody id="rows"><tr><td colspan="6" style="color:var(--mut)">loading&hellip;</td></tr></tbody></table></div>
 
-<div class="card"><div class="warn">
-<b>Open</b> lists what is reachable on a sandbox. <b>Watch</b> is a live view of its screen,
-  <b>Agents</b> installs Hermes or opencode inside it, and <b>&#8943;</b> holds the rest:<br>
-  <b>Update Deskhand</b> &mdash; reinstall the staged build; keeps the token (~25s).<br>
-  <b>Repair / Finish setup</b> &mdash; for a sandbox stuck at a lock screen or with no Deskhand. <b>Issues a new token</b> (~3min).<br>
-  <b>Destroy</b> &mdash; permanent; the disk goes too.
+<div class="card" id="legendcard"><div class="warn">
+<b>Pick a sandbox</b> to open the bay below it: a summary of what it is, then keys for everything
+you can do to it. <b>A key with a dot has something to say</b> &mdash; Groundhog wears its last
+outcome (green succeeded, amber needs a reboot, red failed) and Notes lights when someone has
+written one. Keys that need a live guest are disabled on a stopped sandbox.<br>
+<b>Watch</b> is the screen, from Proxmox&rsquo;s framebuffer or Deskhand&rsquo;s own capture.
+<b>Groundhog</b> validates a config before applying it. <b>Repair</b> redoes the post-clone setup
+and issues a new token. <b>Destroy</b> is permanent and the disk goes too.
 </div></div>
 
-<div class="card">
+<div class="card" id="connectcard">
   <b>Connect an AI agent</b>
   <div class="warn" style="margin:6px 0 12px">One endpoint covers every sandbox.
   This controller proxies each sandbox&rsquo;s Deskhand, so you configure it once and
   sandboxes you create later show up as tools automatically &mdash; no per-sandbox setup,
   no tokens to copy.</div>
   <div class="row" style="gap:8px;flex-wrap:wrap">
-    <button class="d" style="color:#4a9eff;border-color:#4a9eff" onclick="copyHub('claude')">Copy for Claude Code</button>
-    <button class="d" style="color:#3fb950;border-color:#3fb950" onclick="copyHub('hermes')">Copy for Hermes</button>
+    <button class="d" style="color:var(--acc);border-color:var(--acc)" onclick="copyHub('claude')">Copy for Claude Code</button>
+    <button class="d" style="color:var(--ok);border-color:var(--ok)" onclick="copyHub('hermes')">Copy for Hermes</button>
   </div>
   <pre id="hubcmd" style="margin-top:12px;white-space:pre-wrap"></pre>
   <div class="warn"><b>Sandbox-only mode.</b> Hermes keeps its own file, terminal, browser and
@@ -4203,16 +4277,16 @@ pre{background:#0b0d11;border:1px solid var(--ln);border-radius:6px;padding:12px
   </div>
   <label for="gh_body">Groundhogfile</label>
   <textarea id="gh_body" spellcheck="false" rows="14"
-    style="width:100%;font:13px/1.5 ui-monospace,Consolas,monospace;background:#0f1115;
+    style="width:100%;font:13px/1.5 ui-monospace,Consolas,monospace;background:var(--panel);
            color:var(--fg);border:1px solid var(--ln);border-radius:6px;padding:10px"></textarea>
   <div style="display:flex;gap:8px;align-items:center;margin-top:10px;flex-wrap:wrap">
     <button class="d" onclick="ghPlan()">Validate</button>
-    <button class="d" style="color:#58a6ff;border-color:#58a6ff" onclick="ghApply()">Apply</button>
+    <button class="d" style="color:var(--acc);border-color:var(--acc)" onclick="ghApply()">Apply</button>
     <label style="display:flex;align-items:center;gap:6px;color:var(--mut);font-size:12px">
       <input type="checkbox" id="gh_reboot"> allow it to reboot mid-apply</label>
     <button class="d" onclick="document.getElementById('ghcard').style.display='none'">Close</button>
   </div>
-  <pre id="gh_out" style="margin:12px 0 0;padding:10px;background:#0f1115;border:1px solid var(--ln);
+  <pre id="gh_out" style="margin:12px 0 0;padding:10px;background:var(--panel);border:1px solid var(--ln);
        border-radius:6px;font:12px/1.5 ui-monospace,Consolas,monospace;color:var(--mut);
        white-space:pre-wrap;max-height:260px;overflow:auto">No run recorded for this sandbox yet.</pre>
 </div>
@@ -4254,7 +4328,7 @@ pre{background:#0b0d11;border:1px solid var(--ln);border-radius:6px;padding:12px
         <option value="1">1 fps</option><option value="2" selected>2 fps</option>
         <option value="4">4 fps</option><option value="8">8 fps</option>
       </select>
-      <a id="wconsole" href="#" target="_blank"><button class="d" style="color:#4a9eff;border-color:#4a9eff">Proxmox console</button></a>
+      <a id="wconsole" href="#" target="_blank"><button class="d" style="color:var(--acc);border-color:var(--acc)">Proxmox console</button></a>
       <button class="d" onclick="stopWatch()">Close</button>
     </div>
   </div>
@@ -4310,9 +4384,9 @@ function actions(s){
                 title="Give it back">Release</button>`;
     }
   }
-  return hold + `<button class="d" style="color:#a371f7;border-color:#a371f7" onclick="watch(${s.vmid},'${s.name}')">Watch</button>
+  return hold + `<button class="d" style="color:var(--mag);border-color:var(--mag)" onclick="watch(${s.vmid},'${s.name}')">Watch</button>
     <button class="d" onclick="ghPanel(${s.vmid},'${esc(s.name)}')">Groundhog</button>
-    <button class="d" style="color:#58a6ff;border-color:#58a6ff" onclick="agentPanel(${s.vmid},'${s.name}')">Agents</button>
+    <button class="d" style="color:var(--acc);border-color:var(--acc)" onclick="agentPanel(${s.vmid},'${s.name}')">Agents</button>
     <details class="menu"><summary>&#8943;</summary><div class="mi">${m.join('')}</div></details>`;
 }
 function row(s){
@@ -4463,23 +4537,60 @@ function ticks(){
   });
 }
 
+// The status bar: what you are connected to and whether it is healthy. Reads
+// what the page already has rather than asking for anything new.
+function deckTop(rows){
+  var tm = document.getElementById('dk-tmpl');
+  var hs = document.getElementById('dk-host');
+  var rt = document.getElementById('dk-right');
+  if (!tm || !hs || !rt) return;
+  hs.textContent = location.hostname || 'sandboxctl';
+  var stale = (rows||[]).filter(function(s){ return s.status === 'running' && !s.token; }).length;
+  var exp   = (rows||[]).filter(function(s){ return s.expires === 'expired'; }).length;
+  var bits = [new Date().toISOString().slice(11,19) + 'Z'];
+  if (stale) bits.push('<span class="cau">' + stale + ' without a token</span>');
+  if (exp)   bits.push('<span class="cau">' + exp + ' past expiry</span>');
+  rt.innerHTML = bits.join(' &middot; ');
+}
+
 async function drawCapacity(){
   try{
     const r=await fetch('api/capacity');
     if(!r.ok) return;
     const c=await r.json();
     var pct=function(a,b){ return b ? Math.min(100, Math.round(a/b*100)) : 0; };
-    var hot=function(a,b){ return b && a/b >= .8 ? ' hot' : ''; };
-    var left=c.running_left;
+    var ticks=function(n){ var s=''; n=Math.min(n,16);
+      for(var i=0;i<n;i++) s+='<i></i>'; return '<span class="g-ticks">'+s+'</span>'; };
+    var tm = document.getElementById("dk-tmpl");
+    if (tm && c.template) tm.textContent = c.template;
+    var left=c.running_left, mb=c.running*180, cap=1024;
+    var runCls = left===0 ? 'crit' : (left<=1 ? 'cau' : '');
+    var memCls = mb/cap>=0.85 ? 'cau' : '';
     document.getElementById('cap').innerHTML =
-      '<span class="m">sandboxes <span class="bar"><i style="width:'+pct(c.sandboxes,c.max_sandboxes)+'%"></i></span> '
-        +c.sandboxes+' / '+c.max_sandboxes+'</span>'
-      +'<span class="m">running <span class="bar"><i class="'+hot(c.running,c.max_running).trim()
-        +'" style="width:'+pct(c.running,c.max_running)+'%"></i></span> '
-        +c.running+' / '+c.max_running+'</span>'
-      +(left<=1 ? '<span class="warnmsg">'+(left===0
-          ? 'no room left \u2014 create will refuse until one is destroyed or stopped'
-          : '1 slot left \u2014 each running sandbox costs the controller ~180 MB')+'</span>' : '');
+      '<div class="gauge">'
+      + '<div class="g-l"><span>Fleet slots</span><span>MAX '+c.max_sandboxes+'</span></div>'
+      + '<div class="g-v">'+c.sandboxes+'<small>/ '+c.max_sandboxes+'</small></div>'
+      + '<div class="g-t"><i style="width:calc('+pct(c.sandboxes,c.max_sandboxes)+'% - 2px)"></i>'
+      + ticks(c.max_sandboxes)+'</div>'
+      + '<div class="g-f">'+c.sandboxes_left+' free</div></div>'
+
+      + '<div class="gauge">'
+      + '<div class="g-l"><span>Running</span><span>OF '+c.max_running+'</span></div>'
+      + '<div class="g-v'+(runCls?' '+runCls:'')+'">'+c.running+'<small>/ '+c.max_running+'</small></div>'
+      + '<div class="g-t"><i class="'+runCls+'" style="width:calc('+pct(c.running,c.max_running)+'% - 2px)"></i>'
+      + ticks(c.max_running)+'</div>'
+      + '<div class="g-f">'+(left===0
+          ? '<b class="crit">FULL</b> \u2014 create will refuse'
+          : (left===1 ? '<b>CAUTION</b> \u2014 1 start left' : left+' starts left'))
+      + (c.creating ? ' &middot; '+c.creating+' building' : '')+'</div></div>'
+
+      + '<div class="gauge">'
+      + '<div class="g-l"><span>Recorder budget</span><span>OOM '+cap+' MB</span></div>'
+      + '<div class="g-v'+(memCls?' '+memCls:'')+'">'+mb+'<small>MB &nbsp;'+c.running+' &times; 180</small></div>'
+      + '<div class="g-t"><i class="'+memCls+'" style="width:calc('+pct(mb,cap)+'% - 2px)"></i>'
+      + '<span class="g-red"></span></div>'
+      + '<div class="g-f">'+(memCls ? '<b>CAUTION</b> \u2014 near the OOM line' : 'headroom for '
+          + Math.max(0, Math.floor((cap-mb)/180)) + ' more')+'</div></div>';
   }catch(e){ /* the list is the point; capacity is a nicety */ }
 }
 
@@ -4490,7 +4601,7 @@ async function refresh(){
   const d=await r.json();
   if(!d.length){
     document.getElementById('rows').innerHTML =
-      '<tr><td colspan="6" style="color:#8b93a1">No sandboxes yet.</td></tr>';
+      '<tr><td colspan="6" style="color:var(--mut)">No sandboxes yet.</td></tr>';
   } else {
     var by=[[],[],[],[]];
     d.forEach(function(s){ by[bucket(s)].push(s); });
@@ -4510,9 +4621,10 @@ async function refresh(){
     ticks();
   }
   drawCapacity();
+  deckTop(d);
  }catch(e){
   document.getElementById('rows').innerHTML =
-    '<tr><td colspan="6" style="color:#f85149">Could not load: '+e.message+'</td></tr>';
+    '<tr><td colspan="6" style="color:var(--bad)">Could not load: '+e.message+'</td></tr>';
  }
 }
 setInterval(ticks, 1000);
@@ -4573,7 +4685,7 @@ async function payload(){
   try{
     const d=await (await fetch('api/payload')).json();
     const el=document.getElementById('pay');
-    if(!d.kind){ el.innerHTML='<span style="color:#f85149">nothing staged &mdash; Create and Update will fail</span>'; return; }
+    if(!d.kind){ el.innerHTML='<span style="color:var(--bad)">nothing staged &mdash; Create and Update will fail</span>'; return; }
     const mb=(d.size/1048576).toFixed(1);
     el.textContent=(d.tag?d.tag+'  ':'')+(d.asset||d.kind)+'  '+mb+' MB  ('+(d.fetched||d.mtime||'')+')';
   }catch(e){ document.getElementById('pay').textContent='could not read'; }
@@ -4613,7 +4725,7 @@ async function recordings(vmid,name){
       (st&&st.recording ? ('recording now \u00b7 '+st.frames+' frames this chunk') : 'not currently recording')
       + ' \u00b7 8h chunks \u00b7 kept '+d.retention_days+' days'
       + (st&&st.error ? (' \u00b7 last error: '+st.error) : '');
-    if(!d.items.length){ document.getElementById('recrows').innerHTML='<tr><td colspan="3" style="color:#8b93a1">Nothing recorded yet.</td></tr>'; return; }
+    if(!d.items.length){ document.getElementById('recrows').innerHTML='<tr><td colspan="3" style="color:var(--mut)">Nothing recorded yet.</td></tr>'; return; }
     document.getElementById('recrows').innerHTML=d.items.map(function(it){
       var t=it.started, pretty=t.slice(0,4)+'-'+t.slice(4,6)+'-'+t.slice(6,8)+' '+t.slice(9,11)+':'+t.slice(11,13);
       var mb=(it.size/1048576).toFixed(1)+' MB';
@@ -4626,7 +4738,7 @@ async function recordings(vmid,name){
         +'<button class="d" onclick="playrec('+q+it.file+q+')">Play</button> '
         +'<a href="api/recording?file='+it.file+'" download><button class="d">Download</button></a></td></tr>';
     }).join('');
-  }catch(e){ document.getElementById('recrows').innerHTML='<tr><td colspan="3" style="color:#f85149">'+e.message+'</td></tr>'; }
+  }catch(e){ document.getElementById('recrows').innerHTML='<tr><td colspan="3" style="color:var(--bad)">'+e.message+'</td></tr>'; }
 }
 function playrec(file){
   var v=document.getElementById('recplayer');
