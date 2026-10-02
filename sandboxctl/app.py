@@ -3364,7 +3364,7 @@ def _guard_capacity():
     if cap["running"] >= MAX_RUNNING:
         raise RuntimeError(
             f"at the running limit: {cap['running']} of {MAX_RUNNING} are running. "
-            "Each running sandbox costs the controller ~100 MB for its console "
+            "Each running sandbox costs the controller ~180 MB for its console "
             "recorder. Destroy or stop one, or raise max_running in config.json.")
 
 
@@ -3852,7 +3852,7 @@ HOW MANY YOU MAY HAVE
   capacity        how many sandboxes exist and run, against the limits.
   create_sandbox refuses at either limit rather than queueing, so check this
   before creating several. Each running sandbox costs the controller about
-  100 MB for its console recorder, which is what the running limit protects.
+  180 MB for its console recorder, which is what the running limit protects.
 
 WHEN THEY GO AWAY
   set_expiry      a sandbox can be destroyed automatically when its time is up.
@@ -4429,7 +4429,7 @@ async function drawCapacity(){
         +c.running+' / '+c.max_running+'</span>'
       +(left<=1 ? '<span class="warnmsg">'+(left===0
           ? 'no room left \u2014 create will refuse until one is destroyed or stopped'
-          : '1 slot left \u2014 each running sandbox costs the controller ~100 MB')+'</span>' : '');
+          : '1 slot left \u2014 each running sandbox costs the controller ~180 MB')+'</span>' : '');
   }catch(e){ /* the list is the point; capacity is a nicety */ }
 }
 
