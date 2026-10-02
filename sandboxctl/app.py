@@ -451,6 +451,9 @@ GROUNDHOG_TASK = r"Groundhog\RunPending"
 # vmid -> the last outcome we saw, for the fleet list's badge. A hint, not a
 # record: the panel reads the guest. Not persisted on purpose -- a stale badge
 # that survived a restart would be worse than no badge.
+# The dashboard's favicon, base64 of a small SVG. Defined once and used both
+# by the page tag and the /favicon.svg route.
+FAVICON_B64 = "PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAzMiAzMiI+PHJlY3Qgd2lkdGg9IjMyIiBoZWlnaHQ9IjMyIiByeD0iNyIgZmlsbD0iIzE1MTkyMiIvPjxyZWN0IHg9IjUiIHk9IjgiIHdpZHRoPSIyMiIgaGVpZ2h0PSIxNSIgcng9IjIuNSIgZmlsbD0iIzRhOWVmZiIvPjxyZWN0IHg9IjkiIHk9IjI1IiB3aWR0aD0iMTQiIGhlaWdodD0iMi41IiByeD0iMS4yNSIgZmlsbD0iIzJhMzI0MiIvPjxjaXJjbGUgY3g9IjIyLjUiIGN5PSIxMi41IiByPSIyLjYiIGZpbGw9IiMzZmI5NTAiLz48L3N2Zz4="
 GH_LAST = {}
 GROUNDHOG_LAST_RUN = GROUNDHOG_HOME + r"\last-run"
 
@@ -3826,6 +3829,7 @@ def handle_mcp(msg, host=None):
 # --------------------------------------------------------------------------
 PAGE = """<!doctype html><html><head><meta charset="utf-8">
 <title>Sandboxes</title><meta name="viewport" content="width=device-width,initial-scale=1">
+<link rel="icon" type="image/svg+xml" href="data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAzMiAzMiI+PHJlY3Qgd2lkdGg9IjMyIiBoZWlnaHQ9IjMyIiByeD0iNyIgZmlsbD0iIzE1MTkyMiIvPjxyZWN0IHg9IjUiIHk9IjgiIHdpZHRoPSIyMiIgaGVpZ2h0PSIxNSIgcng9IjIuNSIgZmlsbD0iIzRhOWVmZiIvPjxyZWN0IHg9IjkiIHk9IjI1IiB3aWR0aD0iMTQiIGhlaWdodD0iMi41IiByeD0iMS4yNSIgZmlsbD0iIzJhMzI0MiIvPjxjaXJjbGUgY3g9IjIyLjUiIGN5PSIxMi41IiByPSIyLjYiIGZpbGw9IiMzZmI5NTAiLz48L3N2Zz4=">
 <style>
 :root{--bg:#0f1115;--fg:#e6e6e6;--mut:#8b93a1;--ln:#252a33;--acc:#4a9eff;--ok:#3fb950;--bad:#f85149}
 *{box-sizing:border-box}
@@ -4697,6 +4701,18 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, json.dumps(groundhog_status(int(vmid))))
             except Exception as exc:                  # noqa: BLE001
                 return self._send(400, json.dumps({"error": str(exc)}))
+        if p.path in ("/favicon.svg", "/favicon.ico"):
+            # The same icon the page embeds. .ico is answered with an
+            # SVG on purpose: every browser that asks for it by that name
+            # accepts one, and it saves carrying a second format.
+            body = base64.b64decode(FAVICON_B64)
+            self.send_response(200)
+            self.send_header("Content-Type", "image/svg+xml")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "max-age=86400")
+            self.end_headers()
+            self.wfile.write(body)
+            return
         if p.path == "/api/capacity":
             try:
                 return self._send(200, json.dumps(capacity()))
