@@ -608,6 +608,68 @@ def _plan_clean(text):
     return "\n".join(out).strip()
 
 
+# Short descriptions for the editor. Keyed by the file's stem; anything in the
+# directory without an entry still shows up, just without the blurb.
+GH_LIBRARY_NOTES = {
+    "heisenberg": "Heisenberg debugging MCP server, plus the toolchain it drives "
+                  "(Sysinternals, WinDbg, TTD, symbols). Slow: Windows features "
+                  "come from Windows Update.",
+    "opencode": "opencode from its own release zip, on the machine PATH.",
+    "hermes": "Hermes via the vendor installer. ~2 GB; brings its own git, "
+              "python and node.",
+    "debug-kit": "Heisenberg and opencode together: drive native debugging from "
+                 "an agent.",
+    "everything": "Every agent and tool here in one apply. Bake this into a "
+                  "template rather than waiting on it per sandbox.",
+}
+
+
+def groundhog_library():
+    """The profiles shipped alongside this service, newest content each time.
+
+    Read from disk rather than cached: these are small, and editing one and
+    reloading the page is how you iterate on them.
+    """
+    d = os.path.join(HERE, "groundhog")
+    out = []
+    for name in sorted(os.listdir(d)) if os.path.isdir(d) else []:
+        if not name.endswith(".groundhog.yaml"):
+            continue
+        stem = name[: -len(".groundhog.yaml")]
+        try:
+            with open(os.path.join(d, name), encoding="utf-8") as fh:
+                body = fh.read()
+        except OSError:
+            continue
+        out.append({"name": stem,
+                    "note": GH_LIBRARY_NOTES.get(stem, ""),
+                    "url": f"{SELF_URL}/payload/lib-{name}",
+                    "content": body.replace("@@SELF@@", SELF_URL.split("//", 1)[-1])})
+    return out
+
+
+def publish_groundhog_library():
+    """Copy the library into the payload directory, where a guest can fetch it.
+
+    Done at startup so an edited profile is picked up by a restart, and because
+    the combinations reference each other by URL -- they have to be fetchable,
+    not just readable here.
+    """
+    pdir = os.path.join(HERE, "payload")
+    try:
+        os.makedirs(pdir, exist_ok=True)
+        for item in groundhog_library():
+            dest = os.path.join(pdir, "lib-" + item["name"] + ".groundhog.yaml")
+            tmp = dest + ".tmp"
+            with open(tmp, "w", encoding="utf-8", newline="\n") as fh:
+                fh.write(item["content"])
+            os.replace(tmp, dest)
+        return len(groundhog_library())
+    except Exception as exc:                          # noqa: BLE001
+        print(f"groundhog library: not published ({exc})", flush=True)
+        return 0
+
+
 def groundhog_plan(vmid, source):
     """Run `groundhog-agent plan` in the guest. Loads everything, changes nothing.
 
@@ -4006,6 +4068,9 @@ pre{background:#0b0d11;border:1px solid var(--ln);border-radius:6px;padding:12px
         <option value="apps">a couple of winget apps</option>
         <option value="secret">pass a secret into the environment</option>
       </select></div>
+    <div style="grid-column:span 2"><label>Or one of the profiles shipped with this controller</label>
+      <select id="gh_lib" onchange="ghLib()"><option value="">loading&hellip;</option></select>
+      <div class="warn" id="gh_libnote" style="margin:6px 0 0">&nbsp;</div></div>
     <div><label>Secrets (NAME=value, one per line)</label>
       <input id="gh_secrets" placeholder="API_TOKEN=..."></div>
   </div>
@@ -4106,7 +4171,19 @@ function actions(s){
   m.push(`<button class="d okish" onclick="rep(${s.vmid})">${s.token?'Repair':'Finish setup'}</button>`);
   m.push(`<button class="d" onclick="recordings(${s.vmid},'${s.name}')">Recordings</button>`);
   m.push(`<button class="d badish" onclick="destroy(${s.vmid})">Destroy</button>`);
-  return `<button class="d" style="color:#a371f7;border-color:#a371f7" onclick="watch(${s.vmid},'${s.name}')">Watch</button>
+  // Claim where it can be claimed, Release only for the holder. A row that is
+  // someone else's says so in the badge and offers neither.
+  var hold = '';
+  if (s.status === 'running') {
+    if (!s.claimed_by) {
+      hold = `<button class="d okish" onclick="claimRow(${s.vmid})"
+                title="Hold it so nobody destroys or repairs it while you work">Claim</button>`;
+    } else if (s.claimed_by === whoAmI(true)) {
+      hold = `<button class="d warnish" onclick="releaseRow(${s.vmid})"
+                title="Give it back">Release</button>`;
+    }
+  }
+  return hold + `<button class="d" style="color:#a371f7;border-color:#a371f7" onclick="watch(${s.vmid},'${s.name}')">Watch</button>
     <button class="d" onclick="ghPanel(${s.vmid},'${esc(s.name)}')">Groundhog</button>
     <button class="d" style="color:#58a6ff;border-color:#58a6ff" onclick="agentPanel(${s.vmid},'${s.name}')">Agents</button>
     <details class="menu"><summary>&#8943;</summary><div class="mi">${m.join('')}</div></details>`;
@@ -4424,6 +4501,38 @@ function playrec(file){
   v.scrollIntoView({behavior:'smooth',block:'nearest'});
 }
 var agvm=null, MODEL_CTX={};
+// Asked once and remembered: a claim nobody can be asked about is not a claim,
+// and retyping your own name every time is how a feature gets skipped.
+function whoAmI(quiet){
+  var w='';
+  try{ w=localStorage.getItem('sbx-who')||''; }catch(e){}
+  if(w || quiet) return w;
+  w=(prompt('Your name, so others know who holds a sandbox:')||'').trim().slice(0,60);
+  if(w){ try{ localStorage.setItem('sbx-who',w); }catch(e){} }
+  return w;
+}
+async function claimRow(vmid){
+  var who=whoAmI();
+  if(!who) return;
+  var purpose=(prompt('What for? (optional, shown to whoever looks next)')||'').trim();
+  try{
+    const r=await fetch('api/claim',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({vmid:vmid,who:who,purpose:purpose,minutes:120})});
+    const d=await r.json();
+    if(d.error){ alert('Could not claim it: '+d.error); return; }
+    refresh();
+  }catch(e){ alert('Could not claim it: '+e.message); }
+}
+async function releaseRow(vmid){
+  var who=whoAmI(true);
+  try{
+    const r=await fetch('api/claim',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({vmid:vmid,who:who,release:true})});
+    const d=await r.json();
+    if(d.error){ alert('Could not release it: '+d.error); return; }
+    refresh();
+  }catch(e){ alert('Could not release it: '+e.message); }
+}
 var ghvm=null;
 // A newline with no escape anywhere: a template literal holding a real one.
 // Every multi-line string below uses this or a backtick literal. Escape
@@ -4457,6 +4566,27 @@ verify:
            '  - command: if (-not $env:EXAMPLE_TOKEN) { exit 1 }',
            ''].join(NL)
 };
+var GH_LIB=[];
+async function ghLoadLibrary(){
+  var sel=document.getElementById('gh_lib');
+  try{
+    const r=await fetch('api/groundhog/library');
+    GH_LIB=await r.json();
+    if(!GH_LIB.length){ sel.innerHTML='<option value="">(none shipped)</option>'; return; }
+    sel.innerHTML='<option value="">(pick one)</option>'+GH_LIB.map(function(p,i){
+      return '<option value="'+i+'">'+esc(p.name)+'</option>'; }).join('');
+  }catch(e){ sel.innerHTML='<option value="">(could not load)</option>'; }
+}
+function ghLib(){
+  var i=document.getElementById('gh_lib').value;
+  var note=document.getElementById('gh_libnote');
+  if(i===''){ note.innerHTML='&nbsp;'; return; }
+  var p=GH_LIB[parseInt(i,10)];
+  if(!p) return;
+  document.getElementById('gh_body').value=p.content;
+  document.getElementById('gh_tpl').value='';
+  note.textContent=p.note||'';
+}
 function ghStarter(){
   var k=document.getElementById('gh_tpl').value;
   if(k && GH_STARTERS[k]) document.getElementById('gh_body').value=GH_STARTERS[k];
@@ -4467,6 +4597,7 @@ function ghPanel(vmid,name){
   var c=document.getElementById('ghcard');
   c.style.display='block';
   c.scrollIntoView({behavior:'smooth'});
+  if(!GH_LIB.length) ghLoadLibrary();
   if(!document.getElementById('gh_body').value.trim()){
     document.getElementById('gh_tpl').value='internals'; ghStarter();
   }
@@ -4693,6 +4824,11 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 return self._send(200, json.dumps(
                     {k: get_expiry(k) for k in _expiry_load()}))
+            except Exception as exc:                  # noqa: BLE001
+                return self._send(500, json.dumps({"error": str(exc)}))
+        if p.path == "/api/groundhog/library":
+            try:
+                return self._send(200, json.dumps(groundhog_library()))
             except Exception as exc:                  # noqa: BLE001
                 return self._send(500, json.dumps({"error": str(exc)}))
         if p.path == "/api/groundhog":
@@ -5038,6 +5174,10 @@ if __name__ == "__main__":
     pay = ThreadingHTTPServer((PAYLOAD_LISTEN[0], int(PAYLOAD_LISTEN[1])), PayloadHandler)
     threading.Thread(target=pay.serve_forever, daemon=True).start()
     print(f"payload  listening on {PAYLOAD_LISTEN[0]}:{PAYLOAD_LISTEN[1]} (sandbox-facing, read-only)", flush=True)
+
+    n = publish_groundhog_library()
+    if n:
+        print(f"groundhog library: {n} profile(s) published to the payload port", flush=True)
 
     threading.Thread(target=reaper_loop, daemon=True).start()
     print("expiry reaper running (default "
