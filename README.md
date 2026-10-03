@@ -243,7 +243,7 @@ because `drvload` in WinPE does not carry the driver into the installed system.
 ```sh
 apt install -y python3-pil python3-cryptography
 mkdir -p /opt/sandboxctl && cd /opt/sandboxctl
-# copy app.py, live.py, sandboxctl.service here
+# copy app.py, dashboard.html, live.py, recorder.py, sandboxctl.service here
 cp config.example.json config.json && chmod 600 config.json && $EDITOR config.json
 cp sandboxctl.service /etc/systemd/system/
 systemctl enable --now sandboxctl
@@ -905,6 +905,7 @@ Things that cost real time to find:
 ```
 sandboxctl/
   app.py                 controller: web UI, MCP server, Proxmox driver
+  dashboard.html         the web UI, read from disk on every request (edit and reload)
   live.py                RFB client + Deskhand capture -> MJPEG
   config.example.json    copy to config.json (gitignored: holds credentials)
   sandboxctl.service     systemd unit

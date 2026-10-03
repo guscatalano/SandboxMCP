@@ -1,0 +1,994 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8">
+<title>Sandboxes</title><meta name="viewport" content="width=device-width,initial-scale=1">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<!-- Fallbacks are load-bearing: this is a LAN tool and the faces come from the
+     internet. Segoe UI and Consolas hold close enough shapes that a failed fetch
+     reads as plain rather than broken. -->
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Work+Sans:wght@400;500;600&family=Red+Hat+Mono:wght@400;500&display=swap">
+<style>
+/* Three Pane, dark. Pick a sandbox on the left, read it in the middle, operate
+   it on the right. Three surfaces, one step of lightness apart, so the columns
+   read as columns without rules doing all the work. The violet is the only
+   accent; green, amber and red mean the same thing wherever they appear. */
+:root{
+  --bg:#0F1217; --panel:#161A21; --inset:#12161C; --ln:#2A313D; --ln2:#232935; --ln3:#343C49;
+  --fg:#E6E9EF; --fg2:#CBD2DC; --mut:#8B94A3; --dim:#6B7484;
+  --acc:#A78BFA; --acc-fill:#7C3AED; --sel:#231C3A;
+  --ok:#4ADE80; --ok-bg:#14301F; --warn:#F5B544; --warn-bg:#3A2C0F; --bad:#FF7B72; --bad-bg:#3B1717;
+  --danger-bg:#1C1215; --danger-fill:#DC2626;
+  --sans:"Work Sans",system-ui,"Segoe UI",Arial,sans-serif;
+  --mono:"Red Hat Mono","Cascadia Mono",Consolas,monospace;
+}
+*{box-sizing:border-box;min-width:0}
+html,body{height:100%}
+body{margin:0;background:var(--bg);color:var(--fg);font:13px/1.4 var(--sans)}
+a{color:var(--acc);text-decoration:none} a:hover{text-decoration:underline}
+code,.mono{font-family:var(--mono);font-variant-numeric:tabular-nums}
+button{font:inherit;cursor:pointer}
+button:disabled{opacity:.45;cursor:not-allowed}
+:focus-visible{outline:2px solid var(--acc);outline-offset:1px}
+input,select,textarea{background:var(--inset);border:1px solid var(--ln3);color:var(--fg);border-radius:6px;padding:6px 8px;font:inherit;width:100%}
+textarea{font:12.5px/1.5 var(--mono)}
+label{display:block;color:var(--mut);font-size:11px;margin-bottom:4px}
+pre{margin:0;background:var(--inset);border:1px solid var(--ln);border-radius:6px;padding:10px;font:12px/1.5 var(--mono);color:var(--fg2);white-space:pre-wrap;overflow-wrap:anywhere;overflow:auto;max-height:280px}
+.hidden{display:none!important}
+
+/* ---- the frame: top bar, then three columns that each scroll alone ---- */
+.app{height:100vh;display:grid;grid-template-rows:44px minmax(0,1fr);grid-template-columns:260px minmax(0,1fr) 300px}
+.top{grid-column:1/4;display:flex;align-items:center;gap:14px;padding:0 14px;background:var(--panel);border-bottom:1px solid var(--ln)}
+.brand{font-weight:600;letter-spacing:.02em;white-space:nowrap}
+.brand small{font-weight:400;color:var(--mut);margin-left:8px;font-family:var(--mono);font-size:11px}
+.cap{display:flex;gap:16px;margin-left:auto;color:var(--mut);font-size:12px;font-family:var(--mono);align-items:center;flex-wrap:wrap}
+.cap b{color:var(--fg);font-weight:600}
+.cap .bar{display:inline-block;width:56px;height:5px;background:var(--ln);border-radius:3px;vertical-align:middle;margin-left:6px;overflow:hidden}
+.cap .bar i{display:block;height:100%;background:var(--acc)}
+.cap .bar i.hot{background:var(--warn)} .cap .bar i.full{background:var(--bad)}
+.cap .job{color:var(--warn)}
+.btn{display:inline-flex;align-items:center;justify-content:center;gap:6px;border:1px solid var(--ln3);border-radius:6px;padding:5px 10px;font-size:12px;font-weight:500;background:var(--panel);color:var(--fg);white-space:nowrap}
+.btn:hover:not(:disabled){border-color:var(--acc)}
+.btn.pri{background:var(--acc-fill);border-color:var(--acc-fill);color:#fff}
+.btn.dng{color:var(--bad);border-color:#5A2A2A}
+.btn.dng.solid{background:var(--danger-fill);color:#fff;border-color:var(--danger-fill)}
+.btn.sm{padding:3px 8px;font-size:11px}
+.btns{display:flex;gap:6px;flex-wrap:wrap}
+
+/* ---- left: the fleet ---- */
+.list{background:var(--panel);border-right:1px solid var(--ln);display:flex;flex-direction:column;min-height:0}
+.filters{display:flex;gap:3px;padding:10px 8px 8px;flex-wrap:wrap;border-bottom:1px solid var(--ln2)}
+.filters button{font-size:10.5px;padding:3px 7px;border-radius:999px;border:1px solid var(--ln);color:var(--mut);background:transparent}
+.filters button.on{background:var(--fg);color:var(--bg);border-color:var(--fg)}
+.search{margin:8px 10px 4px}
+.search input{font-size:12px;padding:6px 8px}
+.rows{overflow:auto;min-height:0;flex:1}
+.row{display:grid;grid-template-columns:10px minmax(0,1fr);gap:8px;padding:10px 12px;border-bottom:1px solid var(--ln2);align-items:start;cursor:pointer;width:100%;text-align:left;background:none;border-left:0;border-right:0;border-top:0;color:inherit}
+.row:hover{background:#1A1F28}
+.row.sel{background:var(--sel);box-shadow:inset 3px 0 0 var(--acc)}
+.dot{width:8px;height:8px;border-radius:50%;margin-top:5px;background:var(--dim)}
+.dot.run{background:var(--ok)} .dot.busy{background:var(--warn)} .dot.bad{background:var(--bad)}
+.row .nm{display:flex;gap:6px;align-items:baseline}
+.row .nm b{font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.row .nm .id{color:var(--mut);font-size:11px;font-family:var(--mono)}
+.row .sub{color:var(--mut);font-size:11px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.row .tags{display:flex;gap:4px;margin-top:4px;flex-wrap:wrap}
+.tag{font-size:10px;padding:1px 6px;border-radius:4px;background:var(--ln2);color:var(--fg2);white-space:nowrap;max-width:100%;overflow:hidden;text-overflow:ellipsis}
+.tag.bad{background:var(--bad-bg);color:var(--bad)} .tag.warn{background:var(--warn-bg);color:var(--warn)} .tag.ok{background:var(--ok-bg);color:var(--ok)}
+.listfoot{padding:8px 12px;font-size:11px;color:var(--mut);border-top:1px solid var(--ln2);font-family:var(--mono)}
+.empty{padding:18px 12px;color:var(--mut);font-size:12px}
+
+/* ---- middle: the sandbox ---- */
+.detail{min-height:0;overflow:auto;padding:16px 18px;display:flex;flex-direction:column;gap:14px}
+.hd{display:flex;align-items:baseline;gap:10px;flex-wrap:wrap}
+.hd h2{margin:0;font-size:18px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:100%}
+.hd .id{color:var(--mut);font-family:var(--mono)}
+.pill{font-size:11px;padding:2px 8px;border-radius:999px;font-weight:600;white-space:nowrap;background:var(--ln2);color:var(--fg2)}
+.pill.run{background:var(--ok-bg);color:var(--ok)} .pill.bad{background:var(--bad-bg);color:var(--bad)} .pill.warn{background:var(--warn-bg);color:var(--warn)}
+.sec{background:var(--panel);border:1px solid var(--ln);border-radius:8px;overflow:hidden;box-shadow:0 1px 0 rgba(0,0,0,.35)}
+.sec .sh{display:flex;align-items:center;gap:8px;padding:8px 12px;border-bottom:1px solid var(--ln2);font-size:12px;font-weight:600;flex-wrap:wrap}
+.sec .sh .r{margin-left:auto;font-weight:400;color:var(--mut);font-size:11px;display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+.sec .body{padding:10px 12px}
+.two{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:14px}
+@media(max-width:1500px){.two.wide{grid-template-columns:minmax(0,1fr)}}
+.fb{position:relative;background:#0B0E13;display:flex;align-items:center;justify-content:center;min-height:120px}
+.fb img{display:block;width:100%;height:auto;max-height:70vh;object-fit:contain;background:#000}
+.fb .live{position:absolute;top:8px;right:8px;font-size:10px;color:#fff;background:#DC2626;padding:1px 6px;border-radius:3px;font-weight:600}
+.fb .msg{color:var(--mut);font-size:12px;padding:20px;text-align:center}
+.steps{display:grid;grid-auto-flow:column;grid-auto-columns:minmax(0,1fr);gap:4px;padding:10px 12px 6px}
+.step{font-size:10px;text-align:center;color:var(--fg2)}
+.step i{display:block;height:6px;border-radius:3px;background:var(--ln3);margin-bottom:4px}
+.step.done i{background:var(--ok)} .step.failed i{background:var(--bad)} .step.failed{color:var(--bad)} .step.changed i{background:var(--acc)}
+.step span{display:block;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.kv{display:grid;grid-template-columns:auto minmax(0,1fr);gap:4px 12px;font-size:12px;margin:0}
+.kv dt{color:var(--mut);margin:0}.kv dd{margin:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.agents{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:1px;background:var(--ln2)}
+.ag{background:var(--panel);padding:10px 12px}
+.ag b{display:block;font-weight:600;font-size:12px}
+.ag .st{font-size:11px;color:var(--mut);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.ag .st.ok{color:var(--ok)} .ag .st.off{color:var(--dim)}
+.ag code{font-size:11px}
+.recs{display:flex;flex-direction:column;gap:4px;font-size:12px}
+.recs .it{display:grid;grid-template-columns:minmax(0,1fr) auto auto;gap:12px;align-items:center}
+.note{border-left:2px solid var(--ln3);padding:2px 0 6px 10px;margin-bottom:8px;font-size:12px}
+.note .who{font-weight:600;margin-right:8px}
+.note .when{color:var(--mut);font-size:11px;margin-right:8px}
+.note .via{color:var(--dim);font-size:11px;font-family:var(--mono)}
+.note .what{white-space:pre-wrap;margin-top:2px;color:var(--fg2)}
+.notes-add{display:flex;gap:8px;flex-wrap:wrap;margin-top:8px}
+.notes-add input:first-child{width:130px;flex:none}
+.notes-add input:nth-child(2){flex:1;min-width:160px}
+.muted{color:var(--mut)} .ok{color:var(--ok)} .warn{color:var(--warn)} .bad{color:var(--bad)}
+.hint{color:var(--mut);font-size:12px;line-height:1.5}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin-bottom:12px}
+details.adv>summary{cursor:pointer;color:var(--mut);font-size:12px;margin-bottom:8px}
+
+/* history: the Case File timeline, in the middle column */
+.tl{display:grid;grid-template-columns:48px 14px minmax(0,1fr);gap:0 10px;padding:8px 12px 4px}
+.tl .t{font-family:var(--mono);font-size:11px;color:var(--mut);padding:5px 0;text-align:right;white-space:nowrap}
+.tl .m{position:relative;padding-top:8px}
+.tl .m::before{content:"";position:absolute;left:6px;top:0;bottom:0;width:1px;background:var(--ln)}
+.tl .m i{position:relative;display:block;width:13px;height:13px;border-radius:50%;background:var(--panel);border:2px solid var(--fg2)}
+.tl .m i.sq{border-radius:0}
+.tl .m i.acc{border-color:var(--acc)}
+.tl .m i.ok{border-color:var(--ok);background:var(--ok)}
+.tl .m i.red{border-color:var(--bad);background:var(--bad)}
+.tl .m i.dim{border-color:var(--dim)}
+.tl .m i.grey{border-color:var(--dim);border-style:dashed;background:transparent}
+.tl .e{padding:4px 0 8px;border-bottom:1px solid var(--ln2);font-size:12px}
+.tl .e:last-child{border-bottom:0}
+.tl .e b{font-weight:600}
+.tl .e .k{display:inline-block;font-size:10px;letter-spacing:.08em;text-transform:uppercase;color:var(--mut);margin-right:6px;min-width:64px}
+.tl .e p{margin:1px 0 0;color:var(--fg2);font-size:11.5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.tl .e.future{color:var(--mut)} .tl .e.future b{font-weight:400}
+.tl .e .n{color:var(--mut);font-family:var(--mono);font-size:11px;margin-left:6px}
+
+/* ---- right: the inspector ---- */
+.insp{background:var(--panel);border-left:1px solid var(--ln);min-height:0;overflow:auto;display:flex;flex-direction:column}
+.insp .ih{padding:10px 14px;font-size:11px;font-weight:600;letter-spacing:.06em;color:var(--mut);text-transform:uppercase;border-bottom:1px solid var(--ln2);font-family:var(--mono)}
+.grp{padding:10px 14px;border-bottom:1px solid var(--ln2);display:flex;flex-direction:column;gap:6px}
+.grp .gl{font-size:11px;color:var(--mut)}
+.fact{display:flex;justify-content:space-between;gap:8px;font-size:12px}
+.fact span:last-child{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;text-align:right}
+.fact.wrap span:last-child{white-space:normal;overflow-wrap:anywhere}
+.seg{display:flex;border:1px solid var(--ln3);border-radius:6px;overflow:hidden}
+.seg button{flex:1;text-align:center;padding:4px 0;font-size:11px;border:0;border-right:1px solid var(--ln3);background:transparent;color:var(--fg2)}
+.seg button:last-child{border-right:0}
+.seg button.on{background:var(--fg);color:var(--bg)}
+.copy{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:6px;align-items:center;font-size:11px}
+.copy code{background:var(--inset);padding:4px 6px;border-radius:4px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--fg2);font-size:11px}
+.copy button{border:0;background:none;color:var(--acc);font-size:11px;padding:0}
+.danger{margin-top:auto;background:var(--danger-bg);border-bottom:0}
+.tick.soon{color:var(--bad)}
+.who{font-size:11px;color:var(--mut)} .who a{cursor:pointer}
+
+/* ---- jobs: a strip under the header while something runs ---- */
+.jobbox .sh .r{font-family:var(--mono)}
+.jobbox pre{max-height:220px;border:0;border-radius:0}
+
+/* ---- narrow screens: stack ---- */
+@media(max-width:1100px){
+  .app{height:auto;grid-template-columns:minmax(0,1fr);grid-template-rows:auto auto auto auto}
+  .top{grid-column:1}
+  .list{border-right:0;border-bottom:1px solid var(--ln);max-height:40vh}
+  .insp{border-left:0;border-top:1px solid var(--ln)}
+  .danger{margin-top:0}
+}
+@media(prefers-reduced-motion:reduce){*{scroll-behavior:auto!important}}
+</style></head><body>
+<div class="app">
+  <div class="top">
+    <span class="brand">sandboxctl<small id="dk-host"></small></span>
+    <span class="cap" id="cap"></span>
+    <button class="btn pri" onclick="showCreate()">+ New sandbox</button>
+  </div>
+
+  <!-- left -->
+  <div class="list">
+    <div class="filters" id="filters">
+      <button class="on" data-f="all" onclick="setFilter('all')">All</button>
+      <button data-f="running" onclick="setFilter('running')">Running</button>
+      <button data-f="stopped" onclick="setFilter('stopped')">Stopped</button>
+      <button data-f="mine" onclick="setFilter('mine')">Mine</button>
+      <button data-f="held" onclick="setFilter('held')">Held</button>
+    </div>
+    <div class="search"><input id="q" placeholder="Filter by name or vmid…  (Ctrl-K)" oninput="query=this.value;renderList()" onkeydown="if(event.key==='Enter')openFirst()"></div>
+    <div class="rows" id="rows"><div class="empty">loading…</div></div>
+    <div class="listfoot" id="listfoot">&nbsp;</div>
+  </div>
+
+  <!-- middle -->
+  <div class="detail" id="detail">
+    <div class="sec jobbox hidden" id="jobbox">
+      <div class="sh"><span id="jobtitle">Job</span><span class="r"><span id="jobelapsed"></span><button class="btn sm" onclick="hideJob()">hide</button></span></div>
+      <pre id="joblog"></pre>
+    </div>
+
+    <!-- nothing selected, or creating -->
+    <div id="view-create">
+      <div class="hd"><h2>New sandbox</h2><span class="id">clone of the template, then Deskhand, then your profile</span></div>
+      <div class="sec" style="margin-top:14px"><div class="body">
+        <div class="grid">
+          <div><label>Name</label><input id="c_name" placeholder="auto" maxlength="15"></div>
+          <div><label>Profile (Groundhog)</label><select id="c_profile"><option value="">Deskhand only</option></select></div>
+          <div><label>Expires</label><select id="c_ttl">
+            <option value="0">never</option><option value="60">in 1 hour</option><option value="240" selected>in 4 hours</option>
+            <option value="1440">in 24 hours</option><option value="10080">in 7 days</option></select></div>
+        </div>
+        <div class="hint" id="c_profnote" style="margin:-4px 0 12px">&nbsp;</div>
+        <details class="adv"><summary>Hardware and Deskhand options</summary>
+          <div class="grid">
+            <div><label>Cores</label><input id="c_cores" type="number" value="4" min="1" max="16"></div>
+            <div><label>Memory (MiB)</label><input id="c_mem" type="number" value="8192" step="1024" min="4096"></div>
+            <div><label>Deskhand port</label><input id="c_port" type="number" value="8791"></div>
+            <div><label>Shell (/shell/run)</label><select id="c_shell"><option value="1" selected>enabled</option><option value="0">disabled</option></select></div>
+            <div><label>TLS (self-signed)</label><select id="c_tls"><option value="0" selected>off</option><option value="1">on</option></select></div>
+          </div>
+          <div class="hint">TLS uses an ephemeral self-signed certificate that changes on every boot, so MCP clients that verify certificates reject it. Leave it off unless you know you want it.</div>
+        </details>
+        <div class="btns" style="margin-top:12px;align-items:center">
+          <button class="btn pri" id="c_go" onclick="create()">Create sandbox</button>
+          <span class="hint">About 5 minutes: clone, Windows OOBE, a reboot for auto-logon, the Deskhand install, then the profile.</span>
+        </div>
+      </div></div>
+      <div class="sec" style="margin-top:14px"><div class="sh">If you are an AI reading this page</div><div class="body hint">
+        Connect over MCP at <code>/mcp</code> on this host, call <code>list_sandboxes</code>, then drive a sandbox through its <code>&lt;name&gt;__deskhand_*</code> tools. The full guide, as plain text, is at <a href="/llms.txt">/llms.txt</a>; a machine-readable card is at <a href="/.well-known/agent.json">/.well-known/agent.json</a>. Sandboxes are disposable and untrusted: never put real credentials in one, and destroy what you finish with.
+      </div></div>
+    </div>
+
+    <!-- a sandbox -->
+    <div id="view-sb" class="hidden" style="display:flex;flex-direction:column;gap:14px">
+      <div class="hd"><h2 id="s_name"></h2><span class="id" id="s_vmid"></span><span class="pill" id="s_state"></span><span class="id" id="s_meta"></span></div>
+
+      <div class="two wide">
+        <div class="sec">
+          <div class="sh">Console<span class="r">
+            <select id="w_src" style="width:auto;padding:2px 6px;font-size:11px" onchange="screenMode()"><option value="still">still, every 4 s</option><option value="vnc">live · VNC</option><option value="deskhand">live · Deskhand</option></select>
+            <select id="w_fps" style="width:auto;padding:2px 6px;font-size:11px" onchange="screenMode()"><option value="1">1 fps</option><option value="2" selected>2 fps</option><option value="4">4 fps</option></select>
+            <a id="w_console" href="#" target="_blank">Open full ↗</a></span></div>
+          <div class="fb"><img id="scr" alt="" class="hidden"><span class="live hidden" id="scr_live">LIVE</span><div class="msg" id="scr_msg">not running</div></div>
+        </div>
+        <div class="sec">
+          <div class="sh">Groundhog<span class="r"><span id="gh_sum"></span><a onclick="toggle('gh_editor');return false" href="#">Edit profile</a></span></div>
+          <div class="steps" id="gh_steps"></div>
+          <div class="body" id="gh_detail" style="padding-top:4px"><dl class="kv" id="gh_kv"></dl></div>
+          <div class="body hidden" id="gh_editor" style="border-top:1px solid var(--ln2)">
+            <div class="hint" style="margin-bottom:10px">Groundhog brings a sandbox to a declared state from one file: apps, files, registry, environment, and its own checks. <b>Validate</b> runs its <code>plan</code> in the guest and changes nothing; <b>Apply</b> runs it for real. Name secrets as <code>${secret:NAME}</code> and give the values below; they are stripped from the guest as the agent reads them and never logged.</div>
+            <div class="grid">
+              <div><label>Shipped profile</label><select id="gh_lib" onchange="ghLib()"><option value="">loading…</option></select></div>
+              <div><label>Or a starter</label><select id="gh_tpl" onchange="ghStarter()">
+                <option value="">(keep the editor)</option>
+                <option value="internals">groundhog:windows-internals</option>
+                <option value="sysinternals">groundhog:sysinternals only</option>
+                <option value="apps">a couple of winget apps</option>
+                <option value="secret">pass a secret into the environment</option></select></div>
+              <div><label>Secrets (NAME=value per line)</label><input id="gh_secrets" placeholder="API_TOKEN=…"></div>
+            </div>
+            <div class="hint" id="gh_libnote" style="margin:-6px 0 8px">&nbsp;</div>
+            <textarea id="gh_body" spellcheck="false" rows="12"></textarea>
+            <div class="btns" style="margin-top:8px;align-items:center">
+              <button class="btn" onclick="ghPlan()">Validate</button>
+              <button class="btn pri" onclick="ghApply()">Apply</button>
+              <label style="display:flex;align-items:center;gap:6px;margin:0"><input type="checkbox" id="gh_reboot" style="width:auto"> allow a reboot mid-apply</label>
+            </div>
+            <pre id="gh_out" style="margin-top:10px">No run recorded for this sandbox yet.</pre>
+          </div>
+        </div>
+      </div>
+
+      <div class="sec">
+        <div class="sh">Agents<span class="r"><span id="ag_sum"></span><a href="#" onclick="agForm();return false">Install agents</a></span></div>
+        <div class="agents" id="ag_cells"></div>
+        <div class="body hidden" id="ag_form" style="border-top:1px solid var(--ln2)">
+          <div class="hint" style="margin-bottom:10px">Installs into the sandbox itself and configures it with this sandbox's own Deskhand as an MCP server, so the agent can drive the desktop it runs on. Several minutes; Hermes is a ~2 GB install. Leave the endpoint blank to use the controller's configured keys.</div>
+          <div class="grid">
+            <div style="grid-column:span 2"><label>Inference endpoint (OpenAI-compatible)</label><input id="ag_url" value="@@AGENT_BASEURL@@" placeholder="http://host:11444/v1" onchange="document.getElementById('ag_model').value='';loadModels()"></div>
+            <div><label>API key</label><input id="ag_key" placeholder="blank if none"></div>
+            <div><label>Model</label><input id="ag_model" list="ag_models" value="@@AGENT_MODEL@@" placeholder="pick or type"><datalist id="ag_models"></datalist></div>
+          </div>
+          <div class="hint" id="ag_models_note" style="margin:-6px 0 10px">&nbsp;</div>
+          <div class="btns" style="align-items:center">
+            <label style="display:flex;align-items:center;gap:6px;margin:0"><input type="checkbox" id="ag_hermes" checked style="width:auto"> Hermes</label>
+            <label style="display:flex;align-items:center;gap:6px;margin:0"><input type="checkbox" id="ag_opencode" checked style="width:auto"> opencode</label>
+            <button class="btn pri" onclick="installAgents()">Install</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="sec">
+        <div class="sh">History<span class="r"><span id="hist_sum"></span><a href="#" onclick="histLoad(true);return false">Refresh</a><a href="#" onclick="histExport();return false">Export</a></span></div>
+        <div class="tl" id="hist"></div>
+      </div>
+
+      <div class="two">
+        <div class="sec">
+          <div class="sh">Recordings<span class="r" id="rec_sum"></span></div>
+          <div class="body"><video id="recplayer" controls preload="metadata" class="hidden" style="width:100%;max-height:420px;background:#000;border:1px solid var(--ln);border-radius:6px;margin-bottom:8px"></video>
+            <div class="recs" id="recs"></div></div>
+        </div>
+        <div class="sec">
+          <div class="sh">Notes<span class="r" id="notes_sum"></span></div>
+          <div class="body"><div id="notes"></div>
+            <div class="notes-add"><input id="n_who" placeholder="your name" maxlength="60"><input id="n_txt" placeholder="What is this sandbox for? What did you change?" onkeydown="if(event.key==='Enter')addNote()"><button class="btn" onclick="addNote()">Add</button></div></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- right -->
+  <div class="insp" id="insp">
+    <div class="ih" id="i_head">Fleet</div>
+    <!-- fleet mode -->
+    <div id="i_fleet">
+      <div class="grp"><div class="gl">Deskhand build</div>
+        <div class="fact wrap"><span>Staged</span><span id="pay">checking…</span></div>
+        <div class="hint">What Create installs and what Update rolls out.</div>
+        <div class="btns"><input id="tag" placeholder="latest" style="width:110px"><button class="btn" onclick="fetchDh()">Fetch from GitHub</button></div></div>
+      <div class="grp"><div class="gl">Connect an AI agent to every sandbox</div>
+        <div class="hint">One endpoint covers the fleet: this controller proxies each sandbox's Deskhand, so sandboxes created later show up as tools automatically.</div>
+        <div class="btns"><button class="btn" onclick="copyHub('claude')">Copy for Claude Code</button><button class="btn" onclick="copyHub('hermes')">Copy for Hermes</button></div>
+        <pre id="hubcmd" style="max-height:none"></pre>
+        <div class="hint"><b>Sandbox-only mode for Hermes:</b> scope a run with <code>hermes -t sandboxctl -z "…"</code>, or make it permanent with <code>hermes tools disable web browser terminal file code_execution</code>.</div></div>
+      <div class="grp"><div class="gl">Controller</div>
+        <div class="fact"><span>Template</span><span class="mono" id="i_tmpl">—</span></div>
+        <div class="fact"><span>Proxmox</span><span class="mono">@@PVEHOST@@ · @@PVENODE@@</span></div>
+        <div class="fact"><span>You</span><span class="who" id="i_who"></span></div></div>
+    </div>
+    <!-- sandbox mode -->
+    <div id="i_sb" class="hidden" style="display:flex;flex-direction:column;flex:1">
+      <div class="grp">
+        <div class="fact"><span>State</span><span id="i_state"></span></div>
+        <div class="fact"><span>Address</span><span class="mono" id="i_ip"></span></div>
+        <div class="fact"><span>Held by</span><span id="i_holder"></span></div>
+        <div class="fact wrap" id="i_purpose_row"><span>Purpose</span><span id="i_purpose"></span></div>
+        <div class="btns" id="i_claim_btns"></div>
+      </div>
+      <div class="grp">
+        <div class="gl">Expires <b id="i_exp" class="mono"></b></div>
+        <div class="seg" id="i_ttl">
+          <button onclick="setTtl(15)">15m</button><button onclick="setTtl(60)">1h</button><button onclick="setTtl(240)">4h</button><button onclick="setTtl(1440)">24h</button><button onclick="setTtl(0)">never</button>
+        </div>
+        <div class="btns"><button class="btn sm" onclick="extendTtl(60)">Extend 1 h</button></div>
+      </div>
+      <div class="grp">
+        <div class="gl">Isolation</div>
+        <div class="fact"><span>Egress</span><span>controller payload port only</span></div>
+        <div class="fact"><span>Recorder</span><span id="i_rec">—</span></div>
+        <div class="fact"><span>Groundhog</span><span id="i_gh">—</span></div>
+      </div>
+      <div class="grp" id="i_endpoint">
+        <div class="gl">Endpoint</div>
+        <div class="copy"><code id="i_mcp">—</code><button onclick="copyMcp('claude')">Claude</button></div>
+        <div class="copy"><code id="i_mcp2">—</code><button onclick="copyMcp('hermes')">Hermes</button></div>
+        <div class="copy"><code id="i_tok">—</code><button id="i_tokbtn" onclick="revealTok()">Reveal</button></div>
+        <div class="btns"><a class="btn sm" id="i_dh" href="#" target="_blank">Open Deskhand ↗</a><a class="btn sm" id="i_hermes" href="#" target="_blank">Hermes dashboard ↗</a></div>
+        <div class="hint hidden" id="i_hcred"></div>
+      </div>
+      <div class="grp">
+        <div class="gl">Maintain</div>
+        <div class="btns"><button class="btn" id="i_repair" onclick="rep()">Repair</button><button class="btn" id="i_update" onclick="upd()">Update Deskhand</button></div>
+      </div>
+      <div class="grp danger">
+        <div class="gl">Danger</div>
+        <div class="btns" id="i_danger"><button class="btn dng" onclick="armDestroy()">Destroy…</button></div>
+        <div class="hint" id="i_lost"></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+'use strict';
+const $ = id => document.getElementById(id);
+const PVE = { host: '@@PVEHOST@@', node: '@@PVENODE@@' };
+let fleet = [], fleetBy = {}, cap = null, jobsList = [];
+let sel = null, filter = 'all', query = '';
+let jobId = null, jobHidden = false;
+let screenTimer = null, armTimer = null, tokShown = false, GH_LIB = [], MODEL_CTX = {};
+
+function esc(s){ return String(s == null ? '' : s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'})[c]); }
+function toggle(id){ $(id).classList.toggle('hidden'); }
+function fmtWhen(ts){
+  const age = Date.now()/1000 - ts;
+  if (age < 60) return 'just now';
+  if (age < 3600) return Math.floor(age/60) + 'm ago';
+  if (age < 86400) return Math.floor(age/3600) + 'h ago';
+  const d = new Date(ts*1000);
+  return d.toLocaleDateString() + ' ' + d.toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'});
+}
+function hhmm(ts){ const d = new Date(ts*1000); return d.toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'}); }
+function fmtLeft(sec){
+  if (sec <= 0) return 'expired';
+  const h = Math.floor(sec/3600), m = Math.floor((sec%3600)/60);
+  if (h >= 48) return Math.floor(h/24) + ' d ' + (h%24) + ' h';
+  if (h) return h + ' h ' + (m < 10 ? '0' : '') + m + ' min';
+  if (m >= 2) return m + ' min';
+  return Math.floor(sec) + ' s';
+}
+async function getJSON(url, opts){
+  const r = await fetch(url, opts);
+  const d = await r.json().catch(() => ({}));
+  if (!r.ok && !d.error) d.error = 'HTTP ' + r.status;
+  return d;
+}
+function post(url, body){
+  return getJSON(url, {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
+}
+
+/* ---- identity: asked once, remembered ---- */
+function whoAmI(quiet){
+  let w = '';
+  try { w = localStorage.getItem('sbx-who') || ''; } catch(e){}
+  if (w || quiet) return w;
+  w = (prompt('Your name, so others know who holds a sandbox:') || '').trim().slice(0, 60);
+  if (w) { try { localStorage.setItem('sbx-who', w); } catch(e){} }
+  renderWho();
+  return w;
+}
+function renderWho(){
+  const w = whoAmI(true);
+  $('i_who').innerHTML = w ? esc(w) + ' · <a onclick="changeWho()">change</a>' : '<a onclick="changeWho()">set your name</a>';
+}
+function changeWho(){
+  const w = (prompt('Your name:', whoAmI(true)) || '').trim().slice(0, 60);
+  try { if (w) localStorage.setItem('sbx-who', w); else localStorage.removeItem('sbx-who'); } catch(e){}
+  renderWho(); renderList(); renderInspector();
+}
+
+/* ---- clipboard: plain http has no navigator.clipboard, so fall back ---- */
+function copyText(t, what, extra){
+  const shown = (what || 'Value') + ' copied to clipboard:\n\n' + t + (extra || '');
+  function viaTextarea(){
+    try {
+      const ta = document.createElement('textarea');
+      ta.value = t; ta.setAttribute('readonly', '');
+      ta.style.position = 'fixed'; ta.style.top = '-1000px'; ta.style.opacity = '0';
+      document.body.appendChild(ta); ta.select(); ta.setSelectionRange(0, t.length);
+      const ok = document.execCommand('copy');
+      document.body.removeChild(ta);
+      if (ok) { alert(shown); return true; }
+    } catch(e){}
+    return false;
+  }
+  try {
+    if (window.isSecureContext && navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(t).then(() => alert(shown), () => { if (!viaTextarea()) prompt((what||'Value') + ' (copy it):', t); });
+      return;
+    }
+  } catch(e){}
+  if (!viaTextarea()) prompt((what || 'Value') + ' (copy it):', t);
+}
+
+/* ---- the fleet ---- */
+async function refresh(){
+  try {
+    const [sb, c, js] = await Promise.all([getJSON('api/sandboxes'), getJSON('api/capacity'), getJSON('api/jobs')]);
+    if (Array.isArray(sb)) { fleet = sb; fleetBy = {}; fleet.forEach(s => fleetBy[s.vmid] = s); }
+    if (c && !c.error) cap = c;
+    if (Array.isArray(js)) jobsList = js;
+    renderTop(); renderList(); renderInspector();
+    if (sel !== null) {
+      if (!fleetBy[sel]) { clearSel(); }
+      else renderHeader();
+    }
+    const running = jobsList.find(j => !j.done);
+    if (running && !jobId) { jobId = running.id; jobHidden = false; pollJob(); }
+  } catch(e) {
+    $('rows').innerHTML = '<div class="empty bad">Could not load: ' + esc(e.message) + '</div>';
+  }
+}
+function renderTop(){
+  $('dk-host').textContent = location.hostname || '';
+  if (!cap) return;
+  const pct = (a, b) => b ? Math.min(100, Math.round(a/b*100)) : 0;
+  const cls = (left, max) => left === 0 ? 'full' : (left <= 1 && max > 2 ? 'hot' : '');
+  const running = jobsList.filter(j => !j.done);
+  $('cap').innerHTML =
+    '<span>sandboxes <b>' + cap.sandboxes + '</b>/' + cap.max_sandboxes + '<span class="bar"><i class="' + cls(cap.sandboxes_left, cap.max_sandboxes) + '" style="width:' + pct(cap.sandboxes, cap.max_sandboxes) + '%"></i></span></span>' +
+    '<span>running <b>' + cap.running + '</b>/' + cap.max_running + '<span class="bar"><i class="' + cls(cap.running_left, cap.max_running) + '" style="width:' + pct(cap.running, cap.max_running) + '%"></i></span></span>' +
+    '<span>jobs <b>' + running.length + '</b>' + (running.length ? ' <span class="job">· ' + esc(running[0].title) + '</span>' : '') + '</span>' +
+    '<span>template <b>' + esc(cap.template) + '</b></span>';
+  $('i_tmpl').textContent = cap.template || '—';
+}
+function setFilter(f){
+  filter = f;
+  document.querySelectorAll('#filters button').forEach(b => b.classList.toggle('on', b.dataset.f === f));
+  renderList();
+}
+function visible(s){
+  const me = whoAmI(true);
+  if (filter === 'running' && s.status !== 'running') return false;
+  if (filter === 'stopped' && s.status === 'running') return false;
+  if (filter === 'mine' && !(me && s.claimed_by === me)) return false;
+  if (filter === 'held' && !s.claimed_by) return false;
+  if (query) {
+    const q = query.toLowerCase();
+    if (String(s.vmid).indexOf(q) < 0 && (s.name || '').toLowerCase().indexOf(q) < 0 && (s.claimed_by || '').toLowerCase().indexOf(q) < 0) return false;
+  }
+  return true;
+}
+function rowSub(s){
+  const bits = [];
+  if (s.claimed_by) bits.push(s.claimed_by + (s.claim_purpose ? ' · ' + s.claim_purpose : ''));
+  else bits.push(s.status === 'running' ? 'unclaimed' : 'stopped');
+  if (s.expires_at) bits.push('<span class="tick" data-until="' + s.expires_at + '"></span>');
+  else if (s.expires === 'expired') bits.push('<span class="bad">expired</span>');
+  return bits.map((b, i) => i === 0 ? esc(b) : b).join(' · ');
+}
+function rowTags(s){
+  const t = [];
+  if (s.groundhog === 'failed') t.push('<span class="tag bad">groundhog failed</span>');
+  else if (s.groundhog === 'succeeded') t.push('<span class="tag ok">groundhog ✓</span>');
+  else if (s.groundhog === 'reboot-pending') t.push('<span class="tag warn">needs reboot</span>');
+  else if (s.groundhog && s.groundhog !== 'none') t.push('<span class="tag warn">groundhog ' + esc(s.groundhog) + '</span>');
+  if (s.status === 'running' && !s.token) t.push('<span class="tag bad">no token</span>');
+  if (s.notes) t.push('<span class="tag">' + s.notes + ' note' + (s.notes === 1 ? '' : 's') + '</span>');
+  return t.length ? '<div class="tags">' + t.join('') + '</div>' : '';
+}
+function renderList(){
+  const rows = fleet.filter(visible).sort((a, b) => (a.status === 'running' ? 0 : 1) - (b.status === 'running' ? 0 : 1) || a.vmid - b.vmid);
+  let html = rows.map(s =>
+    '<button class="row' + (sel === s.vmid ? ' sel' : '') + '" onclick="select(' + s.vmid + ')">' +
+    '<span class="dot ' + (s.status === 'running' ? 'run' : '') + '"></span><span>' +
+    '<span class="nm"><b>' + esc(s.name) + '</b><span class="id">' + s.vmid + '</span></span>' +
+    '<span class="sub">' + rowSub(s) + '</span>' + rowTags(s) + '</span></button>').join('');
+  // A create in flight is a row too: it is about to be a sandbox and it holds a slot.
+  jobsList.filter(j => !j.done && /^Creating /.test(j.title)).forEach(j => {
+    html += '<button class="row" onclick="followJob(\'' + esc(j.id) + '\')"><span class="dot busy"></span><span>' +
+      '<span class="nm"><b>' + esc(j.title.replace(/^Creating /, '')) + '</b><span class="id">—</span></span>' +
+      '<span class="sub">creating · ' + esc(j.last || '') + '</span></span></button>';
+  });
+  $('rows').innerHTML = html || '<div class="empty">' + (fleet.length ? 'Nothing matches.' : 'No sandboxes yet. Create one.') + '</div>';
+  const creating = jobsList.filter(j => !j.done && /^Creating /.test(j.title)).length;
+  $('listfoot').textContent = fleet.length + ' sandbox' + (fleet.length === 1 ? '' : 'es') +
+    (creating ? ' · ' + creating + ' creating' : '') + (cap ? ' · ' + cap.sandboxes_left + ' slots free' : '');
+  ticks();
+}
+function openFirst(){
+  const first = fleet.filter(visible)[0];
+  if (first) select(first.vmid);
+}
+function ticks(){
+  const now = Date.now()/1000;
+  document.querySelectorAll('.tick[data-until]').forEach(el => {
+    const left = Math.round(parseInt(el.dataset.until, 10) - now);
+    el.textContent = fmtLeft(left) + (left > 0 ? ' left' : '');
+    el.classList.toggle('soon', left < 15*60);
+  });
+}
+setInterval(ticks, 1000);
+
+/* ---- selecting ---- */
+function select(vmid){
+  if (sel === vmid) return;
+  stopScreen();
+  sel = vmid; tokShown = false;
+  try { localStorage.setItem('sbx-sel', String(vmid)); } catch(e){}
+  if (location.hash !== '#' + vmid) history.replaceState(null, '', '#' + vmid);
+  $('view-create').classList.add('hidden'); $('view-sb').classList.remove('hidden');
+  $('i_fleet').classList.add('hidden'); $('i_sb').classList.remove('hidden');
+  $('gh_editor').classList.add('hidden'); $('ag_form').classList.add('hidden');
+  $('recplayer').classList.add('hidden'); $('recplayer').src = '';
+  $('detail').scrollTop = 0;
+  renderList(); renderHeader(); renderInspector();
+  loadSections();
+}
+function clearSel(){
+  sel = null; stopScreen();
+  try { localStorage.removeItem('sbx-sel'); } catch(e){}
+  showCreate();
+}
+function showCreate(){
+  sel = null; stopScreen();
+  if (location.hash) history.replaceState(null, '', location.pathname);
+  $('view-sb').classList.add('hidden'); $('view-create').classList.remove('hidden');
+  $('i_sb').classList.add('hidden'); $('i_fleet').classList.remove('hidden');
+  $('i_head').textContent = 'Fleet';
+  renderList();
+  if (!$('c_profile').options.length || $('c_profile').options.length === 1) ghLoadLibrary();
+}
+function renderHeader(){
+  const s = fleetBy[sel]; if (!s) return;
+  $('s_name').textContent = s.name; $('s_vmid').textContent = 'vmid ' + s.vmid;
+  const st = $('s_state'); st.textContent = s.status; st.className = 'pill ' + (s.status === 'running' ? 'run' : '');
+  $('s_meta').textContent = (s.ip ? s.ip + ' · ' : '') + 'Deskhand :' + (s.port || 8791);
+  $('w_console').href = 'https://' + PVE.host + ':8006/?console=kvm&novnc=1&vmid=' + s.vmid + '&node=' + PVE.node + '&resize=off';
+  $('i_head').textContent = 'Inspector · ' + s.vmid;
+  if (s.status !== 'running') { stopScreen(); $('scr').classList.add('hidden'); $('scr_msg').textContent = 'not running'; $('scr_msg').classList.remove('hidden'); }
+  else if (!screenTimer) screenMode();
+}
+function loadSections(){
+  ghRefresh(); histLoad(); recLoad(); notesLoad(); agentsRender();
+}
+
+/* ---- console ---- */
+function screenMode(){
+  stopScreen();
+  const s = fleetBy[sel]; if (!s || s.status !== 'running') return;
+  const img = $('scr'), src = $('w_src').value, fps = $('w_fps').value;
+  img.classList.remove('hidden'); $('scr_msg').classList.add('hidden');
+  img.onerror = () => { $('scr_msg').textContent = src === 'deskhand' ? 'Deskhand capture needs a logged-in session.' : 'No frame yet: the recorder has not seen this screen.'; $('scr_msg').classList.remove('hidden'); };
+  if (src === 'still') {
+    $('scr_live').classList.add('hidden');
+    const tick = () => { if (sel === s.vmid) img.src = 'api/screen?vmid=' + s.vmid + '&quiet=1&t=' + Date.now(); };
+    tick(); screenTimer = setInterval(tick, 4000);
+  } else {
+    $('scr_live').classList.remove('hidden');
+    img.src = 'api/stream?vmid=' + s.vmid + '&src=' + src + '&fps=' + fps + '&t=' + Date.now();
+    screenTimer = -1;
+  }
+}
+function stopScreen(){
+  if (screenTimer && screenTimer !== -1) clearInterval(screenTimer);
+  screenTimer = null;
+  $('scr').src = ''; $('scr_live').classList.add('hidden');
+}
+
+/* ---- groundhog ---- */
+const GH_STARTERS = {
+  internals: 'version: 1\nextends: groundhog:windows-internals\n',
+  sysinternals: 'version: 1\nextends: groundhog:sysinternals\n',
+  apps: 'version: 1\napps:\n  - Git.Git\n  - Microsoft.VisualStudioCode\nverify:\n  - command: git --version\n',
+  secret: 'version: 1\nagent: ">=0.12.0"\nenv:\n  EXAMPLE_TOKEN: "${secret:API_TOKEN}"\nverify:\n  - command: if (-not $env:EXAMPLE_TOKEN) { exit 1 }\n'
+};
+async function ghLoadLibrary(){
+  try {
+    const d = await getJSON('api/groundhog/library');
+    GH_LIB = Array.isArray(d) ? d : [];
+  } catch(e) { GH_LIB = []; }
+  $('gh_lib').innerHTML = '<option value="">(pick one)</option>' + GH_LIB.map((p, i) => '<option value="' + i + '">' + esc(p.name) + '</option>').join('');
+  $('c_profile').innerHTML = '<option value="">Deskhand only</option>' + GH_LIB.map((p, i) => '<option value="' + i + '">' + esc(p.name) + '</option>').join('');
+  $('c_profile').onchange = () => { const p = GH_LIB[parseInt($('c_profile').value, 10)]; $('c_profnote').textContent = p ? (p.note || '') : ''; };
+}
+function ghLib(){
+  const p = GH_LIB[parseInt($('gh_lib').value, 10)];
+  if (!p) { $('gh_libnote').innerHTML = '&nbsp;'; return; }
+  $('gh_body').value = p.content; $('gh_tpl').value = ''; $('gh_libnote').textContent = p.note || '';
+}
+function ghStarter(){ const k = $('gh_tpl').value; if (k && GH_STARTERS[k]) $('gh_body').value = GH_STARTERS[k]; }
+async function ghRefresh(){
+  const vmid = sel; if (vmid === null) return;
+  if (!GH_LIB.length) ghLoadLibrary();
+  const d = await getJSON('api/groundhog?vmid=' + vmid).catch(e => ({error: e.message}));
+  if (vmid !== sel) return;
+  const sum = $('gh_sum'), steps = $('gh_steps'), kv = $('gh_kv'), out = $('gh_out');
+  if (d.error) { sum.textContent = 'could not read: ' + d.error; steps.innerHTML = ''; kv.innerHTML = ''; return; }
+  const o = d.outcome || 'none';
+  const ocls = o === 'succeeded' ? 'ok' : o === 'failed' ? 'bad' : o === 'none' ? 'muted' : 'warn';
+  const run = d.run || {};
+  const list = (run.steps || []);
+  const n = list.length, done = list.filter(x => x.status === 'done').length;
+  sum.innerHTML = '<span class="' + ocls + '">' + esc(o === 'none' ? 'nothing applied' : o) + (n ? ' ' + done + '/' + n : '') + '</span>' + (run.updated ? ' · ' + esc(run.updated) : '');
+  $('i_gh').innerHTML = '<span class="' + ocls + '">' + esc(o === 'none' ? 'none' : o) + '</span>';
+  steps.innerHTML = list.map(x => '<div class="step ' + (x.status === 'done' ? (x.changed ? 'changed' : 'done') : x.status === 'failed' ? 'failed' : '') + '" title="' + esc(x.title + (x.message ? ': ' + x.message : '')) + '"><i></i><span>' + esc(x.title) + '</span></div>').join('');
+  let rows = '';
+  if (d.failed_step) rows += '<dt class="bad">Failed at</dt><dd class="bad" style="white-space:normal">' + esc(d.failed_step + (d.failed_message ? ' — ' + d.failed_message : '')) + '</dd>';
+  if (o === 'reboot-pending') rows += '<dt>Waiting</dt><dd style="white-space:normal">for a restart; it continues at the next logon</dd>';
+  if (run.agent) rows += '<dt>Agent</dt><dd>' + esc(run.agent) + '</dd>';
+  if (d.status && !n) rows += '<dt>Status</dt><dd style="white-space:normal">' + esc(d.status) + '</dd>';
+  kv.innerHTML = rows;
+  $('gh_detail').classList.toggle('hidden', !rows);
+  if (n) {
+    out.textContent = list.map(x => (x.status === 'done' ? '  ok  ' : x.status === 'failed' ? ' FAIL ' : '  ..  ') + x.title + (x.changed ? '   (changed)' : '') + (x.message ? '\n        ' + x.message : '')).join('\n');
+  } else if (d.status) out.textContent = d.status;
+  else out.textContent = 'No run recorded for this sandbox yet.';
+}
+function ghPost(extra){
+  return post('api/groundhog', Object.assign({vmid: sel, content: $('gh_body').value, secrets: $('gh_secrets').value, allow_reboot: $('gh_reboot').checked}, extra || {}));
+}
+async function ghPlan(){
+  const out = $('gh_out');
+  if (!$('gh_body').value.trim()) { out.textContent = 'The editor is empty. Pick a shipped profile or a starter first.'; return; }
+  out.textContent = 'validating in the sandbox… plan resolves extends and downloads, so give it a moment.';
+  try { const d = await ghPost({plan: true}); out.textContent = d.error ? 'plan could not run: ' + d.error : (d.ok ? 'valid — these are the steps it would take:' : 'plan rejected it:') + '\n\n' + d.output; }
+  catch(e) { out.textContent = 'plan could not run: ' + e.message; }
+}
+async function ghApply(){
+  const out = $('gh_out');
+  if (!$('gh_body').value.trim()) { out.textContent = 'The editor is empty. Pick a shipped profile or a starter first.'; return; }
+  out.textContent = 'applying… it runs in the sandbox, so this panel follows along.';
+  try {
+    const d = await ghPost({});
+    if (d.error) { out.textContent = 'could not start the apply: ' + d.error; return; }
+    let n = 0;
+    const timer = setInterval(async () => { n++; await ghRefresh(); const o = $('gh_sum').textContent; if (n > 90 || /succeeded|failed|reboot-pending/.test(o)) { clearInterval(timer); histLoad(true); } }, 5000);
+    ghRefresh();
+  } catch(e) { out.textContent = 'could not start the apply: ' + e.message; }
+}
+
+/* ---- agents ---- */
+function agentsRender(){
+  const s = fleetBy[sel]; if (!s) return;
+  const a = s.agents || {}, inst = a.installed || [], cells = [];
+  cells.push('<div class="ag"><b>Deskhand</b><div class="st ' + (s.token ? 'ok' : 'off') + '">' + (s.token ? '✓ listening :' + (s.port || 8791) : (s.status === 'running' ? 'no token — Repair' : 'not running')) + '</div></div>');
+  cells.push('<div class="ag"><b>Hermes</b><div class="st ' + (inst.indexOf('hermes') >= 0 ? 'ok' : 'off') + '">' + (inst.indexOf('hermes') >= 0 ? '✓ installed' + (a.dashboard_port ? ' · dashboard :' + a.dashboard_port : '') : 'not installed') + '</div></div>');
+  cells.push('<div class="ag"><b>opencode</b><div class="st ' + (inst.indexOf('opencode') >= 0 ? 'ok' : 'off') + '">' + (inst.indexOf('opencode') >= 0 ? '✓ installed · terminal app, run it on the desktop' : 'not installed') + '</div></div>');
+  inst.filter(x => x !== 'hermes' && x !== 'opencode').forEach(x => cells.push('<div class="ag"><b>' + esc(x) + '</b><div class="st ok">✓ installed</div></div>'));
+  $('ag_cells').innerHTML = cells.join('');
+  $('ag_sum').textContent = (s.token ? 1 : 0) + inst.length + ' up';
+  if (!$('ag_form').classList.contains('hidden') && !$('ag_models').options.length) loadModels();
+}
+async function loadModels(){
+  const note = $('ag_models_note'), list = $('ag_models'), url = $('ag_url').value.trim();
+  note.textContent = 'checking the endpoint…'; list.innerHTML = '';
+  try {
+    const d = await getJSON('api/models' + (url ? '?base_url=' + encodeURIComponent(url) : ''));
+    if (d.error) { note.textContent = 'could not reach ' + (d.base_url || 'the endpoint') + ': ' + d.error; return; }
+    if (!d.models.length) { note.textContent = d.base_url ? 'no models reported by ' + d.base_url : 'no endpoint set'; return; }
+    list.innerHTML = d.models.map(m => {
+      const c = m.ctx_loaded || m.ctx_max;
+      return '<option value="' + esc(m.id) + '">' + (m.loaded ? 'loaded' : 'available') + (c ? ' · ' + (c >= 1024 ? Math.round(c/1024) + 'k' : c) + ' ctx' : '') + (m.size_mb ? ' · ' + (m.size_mb/1024).toFixed(1) + ' GB' : '') + '</option>';
+    }).join('');
+    MODEL_CTX = {}; d.models.forEach(m => MODEL_CTX[m.id] = m.ctx_loaded || m.ctx_max || 0);
+    const loaded = d.models.filter(m => m.loaded), box = $('ag_model');
+    if (!box.value) box.value = (loaded[0] || d.models[0]).id;
+    const pick = MODEL_CTX[box.value] || 0;
+    const warn = (pick && pick < 32768) ? ((pick >= 1024 ? Math.round(pick/1024) + 'k' : pick) + ' context may be too small (Deskhand alone is ~83 tools) · ') : '';
+    note.textContent = warn + d.models.length + ' model' + (d.models.length === 1 ? '' : 's') + ' at ' + d.base_url + (loaded.length ? ' · loaded: ' + loaded.map(m => m.id).join(', ') : ' · none loaded');
+  } catch(e) { note.textContent = 'could not list models: ' + e.message; }
+}
+async function installAgents(){
+  if (sel === null) return;
+  const list = [];
+  if ($('ag_hermes').checked) list.push('hermes');
+  if ($('ag_opencode').checked) list.push('opencode');
+  if (!list.length) { alert('Pick at least one agent.'); return; }
+  const body = {vmid: sel, agents: list};
+  const u = $('ag_url').value.trim(), k = $('ag_key').value.trim(), md = $('ag_model').value.trim();
+  if (u) body.base_url = u; if (k) body.api_key = k; if (md) body.model = md;
+  if (MODEL_CTX[md]) body.context_length = MODEL_CTX[md];
+  $('ag_form').classList.add('hidden');
+  const d = await post('api/agents', body); followJob(d.id);
+}
+function agForm(){ toggle('ag_form'); if (!$('ag_form').classList.contains('hidden') && !$('ag_models').options.length) loadModels(); }
+
+/* ---- history ---- */
+let HIST = [];
+function histKind(w){
+  w = (w || '').toLowerCase();
+  if (/destroy/.test(w)) return ['red', 'end'];
+  if (/expir/.test(w)) return ['acc', 'expiry'];
+  if (/claim|release/.test(w)) return ['acc', 'custody'];
+  if (/groundhog|install|update|repair|provision|deskhand/.test(w)) return ['sq ok', 'provision'];
+  if (/note|comment/.test(w)) return ['', 'note'];
+  if (/record|screen|file/.test(w)) return ['sq dim', 'evidence'];
+  if (/boot|start|stop|clone|creat|reboot|shutdown|reset|resume|suspend/.test(w)) return ['', 'lifecycle'];
+  return ['dim', 'event'];
+}
+async function histLoad(force){
+  const vmid = sel; if (vmid === null) return;
+  const d = await getJSON('api/history?vmid=' + vmid + '&guest=0').catch(e => ({error: e.message}));
+  if (vmid !== sel) return;
+  if (d.error) { $('hist').innerHTML = '<div class="t"></div><div class="m"><i class="red"></i></div><div class="e bad">could not load: ' + esc(d.error) + '</div>'; return; }
+  HIST = d.events || [];
+  const s = fleetBy[vmid] || {};
+  let html = HIST.map(e => {
+    const k = histKind(e.what), cls = k[0] + (e.ok === false ? ' red' : '');
+    return '<div class="t" title="' + esc(e.when) + '">' + hhmm(e.ts) + '</div><div class="m"><i class="' + cls + '"></i></div>' +
+      '<div class="e"><span class="k">' + k[1] + '</span><b>' + esc(e.what) + '</b>' + (e.count > 1 ? '<span class="n">×' + e.count + (e.last ? ' · last ' + hhmm(e.last) : '') + '</span>' : '') +
+      (e.detail ? '<p title="' + esc(e.detail) + '">' + esc(e.detail) + '</p>' : '') + '</div>';
+  }).join('');
+  if (s.expires_at) html += '<div class="t">' + hhmm(s.expires_at) + '</div><div class="m"><i class="grey"></i></div><div class="e future"><span class="k">expiry</span><b>Scheduled destroy</b><p>unless extended · a held sandbox is left alone until its claim lapses</p></div>';
+  $('hist').innerHTML = html || '<div class="t"></div><div class="m"><i class="dim"></i></div><div class="e muted">Nothing recorded yet.</div>';
+  $('hist_sum').textContent = HIST.length + ' event' + (HIST.length === 1 ? '' : 's') + ' · controller and Proxmox';
+}
+function histExport(){
+  const s = fleetBy[sel] || {};
+  const text = ['# ' + (s.name || sel) + ' (vmid ' + sel + ')', ''].concat(HIST.map(e => e.when + '  ' + e.what + (e.count > 1 ? ' x' + e.count : '') + (e.detail ? '  — ' + e.detail : ''))).join('\n');
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob([text], {type: 'text/plain'}));
+  a.download = (s.name || sel) + '-history.txt'; a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+}
+
+/* ---- recordings ---- */
+async function recLoad(){
+  const vmid = sel; if (vmid === null) return;
+  const d = await getJSON('api/recordings?vmid=' + vmid).catch(e => ({error: e.message}));
+  if (vmid !== sel) return;
+  const box = $('recs'), sum = $('rec_sum');
+  if (d.error) { box.innerHTML = '<span class="bad">' + esc(d.error) + '</span>'; return; }
+  if (!d.enabled) { box.innerHTML = '<span class="muted">Recording is off: set recordings_dir in the controller config.</span>'; sum.textContent = 'off'; $('i_rec').textContent = 'off'; return; }
+  const st = (d.status || {})[String(vmid)];
+  const now = st && st.recording;
+  $('i_rec').innerHTML = now ? '<span class="ok">recording</span>' : '<span class="muted">idle</span>';
+  const total = d.items.reduce((a, it) => a + it.size, 0);
+  sum.textContent = d.items.length + ' · ' + (total/1048576).toFixed(0) + ' MB' + (now ? ' · recording now' : '') + ' · kept ' + d.retention_days + ' d' + (st && st.error ? ' · ' + st.error : '');
+  if (!d.items.length) { box.innerHTML = '<span class="muted">Nothing recorded yet.</span>'; return; }
+  box.innerHTML = d.items.map(it => {
+    const t = it.started, pretty = t.slice(0,4) + '-' + t.slice(4,6) + '-' + t.slice(6,8) + ' ' + t.slice(9,11) + ':' + t.slice(11,13);
+    const live = (st && st.file === it.file) ? ' <span class="tag ok">live</span>' : '';
+    return '<div class="it"><span class="mono">' + pretty + live + '</span><span class="muted">' + (it.size/1048576).toFixed(1) + ' MB</span>' +
+      '<span><a href="#" onclick="playRec(\'' + esc(it.file) + '\');return false">Play</a> · <a href="api/recording?file=' + encodeURIComponent(it.file) + '" download>Download</a></span></div>';
+  }).join('');
+}
+function playRec(file){
+  const v = $('recplayer'); v.classList.remove('hidden'); v.src = 'api/recording?file=' + encodeURIComponent(file); v.play().catch(() => {});
+}
+
+/* ---- notes ---- */
+async function notesLoad(){
+  const vmid = sel; if (vmid === null) return;
+  const list = await getJSON('api/comments?vmid=' + vmid).catch(() => []);
+  if (vmid !== sel) return;
+  const w = whoAmI(true); if (w && !$('n_who').value) $('n_who').value = w;
+  if (!Array.isArray(list) || !list.length) { $('notes').innerHTML = '<p class="muted" style="margin:0">No notes yet. The next person here will not know what this box is for.</p>'; $('notes_sum').textContent = '0'; return; }
+  $('notes').innerHTML = list.map(c => '<div class="note"><span class="who">' + esc(c.author) + '</span><span class="when">' + fmtWhen(c.ts) + '</span><span class="via">' + esc(c.via) + (c.addr ? ' · ' + esc(c.addr) : '') + '</span><div class="what">' + esc(c.text) + '</div></div>').join('');
+  $('notes_sum').textContent = String(list.length);
+}
+async function addNote(){
+  const txt = $('n_txt'); if (!txt.value.trim() || sel === null) return;
+  const d = await post('api/comment', {vmid: sel, text: txt.value, author: $('n_who').value});
+  if (d.error) { alert(d.error); return; }
+  txt.value = ''; notesLoad(); histLoad(true); refresh();
+}
+
+/* ---- inspector ---- */
+function renderInspector(){
+  const s = fleetBy[sel]; if (!s) return;
+  const me = whoAmI(true), running = s.status === 'running';
+  $('i_state').innerHTML = '<span class="' + (running ? 'ok' : 'muted') + '">' + esc(s.status) + '</span>';
+  $('i_ip').textContent = s.ip || '—';
+  $('i_holder').innerHTML = s.claimed_by ? esc(s.claimed_by) + (s.claim_minutes_left != null ? ' <span class="muted">· ' + s.claim_minutes_left + ' min</span>' : '') : '<span class="muted">nobody</span>';
+  $('i_purpose_row').classList.toggle('hidden', !s.claim_purpose);
+  $('i_purpose').textContent = s.claim_purpose || '';
+  let cb = '';
+  if (running) {
+    if (!s.claimed_by) cb = '<button class="btn sm" onclick="claim()">Claim</button>';
+    else if (s.claimed_by === me) cb = '<button class="btn sm" onclick="release()">Release</button>';
+    else cb = '<button class="btn sm" onclick="claim()" title="Takes it over; the holder is told by the history">Reclaim as ' + esc(me || 'me') + '</button>';
+  }
+  $('i_claim_btns').innerHTML = cb;
+  const ex = $('i_exp');
+  if (s.expires_at) { ex.innerHTML = '<span class="tick" data-until="' + s.expires_at + '"></span>'; ticks(); }
+  else ex.textContent = s.expires === 'expired' ? 'expired' : 'never';
+  const mins = s.expires_at ? Math.round((s.expires_at - Date.now()/1000)/60) : 0;
+  document.querySelectorAll('#i_ttl button').forEach(b => {
+    const v = parseInt(b.textContent, 10);
+    const on = b.textContent === 'never' ? !s.expires_at : (s.expires_at && Math.abs(mins - (b.textContent.endsWith('h') ? v*60 : v)) <= 5);
+    b.classList.toggle('on', !!on);
+  });
+  $('i_mcp').textContent = s.mcp_url || (running ? 'no token' : '—');
+  $('i_mcp2').textContent = s.mcp_url ? 'hermes mcp add ' + s.name + ' …' : '—';
+  $('i_tok').textContent = s.token ? (tokShown ? s.token : 'Bearer ' + s.token.slice(0, 6) + '••••••••') : '—';
+  $('i_tokbtn').textContent = tokShown ? 'Copy' : 'Reveal';
+  $('i_dh').classList.toggle('hidden', !s.deskhand_url); if (s.deskhand_url) $('i_dh').href = s.deskhand_url;
+  const a = s.agents || {};
+  const hermes = a.dashboard_port && (a.installed || []).indexOf('hermes') >= 0 && s.ip;
+  $('i_hermes').classList.toggle('hidden', !hermes); if (hermes) $('i_hermes').href = 'http://' + s.ip + ':' + a.dashboard_port + '/';
+  $('i_hcred').classList.toggle('hidden', !a.dashboard_password);
+  if (a.dashboard_password) $('i_hcred').innerHTML = 'Hermes sign-in: user <code>' + esc(a.dashboard_user || 'sandbox') + '</code> · pass <code>' + esc(a.dashboard_password) + '</code>';
+  $('i_repair').textContent = s.token ? 'Repair' : 'Finish setup';
+  $('i_update').disabled = !s.token;
+  $('i_lost').textContent = 'Destroying removes the VM and its disk. Recordings and notes stay on the controller.';
+}
+async function claim(){
+  const who = whoAmI(); if (!who) return;
+  const purpose = (prompt('What for? (optional, shown to whoever looks next)') || '').trim();
+  const d = await post('api/claim', {vmid: sel, who, purpose, minutes: 120});
+  if (d.error) { alert('Could not claim it: ' + d.error); return; }
+  refresh(); histLoad(true);
+}
+async function release(){
+  const d = await post('api/claim', {vmid: sel, who: whoAmI(true), release: true});
+  if (d.error) { alert('Could not release it: ' + d.error); return; }
+  refresh(); histLoad(true);
+}
+async function setTtl(minutes){
+  const d = await post('api/expiry', {vmid: sel, minutes, who: whoAmI(true)});
+  if (d.error) { alert('Could not set the expiry: ' + d.error); return; }
+  refresh(); histLoad(true);
+}
+async function extendTtl(minutes){
+  const s = fleetBy[sel]; if (!s) return;
+  const left = s.expires_at ? Math.max(0, Math.round((s.expires_at - Date.now()/1000)/60)) : 0;
+  await setTtl(left + minutes);
+}
+function revealTok(){
+  const s = fleetBy[sel]; if (!s || !s.token) return;
+  if (!tokShown) { tokShown = true; renderInspector(); return; }
+  copyText(s.token, 'Deskhand token');
+}
+function copyMcp(kind){
+  const s = fleetBy[sel]; if (!s || !s.token) { alert('No token yet: this sandbox is not reachable.'); return; }
+  const url = 'http://' + s.ip + ':' + (s.port || 8791) + '/mcp';
+  // Hermes has no flag for a header value: --auth header makes it ask, so the
+  // token goes in the note rather than the command line.
+  const cmd = kind === 'hermes' ? 'hermes mcp add ' + s.name + ' --url ' + url + ' --auth header'
+                                : 'claude mcp add --transport http ' + s.name + ' ' + url + ' --header "Authorization: Bearer ' + s.token + '"';
+  const note = kind === 'hermes' ? '\n\nHermes will ask "Does this server require authentication?" - answer yes,\nchoose a header, and give it:\n\n  Authorization: Bearer ' + s.token : '';
+  copyText(cmd, 'MCP command', note);
+}
+function hubCmd(kind){
+  const url = location.origin + '/mcp';
+  return kind === 'hermes' ? 'hermes mcp add sandboxctl --url ' + url + ' --connect-timeout 180' : 'claude mcp add --transport http sandboxctl ' + url;
+}
+function copyHub(kind){ copyText(hubCmd(kind), 'Command'); }
+
+/* ---- destructive: two steps, and the second one names the sandbox ---- */
+function armDestroy(){
+  const s = fleetBy[sel]; if (!s) return;
+  $('i_danger').innerHTML = '<button class="btn dng solid" onclick="destroy()">Destroy ' + esc(s.name) + ' (' + s.vmid + ')</button><button class="btn sm" onclick="disarm()">Cancel</button>';
+  clearTimeout(armTimer); armTimer = setTimeout(disarm, 10000);
+}
+function disarm(){ clearTimeout(armTimer); $('i_danger').innerHTML = '<button class="btn dng" onclick="armDestroy()">Destroy…</button>'; }
+async function destroy(){
+  const vmid = sel; disarm();
+  const d = await post('api/destroy', {vmid});
+  if (d.error) { alert(d.error); return; }
+  followJob(d.id);
+}
+async function rep(){ const d = await post('api/repair', {vmid: sel}); if (d.error) { alert(d.error); return; } followJob(d.id); }
+async function upd(){ const d = await post('api/update', {vmid: sel}); if (d.error) { alert(d.error); return; } followJob(d.id); }
+
+/* ---- create ---- */
+async function create(){
+  const b = $('c_go'); b.disabled = true;
+  const p = GH_LIB[parseInt($('c_profile').value, 10)];
+  const body = {
+    name: $('c_name').value, cores: +$('c_cores').value, memory: +$('c_mem').value, port: +$('c_port').value,
+    shell: $('c_shell').value === '1', tls: $('c_tls').value === '1',
+    expires_in_minutes: +$('c_ttl').value, who: whoAmI(true)
+  };
+  if (p) body.groundhog = p.url;
+  try {
+    const d = await post('api/create', body);
+    if (d.error) { alert('Could not create it: ' + d.error); return; }
+    $('c_name').value = ''; followJob(d.id); refresh();
+  } finally { b.disabled = false; }
+}
+
+/* ---- jobs ---- */
+function followJob(id){ if (!id) return; jobId = id; jobHidden = false; pollJob(); }
+function hideJob(){ jobHidden = true; $('jobbox').classList.add('hidden'); }
+async function pollJob(){
+  if (!jobId) return;
+  const j = await getJSON('api/job?id=' + jobId).catch(() => null);
+  if (!j || j.error) { jobId = null; return; }
+  if (!jobHidden) {
+    $('jobbox').classList.remove('hidden');
+    $('jobtitle').textContent = j.title + (j.done ? (j.failed ? ' — failed' : ' — done') : '');
+    $('jobelapsed').textContent = j.elapsed + ' s';
+    let t = j.lines.join('\n');
+    if (j.done && j.result && j.result.url) t += '\n\nOPEN: ' + j.result.url + '\nTOKEN: ' + j.result.token;
+    const pre = $('joblog'); const stick = pre.scrollTop + pre.clientHeight >= pre.scrollHeight - 4;
+    pre.textContent = t; if (stick) pre.scrollTop = pre.scrollHeight;
+  }
+  if (j.done) {
+    const id = jobId; jobId = null; refresh(); payload();
+    if (sel !== null) loadSections();
+    if (j.vmid && /^Creating /.test(j.title) && !j.failed) { setTimeout(() => { if (fleetBy[j.vmid]) select(j.vmid); }, 1500); }
+    return;
+  }
+  setTimeout(pollJob, 2000);
+}
+
+/* ---- fleet-level odds and ends ---- */
+async function payload(){
+  try {
+    const d = await getJSON('api/payload'), el = $('pay');
+    if (!d.kind) { el.innerHTML = '<span class="bad">nothing staged — Create and Update will fail</span>'; return; }
+    el.textContent = (d.tag ? d.tag + ' ' : '') + (d.asset || d.kind) + ' · ' + (d.size/1048576).toFixed(1) + ' MB · ' + (d.fetched || d.mtime || '');
+  } catch(e) { $('pay').textContent = 'could not read'; }
+}
+async function fetchDh(){
+  const tag = $('tag').value.trim();
+  const d = await post('api/fetch', tag ? {tag} : {}); followJob(d.id);
+}
+document.addEventListener('keydown', e => {
+  if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'k') { e.preventDefault(); $('q').focus(); $('q').select(); }
+  if (e.key === 'Escape' && document.activeElement === $('q')) { $('q').value = ''; query = ''; renderList(); $('q').blur(); }
+});
+window.addEventListener('hashchange', () => { const v = parseInt(location.hash.slice(1), 10); if (v && fleetBy[v]) select(v); else if (!location.hash) showCreate(); });
+document.addEventListener('visibilitychange', () => { if (document.hidden) stopScreen(); else if (sel !== null) screenMode(); });
+
+/* ---- start ---- */
+$('hubcmd').textContent = '# Claude Code\n' + hubCmd('claude') + '\n\n# Hermes\n' + hubCmd('hermes');
+renderWho(); ghLoadLibrary(); payload();
+refresh().then(() => {
+  let last = parseInt((location.hash || '').slice(1), 10) || null;
+  if (!last) { try { last = parseInt(localStorage.getItem('sbx-sel'), 10); } catch(e){} }
+  if (last && fleetBy[last]) select(last);
+});
+setInterval(() => { refresh(); if (sel !== null && !jobId) { ghRefresh(); recLoad(); } }, 10000);
+setInterval(() => { if (sel !== null) histLoad(); }, 30000);
+</script></body></html>
