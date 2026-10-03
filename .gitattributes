@@ -1,6 +1,8 @@
-# Shell scripts run on the Proxmox node: CRLF breaks the shebang.
-*.sh   text eol=lf
+# The controller files are copied to a Linux host byte for byte by tools/deploy.sh,
+# so they must be LF in the working copy too, whatever core.autocrlf says here.
 *.py   text eol=lf
-# PowerShell and answer files are consumed by Windows.
-*.ps1  text eol=crlf
-*.xml  text eol=crlf
+*.sh   text eol=lf
+*.html text eol=lf
+*.yaml text eol=lf
+*.md   text eol=lf
+*.json text eol=lf
