@@ -4090,6 +4090,28 @@ textarea:focus-visible,select:focus-visible{outline:2px solid var(--acc);outline
 .bay-keys .k .dot.bad{background:var(--bad)}
 .bay-keys .k.sep{margin-left:auto}
 .bay-host{padding-top:12px}
+/* ---- the split: fleet left, bay right and sticky ---- */
+.split{display:grid;grid-template-columns:minmax(0,1fr);gap:0 18px;align-items:start}
+.split>.left{min-width:0}
+.split>.right{min-width:0}
+@media(min-width:1180px){
+  .split{grid-template-columns:minmax(0,1fr) 420px}
+  /* Sticky is the whole point: the panel changes without the page moving, and a
+     tall panel scrolls in the rail instead of growing the document. */
+  .split>.right{position:sticky;top:10px;max-height:calc(100vh - 20px);overflow:auto;
+    scrollbar-color:var(--ln3) var(--bezel)}
+  .split>.right::-webkit-scrollbar{width:10px}
+  .split>.right::-webkit-scrollbar-track{background:var(--bezel)}
+  .split>.right::-webkit-scrollbar-thumb{background:var(--ln3)}
+  /* Panels were written for full width; in a 420px rail they go single file. */
+  .split>.right .grid{grid-template-columns:minmax(0,1fr)!important}
+  .split>.right .two{grid-template-columns:minmax(0,1fr)}
+  .split>.right #baycard{margin-bottom:0}
+  .split>.right textarea{min-height:160px}
+  .split>.right img{max-width:100%;height:auto}
+}
+/* Keys wrap rather than scroll sideways in a narrow rail. */
+.bay-keys{row-gap:5px}
 .bay-host > .card{background:none;border:0;border-radius:0;padding:0;margin:0}
 .bay-host > .card[style*="display:none"]{display:none!important}
 .sel-mark{color:var(--acc);font:12px ui-monospace,Consolas,monospace}
@@ -4812,9 +4834,11 @@ function baySelect(vmid){
   var c = document.getElementById('baycard');
   c.style.display = 'block';
   bayRender();
-  // Only scroll on the first open: re-selecting while reading should not yank
-  // the page around.
-  if (first) c.scrollIntoView({behavior:'smooth', block:'nearest'});
+  // In the rail the bay is already on screen, so scrolling to it would move the
+  // page for no reason. Only the stacked layout needs the nudge.
+  var railed = window.matchMedia('(min-width:1180px)').matches
+               && document.querySelector('.split');
+  if (first && !railed) c.scrollIntoView({behavior:'smooth', block:'nearest'});
   refresh();
 }
 
@@ -4907,6 +4931,32 @@ function bayRun(id){
   if (id === 'repair') rep(baySel);
   if (id === 'upd')    upd(baySel);
   if (id === 'destroy')destroy(baySel);
+}
+
+// Build the split: the fleet on the left, the bay in a sticky rail on the
+// right. Done here rather than in the template so it is reversible and cannot
+// lose a closing tag -- and so the rail only exists when the bay does.
+function bayLayout(){
+  var wrap = document.querySelector('.wrap');
+  var deck = document.querySelector('.card.deck');
+  var top  = document.querySelector('.deck-top');
+  var bay  = document.getElementById('baycard');
+  if (!wrap || !deck || !bay || document.querySelector('.split')) return;
+  var split = document.createElement('div');
+  split.className = 'split';
+  // The split sits where the status bar was, so flex order still governs what
+  // comes before and after it.
+  split.style.order = 3;
+  var left = document.createElement('div');
+  left.className = 'left';
+  var right = document.createElement('div');
+  right.className = 'right';
+  wrap.insertBefore(split, top || deck);
+  if (top) left.appendChild(top);
+  left.appendChild(deck);
+  right.appendChild(bay);
+  split.appendChild(left);
+  split.appendChild(right);
 }
 
 // Relocate the existing panels into the bay once, at load. Their markup and
@@ -5147,7 +5197,7 @@ async function resume(){
     if(!running) jobId=null;
   }catch(e){}
 }
-bayAdopt(); showHub(); refresh(); payload(); resume(); setInterval(()=>{if(!jobId){refresh();payload();}},10000);
+bayLayout(); bayAdopt(); showHub(); refresh(); payload(); resume(); setInterval(()=>{if(!jobId){refresh();payload();}},10000);
 </script></body></html>"""
 
 
