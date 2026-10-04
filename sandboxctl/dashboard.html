@@ -95,12 +95,18 @@ pre{margin:0;background:var(--inset);border:1px solid var(--ln);border-radius:6p
 .fb img{display:block;width:100%;height:auto;max-height:70vh;object-fit:contain;background:#000}
 .fb .live{position:absolute;top:8px;right:8px;font-size:10px;color:#fff;background:#DC2626;padding:1px 6px;border-radius:3px;font-weight:600}
 .fb .msg{color:var(--mut);font-size:12px;padding:20px;text-align:center}
-.steps{display:flex;flex-wrap:wrap;gap:6px;padding:10px 12px 6px}
-.step{display:inline-flex;align-items:center;gap:6px;font-size:12px;color:var(--fg2);background:var(--inset);border:1px solid var(--ln);border-radius:999px;padding:3px 10px;max-width:100%}
-.step i{width:7px;height:7px;border-radius:50%;background:var(--ln3);flex:none}
-.step.done i{background:var(--ok)} .step.failed i{background:var(--bad)} .step.changed i{background:var(--acc)}
-.step.failed{color:var(--bad);border-color:#5A2A2A;background:var(--bad-bg)}
-.step span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.steps{display:flex;flex-direction:column;padding:6px 0 2px}
+.step{display:grid;grid-template-columns:16px 76px minmax(0,1fr) auto;gap:10px;align-items:baseline;padding:4px 12px;font-size:12px;border-bottom:1px solid var(--ln2)}
+.step:last-child{border-bottom:0}
+.step i{font-style:normal;text-align:center;color:var(--dim)}
+.step .k{font-size:10px;letter-spacing:.08em;text-transform:uppercase;color:var(--mut)}
+.step .s{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--fg2);font-family:var(--mono);font-size:11.5px}
+.step .o{font-size:11px;color:var(--mut);white-space:nowrap}
+.step.done i{color:var(--ok)}
+.step.changed i{color:var(--acc)} .step.changed .o{color:var(--acc)}
+.step.failed i{color:var(--bad)} .step.failed .o{color:var(--bad)} .step.failed .s{color:var(--bad)}
+.step.pending i{color:var(--warn)} .step.pending .o{color:var(--warn)}
+.stepsum{padding:6px 12px 2px;font-size:11px;color:var(--mut)}
 .kv{display:grid;grid-template-columns:auto minmax(0,1fr);gap:4px 12px;font-size:12px;margin:0}
 .kv dt{color:var(--mut);margin:0}.kv dd{margin:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .agents{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:1px;background:var(--ln2)}
@@ -250,30 +256,8 @@ details.adv>summary{cursor:pointer;color:var(--mut);font-size:12px;margin-bottom
           <div class="fb"><img id="scr" alt="" class="hidden"><span class="live hidden" id="scr_live">LIVE</span><div class="msg" id="scr_msg">not running</div></div>
         </div>
         <div class="sec">
-          <div class="sh">Groundhog<span class="r"><span id="gh_sum"></span><a onclick="toggle('gh_editor');return false" href="#">Edit profile</a></span></div>
-          <div class="steps" id="gh_steps"></div>
-          <div class="body" id="gh_detail" style="padding-top:4px"><dl class="kv" id="gh_kv"></dl></div>
-          <div class="body hidden" id="gh_editor" style="border-top:1px solid var(--ln2)">
-            <div class="hint" style="margin-bottom:10px">Groundhog brings a sandbox to a declared state from one file: apps, files, registry, environment, and its own checks. <b>Validate</b> runs its <code>plan</code> in the guest and changes nothing; <b>Apply</b> runs it for real. Name secrets as <code>${secret:NAME}</code> and give the values below; they are stripped from the guest as the agent reads them and never logged.</div>
-            <div class="grid">
-              <div><label>Shipped profile</label><select id="gh_lib" onchange="ghLib()"><option value="">loading…</option></select></div>
-              <div><label>Or a starter</label><select id="gh_tpl" onchange="ghStarter()">
-                <option value="">(keep the editor)</option>
-                <option value="internals">groundhog:windows-internals</option>
-                <option value="sysinternals">groundhog:sysinternals only</option>
-                <option value="apps">a couple of winget apps</option>
-                <option value="secret">pass a secret into the environment</option></select></div>
-              <div><label>Secrets (NAME=value per line)</label><input id="gh_secrets" placeholder="API_TOKEN=…"></div>
-            </div>
-            <div class="hint" id="gh_libnote" style="margin:-6px 0 8px">&nbsp;</div>
-            <textarea id="gh_body" spellcheck="false" rows="12"></textarea>
-            <div class="btns" style="margin-top:8px;align-items:center">
-              <button class="btn" onclick="ghPlan()">Validate</button>
-              <button class="btn pri" onclick="ghApply()">Apply</button>
-              <label style="display:flex;align-items:center;gap:6px;margin:0"><input type="checkbox" id="gh_reboot" style="width:auto"> allow a reboot mid-apply</label>
-            </div>
-            <pre id="gh_out" style="margin-top:10px">No run recorded for this sandbox yet.</pre>
-          </div>
+          <div class="sh">History<span class="r"><span id="hist_sum"></span><a href="#" onclick="histLoad(true);return false">Refresh</a><a href="#" onclick="histExport();return false">Export</a><a href="#" id="hist_tog" onclick="histToggle();return false">Collapse</a></span></div>
+          <div class="tl" id="hist"></div>
         </div>
       </div>
 
@@ -297,8 +281,30 @@ details.adv>summary{cursor:pointer;color:var(--mut);font-size:12px;margin-bottom
       </div>
 
       <div class="sec">
-        <div class="sh">History<span class="r"><span id="hist_sum"></span><a href="#" onclick="histLoad(true);return false">Refresh</a><a href="#" onclick="histExport();return false">Export</a><a href="#" id="hist_tog" onclick="histToggle();return false">Collapse</a></span></div>
-        <div class="tl" id="hist"></div>
+        <div class="sh">Groundhog<span class="r"><span id="gh_sum"></span><a onclick="toggle('gh_editor');return false" href="#">Edit profile</a></span></div>
+        <div class="steps" id="gh_steps"></div>
+        <div class="body" id="gh_detail" style="padding-top:4px"><dl class="kv" id="gh_kv"></dl></div>
+        <div class="body hidden" id="gh_editor" style="border-top:1px solid var(--ln2)">
+          <div class="hint" style="margin-bottom:10px">Groundhog brings a sandbox to a declared state from one file: apps, files, registry, environment, and its own checks. <b>Validate</b> runs its <code>plan</code> in the guest and changes nothing; <b>Apply</b> runs it for real. Name secrets as <code>${secret:NAME}</code> and give the values below; they are stripped from the guest as the agent reads them and never logged.</div>
+          <div class="grid">
+            <div><label>Shipped profile</label><select id="gh_lib" onchange="ghLib()"><option value="">loading…</option></select></div>
+            <div><label>Or a starter</label><select id="gh_tpl" onchange="ghStarter()">
+              <option value="">(keep the editor)</option>
+              <option value="internals">groundhog:windows-internals</option>
+              <option value="sysinternals">groundhog:sysinternals only</option>
+              <option value="apps">a couple of winget apps</option>
+              <option value="secret">pass a secret into the environment</option></select></div>
+            <div><label>Secrets (NAME=value per line)</label><input id="gh_secrets" placeholder="API_TOKEN=…"></div>
+          </div>
+          <div class="hint" id="gh_libnote" style="margin:-6px 0 8px">&nbsp;</div>
+          <textarea id="gh_body" spellcheck="false" rows="12"></textarea>
+          <div class="btns" style="margin-top:8px;align-items:center">
+            <button class="btn" onclick="ghPlan()">Validate</button>
+            <button class="btn pri" onclick="ghApply()">Apply</button>
+            <label style="display:flex;align-items:center;gap:6px;margin:0"><input type="checkbox" id="gh_reboot" style="width:auto"> allow a reboot mid-apply</label>
+          </div>
+          <pre id="gh_out" style="margin-top:10px">No run recorded for this sandbox yet.</pre>
+        </div>
       </div>
 
       <div class="two">
@@ -658,8 +664,23 @@ function screenMode(){
   img.onerror = () => { $('scr_msg').textContent = src === 'deskhand' ? 'Deskhand capture needs a logged-in session.' : 'No frame yet: the recorder has not seen this screen.'; $('scr_msg').classList.remove('hidden'); };
   if (src === 'still') {
     $('scr_live').classList.add('hidden');
-    const tick = () => { if (sel === s.vmid) img.src = 'api/screen?vmid=' + s.vmid + '&quiet=1&t=' + Date.now(); };
-    tick(); screenTimer = setInterval(tick, 4000);
+    // Chained, not setInterval: a frame that takes longer than the interval
+    // would otherwise stack requests, and a browser only opens about six
+    // connections per host -- enough piled-up images and the whole page stops
+    // loading anything, which looks exactly like the server having frozen.
+    const tick = () => {
+      if (sel !== s.vmid || $('w_src').value !== 'still') return;
+      img.src = 'api/screen?vmid=' + s.vmid + '&quiet=1&t=' + Date.now();
+    };
+    const again = () => {
+      if (screenTimer === null) return;
+      screenTimer = setTimeout(tick, 4000);
+    };
+    img.onload = again;
+    const priorError = img.onerror;
+    img.onerror = (e) => { if (priorError) priorError(e); again(); };
+    screenTimer = -2;                 // a sentinel: polling, no timer pending yet
+    tick();
   } else {
     $('scr_live').classList.remove('hidden');
     img.src = 'api/stream?vmid=' + s.vmid + '&src=' + src + '&fps=' + fps + '&t=' + Date.now();
@@ -667,8 +688,10 @@ function screenMode(){
   }
 }
 function stopScreen(){
-  if (screenTimer && screenTimer !== -1) clearInterval(screenTimer);
+  if (screenTimer && screenTimer !== -1 && screenTimer !== -2) clearTimeout(screenTimer);
   screenTimer = null;
+  const img = $('scr');
+  img.onload = null; img.onerror = null;
   $('scr').src = ''; $('scr_live').classList.add('hidden');
 }
 
@@ -708,7 +731,7 @@ async function ghRefresh(){
   const n = list.length, done = list.filter(x => x.status === 'done').length;
   sum.innerHTML = '<span class="' + ocls + '">' + esc(o === 'none' ? 'nothing applied' : o) + (n ? ' ' + done + '/' + n : '') + '</span>' + (run.updated ? ' · ' + esc(run.updated) : '');
   $('i_gh').innerHTML = '<span class="' + ocls + '">' + esc(o === 'none' ? 'none' : o) + '</span>';
-  steps.innerHTML = list.map(x => '<div class="step ' + (x.status === 'done' ? (x.changed ? 'changed' : 'done') : x.status === 'failed' ? 'failed' : '') + '" title="' + esc(x.title + (x.message ? ': ' + x.message : '')) + '"><i></i><span>' + esc(x.title) + '</span></div>').join('');
+  steps.innerHTML = ghSteps(list);
   let rows = '';
   if (d.failed_step) rows += '<dt class="bad">Failed at</dt><dd class="bad" style="white-space:normal">' + esc(d.failed_step + (d.failed_message ? ' — ' + d.failed_message : '')) + '</dd>';
   if (o === 'reboot-pending') rows += '<dt>Waiting</dt><dd style="white-space:normal">for a restart; it continues at the next logon</dd>';
@@ -721,6 +744,54 @@ async function ghRefresh(){
   } else if (d.status) out.textContent = d.status;
   else out.textContent = 'No run recorded for this sandbox yet.';
 }
+// A step's title already names what it did -- "verify C:/x exists", "install
+// Foo (winget)" -- but as a row of pills that reads as a list of nouns and the
+// outcome is a colour nobody has a legend for. Split the verb out, keep the
+// subject, and say in words whether it changed anything or was already right.
+const GH_KINDS = ['set machine env', 'set env', 'verify', 'install', 'ensure', 'copy',
+                  'download', 'remove', 'write', 'run:', 'set'];
+function ghSplit(title){
+  const t = String(title || '');
+  const low = t.toLowerCase();
+  for (const k of GH_KINDS) {
+    if (low.startsWith(k)) {
+      let rest = t.slice(k.length).trim();
+      if (rest.startsWith(':')) rest = rest.slice(1).trim();
+      return [k.replace(':', ''), rest || t];
+    }
+  }
+  return ['step', t];
+}
+function ghSteps(list){
+  if (!list.length) return '';
+  let changed = 0, already = 0, failed = 0;
+  const rows = list.map(x => {
+    const [kind, subject] = ghSplit(x.title);
+    let cls, glyph, outcome;
+    if (x.status === 'failed') {
+      cls = 'failed'; glyph = '✗'; failed++;
+      outcome = x.message ? 'failed' : 'failed';
+    } else if (x.status === 'done' && x.changed) {
+      cls = 'changed'; glyph = '●'; changed++; outcome = 'changed';
+    } else if (x.status === 'done') {
+      cls = 'done'; glyph = '✓'; already++;
+      outcome = (x.message === 'already in desired state') ? 'already correct' : (x.message || 'done');
+    } else {
+      cls = 'pending'; glyph = '○'; outcome = x.status || 'waiting';
+    }
+    const full = x.title + (x.message ? ' — ' + x.message : '');
+    return '<div class="step ' + cls + '" title="' + esc(full) + '">' +
+      '<i>' + glyph + '</i><span class="k">' + esc(kind) + '</span>' +
+      '<span class="s">' + esc(subject) + '</span>' +
+      '<span class="o">' + esc(outcome) + '</span></div>';
+  }).join('');
+  const bits = [];
+  if (changed) bits.push(changed + ' changed');
+  if (already) bits.push(already + ' already correct');
+  if (failed) bits.push(failed + ' failed');
+  return '<div class="stepsum">' + list.length + ' steps · ' + bits.join(' · ') + '</div>' + rows;
+}
+
 function ghPost(extra){
   return post('api/groundhog', Object.assign({vmid: sel, content: $('gh_body').value, secrets: $('gh_secrets').value, allow_reboot: $('gh_reboot').checked}, extra || {}));
 }
@@ -754,6 +825,7 @@ function agentsRender(){
   const dhTxt = s.status !== 'running' ? 'not running'
     : dh === 'listening' ? '✓ answering :' + (s.port || 8791)
     : dh === 'not answering' ? '✗ not answering on :' + (s.port || 8791) + ' — Repair'
+    : dh === 'no address' ? 'no answer from the guest agent — it may be rebooting'
     : 'no token — Repair';
   cells.push('<div class="ag"><b>Deskhand</b><div class="st ' + (dh === 'listening' ? 'ok' : dh === 'not answering' ? 'bad' : 'off') + '">' + dhTxt + '</div></div>');
   cells.push('<div class="ag"><b>Hermes</b><div class="st ' + (inst.indexOf('hermes') >= 0 ? 'ok' : 'off') + '">' + (inst.indexOf('hermes') >= 0 ? '✓ installed' + (a.dashboard_port ? ' · dashboard :' + a.dashboard_port : '') : 'not installed') + '</div></div>');
@@ -1031,12 +1103,15 @@ function renderInspector(){
   $('i_powernote').textContent = running
     ? 'Stopping frees a running slot and the memory its recorder costs.'
     : 'It keeps its disk, its name and its notes while it is off.';
+  const busy = jobsList.some(j => !j.done && j.vmid === s.vmid);
   $('i_repair').textContent = s.token ? 'Repair' : 'Finish setup';
-  $('i_update').disabled = !s.token;
+  $('i_repair').disabled = busy;
+  $('i_update').disabled = !s.token || busy;
+  $('i_repair').title = busy ? 'A job is already running on this sandbox' : '';
   $('i_lost').textContent = 'Destroying removes the VM and its disk. Recordings and notes stay on the controller.';
   // Running, but the controller cannot see it: almost always the guest agent
   // did not come back with the VM. Windows is usually fine behind this.
-  const mute = running && !s.token && !s.ip;
+  const mute = running && !s.ip;
   $('i_agentwarn').classList.toggle('hidden', !mute);
 }
 async function claim(){

@@ -1377,8 +1377,42 @@ def get_archive(vmid=None):
     return [a for a in arc if vmid is None or a.get("vmid") == int(vmid)]
 
 
-def start_job(title, fn, *args):
+def busy_job(vmid):
+    """A long-running job already working on this sandbox, if there is one."""
+    try:
+        vmid = int(vmid)
+    except (TypeError, ValueError):
+        return None
+    with JOBS_LOCK:
+        for j in JOBS.values():
+            if not j.done and getattr(j, "vmid", None) == vmid:
+                return j
+    return None
+
+
+def guard_busy(vmid, what):
+    """Refuse to start a second provision on a sandbox already in one.
+
+    Repair and update both re-run provisioning: auto-logon, a reboot, a fresh
+    Deskhand token. Two at once on one VM interleave all of that and the second
+    token wins, so the first job's reported credential is wrong. Clicking the
+    button twice because it looked stuck was enough to do it.
+    """
+    j = busy_job(vmid)
+    if j:
+        raise RuntimeError(
+            f"refusing to {what}: \"{j.title}\" is already running on {vmid} "
+            f"({int(time.time() - j.started)}s so far). Watch that job instead; "
+            "two provisions on one sandbox fight over its token and its reboots.")
+
+
+def start_job(title, fn, *args, vmid=None):
     job = Job(title)
+    if vmid is not None:
+        try:
+            job.vmid = int(vmid)
+        except (TypeError, ValueError):
+            pass
     with JOBS_LOCK:
         JOBS[job.id] = job
         # Jobs are the only way to see what happened, so keep a decent history,
@@ -1720,8 +1754,27 @@ run:
       $principal = New-ScheduledTaskPrincipal -UserId '@@USER@@' -LogonType Interactive -RunLevel Highest
       $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::Zero)
       Register-ScheduledTask -TaskName 'Deskhand' -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Force | Out-Null
+      # Stop the task, and WAIT for the scheduler to agree it has stopped.
+      # Start-ScheduledTask against a task the scheduler still counts as Running
+      # is silently ignored, so killing the process and starting in the same
+      # breath leaves the task Ready with nothing listening -- which is exactly
+      # how a repair failed its own 'port accepts connections' check while
+      # Deskhand sat installed and not running. The logon trigger does not save
+      # it either: the session is already open by the time this registers, and
+      # an at-logon trigger does not fire for a logon that already happened.
+      Stop-ScheduledTask -TaskName 'Deskhand' -ErrorAction SilentlyContinue
       Stop-Process -Name deskhand-http -Force -ErrorAction SilentlyContinue
+      $stopBy = (Get-Date).AddSeconds(30)
+      while ((Get-ScheduledTask -TaskName 'Deskhand').State -eq 'Running' -and (Get-Date) -lt $stopBy) { Start-Sleep -Seconds 2 }
       Start-ScheduledTask -TaskName 'Deskhand'
+      # And confirm it went. A start that was dropped is indistinguishable from
+      # one that worked until you look, so look.
+      $upBy = (Get-Date).AddSeconds(45)
+      while ((Get-ScheduledTask -TaskName 'Deskhand').State -ne 'Running' -and (Get-Date) -lt $upBy) {
+        Start-Sleep -Seconds 3
+        Start-ScheduledTask -TaskName 'Deskhand'
+      }
+      if ((Get-ScheduledTask -TaskName 'Deskhand').State -ne 'Running') { throw 'the Deskhand task would not start' }
 
 verify:
   - port: @@PORT@@
@@ -4443,7 +4496,11 @@ def _sandbox_view(e):
         out["deskhand"] = ("listening" if deskhand_alive(e["vmid"], e["ip"], port, e["token"])
                            else "not answering")
     elif e.get("status") == "running":
-        out["deskhand"] = "no token"
+        # Three different things were all reported as "no token". Without an
+        # address the guest agent is not answering, which is why no token could
+        # be read -- saying "no token" sent people to Repair when the machine
+        # was mid-reboot and about to come back on its own.
+        out["deskhand"] = "no address" if not e.get("ip") else "no token"
     if e.get("ip") and e.get("token"):
         out["deskhand_url"] = f"http://{e['ip']}:{port}/?token={e['token']}"
         out["mcp_url"] = f"http://{e['ip']}:{port}/mcp"
@@ -4597,6 +4654,7 @@ def _mcp_call(name, args):
         job = start_job("Fetching Deskhand", do_fetch, args.get("tag"))
         return {"job_id": job.id}
     if name == "repair_sandbox":
+        guard_busy(args.get("vmid"), "repair it")
         vmid = args.get("vmid")
         if vmid is None:
             raise ValueError("vmid is required")
@@ -4605,6 +4663,7 @@ def _mcp_call(name, args):
         job = start_job(f"Repairing {vmid}", do_repair, vmid)
         return {"job_id": job.id}
     if name == "update_sandbox":
+        guard_busy(args.get("vmid"), "update it")
         vmid = args.get("vmid")
         if vmid is None:
             raise ValueError("vmid is required")
@@ -4613,6 +4672,7 @@ def _mcp_call(name, args):
         job = start_job(f"Updating {vmid}", do_update, vmid)
         return {"job_id": job.id}
     if name == "install_agents":
+        guard_busy(args.get("vmid"), "install agents on it")
         vmid = args.get("vmid")
         if vmid is None:
             raise ValueError("vmid is required")
@@ -5307,14 +5367,29 @@ class Handler(BaseHTTPRequestHandler):
         if p.path == "/api/agents":
             opts = {k: body.get(k) for k in ("base_url", "api_key", "model", "context_length")
                     if body.get(k)}
+            try:
+                guard_busy(body.get("vmid"), "install agents on it")
+            except Exception as exc:                  # noqa: BLE001
+                return self._send(409, json.dumps({"error": str(exc)}))
             job = start_job(f"Installing agents on {body.get('vmid')}",
-                            do_install_agents, body.get("vmid"), body.get("agents") or [], opts)
+                            do_install_agents, body.get("vmid"), body.get("agents") or [], opts,
+                            vmid=body.get("vmid"))
             return self._send(200, json.dumps({"id": job.id}))
         if p.path == "/api/repair":
-            job = start_job(f"Repairing {body.get('vmid')}", do_repair, body.get("vmid"))
+            try:
+                guard_busy(body.get("vmid"), "repair it")
+            except Exception as exc:                  # noqa: BLE001
+                return self._send(409, json.dumps({"error": str(exc)}))
+            job = start_job(f"Repairing {body.get('vmid')}", do_repair, body.get("vmid"),
+                            vmid=body.get("vmid"))
             return self._send(200, json.dumps({"id": job.id}))
         if p.path == "/api/update":
-            job = start_job(f"Updating {body.get('vmid')}", do_update, body.get("vmid"))
+            try:
+                guard_busy(body.get("vmid"), "update it")
+            except Exception as exc:                  # noqa: BLE001
+                return self._send(409, json.dumps({"error": str(exc)}))
+            job = start_job(f"Updating {body.get('vmid')}", do_update, body.get("vmid"),
+                            vmid=body.get("vmid"))
             return self._send(200, json.dumps({"id": job.id}))
         if p.path == "/api/destroy":
             job = start_job(f"Destroying {body.get('vmid')}", do_destroy, body.get("vmid"))
