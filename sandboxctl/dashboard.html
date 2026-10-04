@@ -107,7 +107,7 @@ pre{margin:0;background:var(--inset);border:1px solid var(--ln);border-radius:6p
 .ag{background:var(--panel);padding:10px 12px}
 .ag b{display:block;font-weight:600;font-size:12px}
 .ag .st{font-size:11px;color:var(--mut);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.ag .st.ok{color:var(--ok)} .ag .st.off{color:var(--dim)}
+.ag .st.ok{color:var(--ok)} .ag .st.off{color:var(--dim)} .ag .st.bad{color:var(--bad)}
 .ag code{font-size:11px}
 .recs{display:flex;flex-direction:column;gap:4px;font-size:12px}
 .recs .it{display:grid;grid-template-columns:minmax(0,1fr) auto auto;gap:12px;align-items:center}
@@ -379,6 +379,7 @@ details.adv>summary{cursor:pointer;color:var(--mut);font-size:12px;margin-bottom
         <div class="copy"><code id="i_tok">—</code><button id="i_tokbtn" onclick="revealTok()">Reveal</button></div>
         <div class="btns"><a class="btn sm" id="i_dh" href="#" target="_blank">Open Deskhand ↗</a><a class="btn sm" id="i_hermes" href="#" target="_blank">Hermes dashboard ↗</a></div>
         <div class="hint hidden" id="i_hcred"></div>
+        <div class="hint hidden" id="i_dhwarn"><span class="bad">Nothing is answering on this port.</span> The token is valid but Deskhand is not running, so these addresses will hang. Repair reinstalls it and issues a new token.</div>
       </div>
       <div class="grp">
         <div class="gl">Maintain</div>
@@ -551,6 +552,7 @@ function rowTags(s){
   if (s.egress === 'blocked') t.push('<span class="tag bad">egress blocked</span>');
   else if (s.egress === 'local') t.push('<span class="tag warn">no internet</span>');
   if (s.status === 'running' && !s.token) t.push('<span class="tag bad">no token</span>');
+  else if (s.deskhand === 'not answering') t.push('<span class="tag bad">deskhand down</span>');
   if (s.notes) t.push('<span class="tag">' + s.notes + ' note' + (s.notes === 1 ? '' : 's') + '</span>');
   return t.length ? '<div class="tags">' + t.join('') + '</div>' : '';
 }
@@ -742,7 +744,14 @@ async function ghApply(){
 function agentsRender(){
   const s = fleetBy[sel]; if (!s) return;
   const a = s.agents || {}, inst = a.installed || [], cells = [];
-  cells.push('<div class="ag"><b>Deskhand</b><div class="st ' + (s.token ? 'ok' : 'off') + '">' + (s.token ? '✓ listening :' + (s.port || 8791) : (s.status === 'running' ? 'no token — Repair' : 'not running')) + '</div></div>');
+  // Say what was found, not what was configured. "listening" here is a reply
+  // from the port, not the presence of a token file in the guest.
+  const dh = s.deskhand;
+  const dhTxt = s.status !== 'running' ? 'not running'
+    : dh === 'listening' ? '✓ answering :' + (s.port || 8791)
+    : dh === 'not answering' ? '✗ not answering on :' + (s.port || 8791) + ' — Repair'
+    : 'no token — Repair';
+  cells.push('<div class="ag"><b>Deskhand</b><div class="st ' + (dh === 'listening' ? 'ok' : dh === 'not answering' ? 'bad' : 'off') + '">' + dhTxt + '</div></div>');
   cells.push('<div class="ag"><b>Hermes</b><div class="st ' + (inst.indexOf('hermes') >= 0 ? 'ok' : 'off') + '">' + (inst.indexOf('hermes') >= 0 ? '✓ installed' + (a.dashboard_port ? ' · dashboard :' + a.dashboard_port : '') : 'not installed') + '</div></div>');
   cells.push('<div class="ag"><b>opencode</b><div class="st ' + (inst.indexOf('opencode') >= 0 ? 'ok' : 'off') + '">' + (inst.indexOf('opencode') >= 0 ? '✓ installed · terminal app, run it on the desktop' : 'not installed') + '</div></div>');
   inst.filter(x => x !== 'hermes' && x !== 'opencode').forEach(x => cells.push('<div class="ag"><b>' + esc(x) + '</b><div class="st ok">✓ installed</div></div>'));
@@ -1003,6 +1012,7 @@ function renderInspector(){
   $('i_tok').textContent = s.token ? (tokShown ? s.token : 'Bearer ' + s.token.slice(0, 6) + '••••••••') : '—';
   $('i_tokbtn').textContent = tokShown ? 'Copy' : 'Reveal';
   $('i_dh').classList.toggle('hidden', !s.deskhand_url); if (s.deskhand_url) $('i_dh').href = s.deskhand_url;
+  $('i_dhwarn').classList.toggle('hidden', s.deskhand !== 'not answering');
   const a = s.agents || {};
   const hermes = a.dashboard_port && (a.installed || []).indexOf('hermes') >= 0 && s.ip;
   $('i_hermes').classList.toggle('hidden', !hermes); if (hermes) $('i_hermes').href = 'http://' + s.ip + ':' + a.dashboard_port + '/';

@@ -4180,10 +4180,18 @@ def deskhand_rpc(ip, port, token, method, params=None, timeout=120):
 
 
 def proxied_targets():
-    """Running sandboxes we can reach, newest-first, capped."""
+    """Running sandboxes we can reach, newest-first, capped.
+
+    "Can reach" used to mean it had an address and a token, which is how a
+    sandbox whose Deskhand had died still had its entire tool set advertised
+    over MCP. Every one of those calls would have hung. Now it has to answer.
+    """
+    entries = list_sandboxes()
+    warm_alive(entries)
     out = []
-    for e in list_sandboxes():
-        if e["status"] == "running" and e.get("ip") and e.get("token"):
+    for e in entries:
+        if (e["status"] == "running" and e.get("ip") and e.get("token")
+                and deskhand_alive(e["vmid"], e["ip"], e.get("port", 8791), e["token"])):
             out.append(e)
         if len(out) >= PROXY_MAX:
             break
@@ -4223,6 +4231,63 @@ def proxy_call(full_name, args):
     raise ValueError(f"no running sandbox named '{sb_name}'")
 
 
+# --------------------------------------------------------------------------
+# Is Deskhand actually answering?
+#
+# Reading a token means a file was read out of the guest. It says nothing about
+# whether anything is listening, and the two drift apart the moment Deskhand
+# dies while the sandbox keeps running -- which is exactly what happened: the
+# dashboard reported "listening :8791" for a sandbox whose port had been timing
+# out for hours, and the MCP endpoint advertised that sandbox's whole tool set,
+# every one of which would have hung.
+#
+# So ask it. Cheap, cached, and short-timeout, because the answer is wanted on
+# every refresh and a dead host is the slow case.
+# --------------------------------------------------------------------------
+_ALIVE_CACHE = {}
+_ALIVE_TTL = 30.0
+
+
+def deskhand_alive(vmid, ip=None, port=8791, token=None, timeout=2.5, cached=True):
+    vmid = int(vmid)
+    if cached:
+        hit = _ALIVE_CACHE.get(vmid)
+        if hit and time.time() - hit[1] < _ALIVE_TTL:
+            return hit[0]
+    ok = False
+    if ip and token:
+        try:
+            req = urllib.request.Request(
+                f"http://{ip}:{port}/health",
+                headers={"Authorization": f"Bearer {token}"})
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                # Anything it answers with means something is listening. A 401
+                # would be a token problem, not a dead service, and the two
+                # want different fixes.
+                ok = int(getattr(r, "status", 0) or 0) < 500
+        except Exception:                             # noqa: BLE001
+            ok = False
+    _ALIVE_CACHE[vmid] = (ok, time.time())
+    return ok
+
+
+def warm_alive(entries):
+    """Probe several at once; one dead sandbox should not add seconds in series."""
+    todo = [e for e in entries
+            if e.get("status") == "running" and e.get("ip") and e.get("token")
+            and (int(e["vmid"]) not in _ALIVE_CACHE
+                 or time.time() - _ALIVE_CACHE[int(e["vmid"])][1] >= _ALIVE_TTL)]
+    if len(todo) > 1:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+            list(pool.map(lambda e: deskhand_alive(e["vmid"], e.get("ip"),
+                                                   e.get("port", 8791), e.get("token"),
+                                                   cached=False), todo))
+    elif todo:
+        e = todo[0]
+        deskhand_alive(e["vmid"], e.get("ip"), e.get("port", 8791), e.get("token"),
+                       cached=False)
+
+
 def _sandbox_view(e):
     """One sandbox, described so a caller can act on it without another lookup."""
     port = e.get("port", 8791)
@@ -4258,6 +4323,11 @@ def _sandbox_view(e):
         out["claimed_by"] = claim["who"]
         out["claim_purpose"] = claim.get("purpose") or ""
         out["claim_minutes_left"] = claim["minutes_left"]
+    if e.get("status") == "running" and e.get("ip") and e.get("token"):
+        out["deskhand"] = ("listening" if deskhand_alive(e["vmid"], e["ip"], port, e["token"])
+                           else "not answering")
+    elif e.get("status") == "running":
+        out["deskhand"] = "no token"
     if e.get("ip") and e.get("token"):
         out["deskhand_url"] = f"http://{e['ip']}:{port}/?token={e['token']}"
         out["mcp_url"] = f"http://{e['ip']}:{port}/mcp"
@@ -4763,7 +4833,9 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(500, json.dumps({"error": str(exc)}))
         if p.path == "/api/sandboxes":
             try:
-                return self._send(200, json.dumps([_sandbox_view(e) for e in list_sandboxes()]))
+                entries = list_sandboxes()
+                warm_alive(entries)
+                return self._send(200, json.dumps([_sandbox_view(e) for e in entries]))
             except Exception as exc:                  # noqa: BLE001
                 return self._send(500, json.dumps({"error": str(exc)}))
         if p.path == "/api/recordings":
