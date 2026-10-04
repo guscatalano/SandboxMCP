@@ -2616,9 +2616,13 @@ MCP_TOOLS = [
     },
     {
         "name": "update_sandbox",
-            "description": ("Update a running sandbox to the Deskhand build currently on the "
-                        "controller, in place. Keeps the sandbox's existing token and settings, "
-                        "so MCP clients pointed at it keep working. Returns a job id."),
+            "description": ("Reinstall Deskhand on a running sandbox from the build currently "
+                        "staged on the controller. Despite the name this is the gentle one and "
+                        "usually the right one: no reboot, and it keeps the sandbox's existing "
+                        "token, port and settings, so MCP clients pointed at it keep working. "
+                        "Use it to pick up a newer Deskhand or to bring a stopped one back. It "
+                        "needs the existing token readable from the guest; when that fails, "
+                        "repair_sandbox rebuilds the setup instead. Returns a job id."),
         "inputSchema": {
             "type": "object",
             "properties": {"vmid": {"type": "integer"}},
@@ -2656,9 +2660,15 @@ MCP_TOOLS = [
     },
     {
         "name": "repair_sandbox",
-        "description": ("Finish a sandbox whose creation was interrupted (it sits at a lock "
-                        "screen with no Deskhand). Re-runs auto-logon and the Deskhand "
-                        "install. Also usable to reinstall Deskhand with a fresh token."),
+        "description": ("Rebuild a sandbox's whole post-clone setup, for one whose creation "
+                        "was interrupted -- it sits at a lock screen with no Deskhand, or its "
+                        "guest never logged on. This is the heavy one and it is not the way to "
+                        "fix a stopped Deskhand: it REBOOTS the sandbox, re-applies auto-logon, "
+                        "re-syncs the Windows account password, and installs Deskhand with a "
+                        "NEW token, so every client pointed at the old one breaks. It also "
+                        "resets the Deskhand port, shell and TLS settings to the defaults. If "
+                        "Deskhand is merely not running or is out of date, use update_sandbox, "
+                        "which reinstalls it in place and keeps the token."),
         "inputSchema": {
             "type": "object",
             "properties": {"vmid": {"type": "integer"}},

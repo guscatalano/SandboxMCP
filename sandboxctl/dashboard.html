@@ -389,11 +389,14 @@ details.adv>summary{cursor:pointer;color:var(--mut);font-size:12px;margin-bottom
         <div class="copy"><code id="i_tok">—</code><button id="i_tokbtn" onclick="revealTok()">Reveal</button></div>
         <div class="btns"><a class="btn sm" id="i_dh" href="#" target="_blank">Open Deskhand ↗</a><a class="btn sm" id="i_hermes" href="#" target="_blank">Hermes dashboard ↗</a></div>
         <div class="hint hidden" id="i_hcred"></div>
-        <div class="hint hidden" id="i_dhwarn"><span class="bad">Nothing is answering on this port.</span> The token is valid but Deskhand is not running, so these addresses will hang. Repair reinstalls it and issues a new token.</div>
+        <div class="hint hidden" id="i_dhwarn"><span class="bad">Nothing is answering on this port.</span> The token is valid but Deskhand is not running, so these addresses will hang. <b>Reinstall Deskhand</b> below brings it back and keeps this token.</div>
       </div>
       <div class="grp">
         <div class="gl">Maintain</div>
-        <div class="btns"><button class="btn" id="i_repair" onclick="rep()">Repair</button><button class="btn" id="i_update" onclick="upd()">Update Deskhand</button></div>
+        <div class="btns"><button class="btn" id="i_update" onclick="upd()">Reinstall Deskhand</button></div>
+        <div class="hint">Reinstalls from the staged build and keeps the same token and port. No reboot. Use this when Deskhand has stopped or is out of date.</div>
+        <div class="btns" style="margin-top:4px"><button class="btn" id="i_repair" onclick="rep()">Rebuild setup…</button></div>
+        <div class="hint" id="i_repairhint">Re-runs the whole post-clone setup for a sandbox that never finished one. Reboots it, re-applies auto-logon, and issues a <b>new token</b>, so anything using the old one stops working.</div>
       </div>
       <div class="grp danger">
         <div class="gl">Danger</div>
@@ -824,7 +827,7 @@ function agentsRender(){
   const dh = s.deskhand;
   const dhTxt = s.status !== 'running' ? 'not running'
     : dh === 'listening' ? '✓ answering :' + (s.port || 8791)
-    : dh === 'not answering' ? '✗ not answering on :' + (s.port || 8791) + ' — Repair'
+    : dh === 'not answering' ? '✗ not answering on :' + (s.port || 8791) + ' — try Reinstall Deskhand'
     : dh === 'no address' ? 'no answer from the guest agent — it may be rebooting'
     : 'no token — Repair';
   cells.push('<div class="ag"><b>Deskhand</b><div class="st ' + (dh === 'listening' ? 'ok' : dh === 'not answering' ? 'bad' : 'off') + '">' + dhTxt + '</div></div>');
@@ -1104,7 +1107,10 @@ function renderInspector(){
     ? 'Stopping frees a running slot and the memory its recorder costs.'
     : 'It keeps its disk, its name and its notes while it is off.';
   const busy = jobsList.some(j => !j.done && j.vmid === s.vmid);
-  $('i_repair').textContent = s.token ? 'Repair' : 'Finish setup';
+  $('i_repair').textContent = s.token ? 'Rebuild setup…' : 'Finish setup…';
+  $('i_repairhint').textContent = s.token
+    ? 'Re-runs the whole post-clone setup. Reboots the sandbox and issues a new token, so anything using the old one stops working.'
+    : 'This sandbox never finished its build, so this is the one to use: auto-logon, a reboot, then Deskhand.';
   $('i_repair').disabled = busy;
   $('i_update').disabled = !s.token || busy;
   $('i_repair').title = busy ? 'A job is already running on this sandbox' : '';
@@ -1170,7 +1176,27 @@ async function destroy(){
   if (d.error) { alert(d.error); return; }
   followJob(d.id);
 }
-async function rep(){ const d = await post('api/repair', {vmid: sel}); if (d.error) { alert(d.error); return; } followJob(d.id); }
+async function rep(){
+  const sb = fleetBy[sel]; if (!sb) return;
+  // It reboots the machine and rotates the token. Neither is what "Repair"
+  // sounded like, so it is spelled out before it happens rather than after.
+  // Built from an array rather than escapes: this file is generated, and a
+  // backslash-n here has twice been turned into a real line break on the way in.
+  const warn = [
+    'Rebuild the setup on ' + sb.name + '?',
+    '',
+    '• the sandbox REBOOTS',
+    '• Deskhand is reinstalled with a NEW token, so clients using the old one break',
+    '• auto-logon and the Windows password are re-applied',
+    '• the Deskhand port, shell and TLS settings go back to defaults',
+    '',
+    'To reinstall Deskhand and keep the token, cancel and use Reinstall Deskhand.'
+  ].join(String.fromCharCode(10));
+  if (!confirm(warn)) return;
+  const d = await post('api/repair', {vmid: sel});
+  if (d.error) { alert(d.error); return; }
+  followJob(d.id);
+}
 async function upd(){ const d = await post('api/update', {vmid: sel}); if (d.error) { alert(d.error); return; } followJob(d.id); }
 
 /* ---- create ---- */
