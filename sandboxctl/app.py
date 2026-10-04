@@ -77,6 +77,9 @@ AGENTS_CFG = CONFIG.get("agents") or {}
 # Matches the default agent-side MCP cap, so Deskhand spills to its OutputStore
 # at the same point the client would otherwise start discarding.
 DESKHAND_TOOL_CHARS = int(CONFIG.get("deskhand_max_tool_chars") or 150000)
+# How often a sandbox checks GitHub for a newer Deskhand. Deskhand clamps
+# this to between 5 minutes and a week; 0 turns auto-update off entirely.
+DESKHAND_UPDATE_MIN = int(CONFIG.get("deskhand_update_interval_min") or 10)
 
 # Console recording. Off unless a directory is configured, because it needs
 # somewhere with room -- a chunk is tens of MB and they accumulate per sandbox.
@@ -1776,6 +1779,8 @@ files:
         "port": @@PORT@@,
         "bind": "any",
         "hideConsole": true,
+        "autoUpdate": true,
+        "autoUpdateIntervalMin": @@UPDATEMIN@@,
         "maxToolChars": @@TOOLCHARS@@,
         "enableShell": @@SHELL@@,
         "enableSessionLaunch": @@SHELL@@@@TLS_LINE@@
@@ -1898,6 +1903,11 @@ if (-not `$ip) { `$ip = 'any' }
 # in every screenshot, and in the way of anything being automated. 0.2.32 added
 # this; on an older build it is simply an unknown variable and is ignored.
 `$env:DESKHAND_HIDE_CONSOLE = '1'
+# Check GitHub for a newer Deskhand and apply it unattended. The sandbox does
+# the fetching, not this controller, so a sandbox with its egress cut simply
+# fails the check and carries on with what it has.
+`$env:DESKHAND_AUTO_UPDATE = '1'
+`$env:DESKHAND_AUTO_UPDATE_INTERVAL_MIN = '@@UPDATEMIN@@'
 @@SHELL_LINE@@
 @@TLS_LINE@@
 Set-Location '$dir'
@@ -2078,7 +2088,8 @@ def provision(job, vmid, opts, configure_hw=True):
               .replace("@@SHELL_LINE@@", shell_line)
               .replace("@@TLS_LINE@@", tls_line)
               .replace("@@USER@@", WIN_USER)
-              .replace("@@TOOLCHARS@@", str(DESKHAND_TOOL_CHARS)))
+              .replace("@@TOOLCHARS@@", str(DESKHAND_TOOL_CHARS))
+              .replace("@@UPDATEMIN@@", str(DESKHAND_UPDATE_MIN)))
     # Default: let Groundhog do it. The Groundhogfile fetches the zip, so an
     # installation staged with the MSI keeps the scripted path rather than
     # failing where it used to work.
@@ -2156,6 +2167,7 @@ def install_deskhand_groundhog(job, vmid, opts, token):
             .replace("@@SHA256@@", sha)
             .replace("@@PORT@@", str(opts["port"]))
             .replace("@@TOOLCHARS@@", str(DESKHAND_TOOL_CHARS))
+            .replace("@@UPDATEMIN@@", str(DESKHAND_UPDATE_MIN))
             .replace("@@SHELL@@", "true" if opts.get("shell") else "false")
             .replace("@@TLS_LINE@@", tls)
             .replace("@@USER@@", WIN_USER))
@@ -3128,6 +3140,33 @@ if ($want -contains 'hermes') {
     }
     if (-not (Test-Path $exe)) { throw 'hermes.exe missing after install' }
 
+    # Installed is not the same as findable. The installer drops hermes.exe
+    # under LOCALAPPDATA and stops there: nothing on PATH, nothing in the Start
+    # menu, so the only way to run it was to type the full path to a binary
+    # buried four folders deep. Fix both.
+    $hbin = Join-Path $hh 'bin'
+    $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
+    if (-not $userPath) { $userPath = '' }
+    if ($userPath -notlike ('*' + $hbin + '*')) {
+        [Environment]::SetEnvironmentVariable(
+            'Path', ($userPath.TrimEnd(';') + ';' + $hbin).TrimStart(';'), 'User')
+        Write-Output ('  PATH += ' + $hbin)
+    }
+    $startMenu = Join-Path $env:APPDATA ('Microsoft\Windows\Start Menu\Programs')
+    New-Item -ItemType Directory -Path $startMenu -Force | Out-Null
+    try {
+        $ws = New-Object -ComObject WScript.Shell
+        $sc = $ws.CreateShortcut((Join-Path $startMenu 'Hermes.lnk'))
+        # --tui, not a bare launch: without it hermes prints usage and exits,
+        # so the shortcut would look broken.
+        $sc.TargetPath = $exe
+        $sc.Arguments = '--tui'
+        $sc.WorkingDirectory = $hh
+        $sc.Description = 'Hermes agent (terminal UI)'
+        $sc.Save()
+        Write-Output '  start menu: Hermes'
+    } catch { Write-Output ('  could not write the Start menu shortcut: ' + $_.Exception.Message) }
+
     # Secrets go in .env, which is the documented precedence path; config.yaml
     # is for behaviour, not credentials.
     $envLines = @()
@@ -3333,6 +3372,18 @@ if ($want -contains 'opencode') {
     $oc = Get-ChildItem $dir -Recurse -Filter opencode.exe | Select-Object -First 1
     if (-not $oc) { throw 'opencode.exe missing from the zip' }
 
+    $startMenu = Join-Path $env:APPDATA ('Microsoft\Windows\Start Menu\Programs')
+    New-Item -ItemType Directory -Path $startMenu -Force | Out-Null
+    try {
+        $ws = New-Object -ComObject WScript.Shell
+        $sc = $ws.CreateShortcut((Join-Path $startMenu 'opencode.lnk'))
+        $sc.TargetPath = $oc.FullName
+        $sc.WorkingDirectory = $oc.DirectoryName
+        $sc.Description = 'opencode (terminal UI)'
+        $sc.Save()
+        Write-Output '  start menu: opencode'
+    } catch { Write-Output ('  could not write the Start menu shortcut: ' + $_.Exception.Message) }
+
     $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
     if (-not $userPath) { $userPath = '' }
     if ($userPath -notlike ('*' + $oc.DirectoryName + '*')) {
@@ -3456,7 +3507,8 @@ def do_update(job, vmid):
               .replace("@@SHELL_LINE@@", "`$env:DESKHAND_ENABLE_SHELL = '1'" if shell else "")
               .replace("@@TLS_LINE@@", "`$env:DESKHAND_TLS = 'self-signed'" if tls else "")
               .replace("@@USER@@", WIN_USER)
-              .replace("@@TOOLCHARS@@", str(DESKHAND_TOOL_CHARS)))
+              .replace("@@TOOLCHARS@@", str(DESKHAND_TOOL_CHARS))
+              .replace("@@UPDATEMIN@@", str(DESKHAND_UPDATE_MIN)))
     if declarative and kind == "zip":
         # Same route it came in by, so the config file stays the source of truth
         # and picks up anything new in it -- hideConsole, for one.
@@ -3654,13 +3706,24 @@ def do_install_agents(job, vmid, agents, opts=None):
     # Point the agent at the Deskhand on its own machine. Deskhand accepts the
     # token as a query parameter, so this needs no header support from either
     # agent -- and 127.0.0.1 keeps it off the wire entirely.
-    launcher = read_launcher(vmid, timeout=120)
-    m = re.search(r"DESKHAND_TOKEN\s*=\s*'([^']+)'", launcher)
-    pm = re.search(r"DESKHAND_PORT\s*=\s*'(\d+)'", launcher)
-    if m:
+    # deskhand.json first, launcher second -- the same order read_token uses.
+    # Looking only at the launcher meant that on a declaratively installed
+    # sandbox, which is every recent one, this found nothing and quietly
+    # installed agents with no way to drive the desktop they sit on. That is
+    # the entire point of installing them there.
+    dh_cfg = read_config(vmid, timeout=120)
+    dh_token = (dh_cfg.get("token") or "").strip() or None
+    dh_port = int(dh_cfg.get("port") or 8791)
+    if not dh_token:
+        launcher = read_launcher(vmid, timeout=120)
+        m = re.search(r"DESKHAND_TOKEN\s*=\s*'([^']+)'", launcher or "")
+        pm = re.search(r"DESKHAND_PORT\s*=\s*'(\d+)'", launcher or "")
+        dh_token = m.group(1) if m else None
+        dh_port = int(pm.group(1)) if pm else 8791
+    if dh_token:
         # Only the port and token travel; the guest resolves the host, because
         # Deskhand listens on the machine's IPv4 rather than on loopback.
-        cfg["deskhand"] = {"port": int(pm.group(1)) if pm else 8791, "token": m.group(1)}
+        cfg["deskhand"] = {"port": dh_port, "token": dh_token}
         job.log("agents will get this sandbox's own Deskhand as an MCP server")
     else:
         job.log("no Deskhand token found; agents get no local desktop tools")
@@ -4160,6 +4223,16 @@ def timings_report():
     return {"slow_line_seconds": SLOW_SECONDS, "routes": rows}
 
 
+def _staged_tag():
+    """Which Deskhand build is staged here, for comparing against what a
+    sandbox actually runs."""
+    try:
+        with open(os.path.join(HERE, "payload", "meta.json"), encoding="utf-8") as fh:
+            return (json.load(fh) or {}).get("tag") or None
+    except Exception:                                 # noqa: BLE001
+        return None
+
+
 def capacity():
     """How many sandboxes exist and run, against the limits.
 
@@ -4204,6 +4277,8 @@ def capacity():
         # The status bar names what every clone comes from: the one fact
         # that explains a whole fleet behaving the same way.
         "template": TEMPLATE,
+        "deskhand_staged": _staged_tag(),
+        "deskhand_update_interval_min": DESKHAND_UPDATE_MIN,
         "sandboxes": total,
         "max_sandboxes": MAX_SANDBOXES,
         "sandboxes_left": max(0, MAX_SANDBOXES - total),
@@ -4519,7 +4594,7 @@ def deskhand_alive(vmid, ip=None, port=8791, token=None, timeout=2.5, cached=Tru
         hit = _ALIVE_CACHE.get(vmid)
         if hit and time.time() - hit[1] < _ALIVE_TTL:
             return hit[0]
-    ok = False
+    ok, version = False, None
     if ip and token:
         try:
             req = urllib.request.Request(
@@ -4530,10 +4605,24 @@ def deskhand_alive(vmid, ip=None, port=8791, token=None, timeout=2.5, cached=Tru
                 # would be a token problem, not a dead service, and the two
                 # want different fixes.
                 ok = int(getattr(r, "status", 0) or 0) < 500
+                try:
+                    # /health already carries the version, so which build a
+                    # sandbox is actually running costs nothing to report --
+                    # and "Deskhand looks old" stops being a guess.
+                    version = (json.loads(r.read().decode("utf-8", "replace"))
+                               or {}).get("version")
+                except Exception:                     # noqa: BLE001
+                    version = None
         except Exception:                             # noqa: BLE001
             ok = False
-    _ALIVE_CACHE[vmid] = (ok, time.time())
+    _ALIVE_CACHE[vmid] = (ok, time.time(), version)
     return ok
+
+
+def deskhand_version(vmid):
+    """The version from the last probe, if there was one."""
+    hit = _ALIVE_CACHE.get(int(vmid))
+    return hit[2] if hit and len(hit) > 2 else None
 
 
 def warm_alive(entries):
@@ -4591,6 +4680,9 @@ def _sandbox_view(e):
     if e.get("status") == "running" and e.get("ip") and e.get("token"):
         out["deskhand"] = ("listening" if deskhand_alive(e["vmid"], e["ip"], port, e["token"])
                            else "not answering")
+        ver = deskhand_version(e["vmid"])
+        if ver:
+            out["deskhand_version"] = ver
     elif e.get("status") == "running":
         # Three different things were all reported as "no token". Without an
         # address the guest agent is not answering, which is why no token could

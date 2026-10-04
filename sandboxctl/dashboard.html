@@ -329,7 +329,7 @@ details.adv>summary{cursor:pointer;color:var(--mut);font-size:12px;margin-bottom
     <div id="i_fleet">
       <div class="grp"><div class="gl">Deskhand build</div>
         <div class="fact wrap"><span>Staged</span><span id="pay">checking…</span></div>
-        <div class="hint">What Create installs and what Update rolls out.</div>
+        <div class="hint" id="pay_note">What Create installs and what Reinstall Deskhand rolls out.</div>
         <div class="btns"><input id="tag" placeholder="latest" style="width:110px"><button class="btn" onclick="fetchDh()">Fetch from GitHub</button></div></div>
       <div class="grp"><div class="gl">Connect an AI agent to every sandbox</div>
         <div class="hint">One endpoint covers the fleet: this controller proxies each sandbox's Deskhand, so sandboxes created later show up as tools automatically.</div>
@@ -830,7 +830,17 @@ function agentsRender(){
     : dh === 'not answering' ? '✗ not answering on :' + (s.port || 8791) + ' — try Reinstall Deskhand'
     : dh === 'no address' ? 'no answer from the guest agent — it may be rebooting'
     : 'no token — Repair';
-  cells.push('<div class="ag"><b>Deskhand</b><div class="st ' + (dh === 'listening' ? 'ok' : dh === 'not answering' ? 'bad' : 'off') + '">' + dhTxt + '</div></div>');
+  // The version comes free with the liveness probe, so show which build is
+  // actually running rather than leaving "Deskhand looks old" as a hunch.
+  const staged = (cap && cap.deskhand_staged || '').replace(/^v/, '');
+  const ver = s.deskhand_version || '';
+  const behind = ver && staged && ver !== staged;
+  const verTxt = ver
+    ? ' · <span class="' + (behind ? 'warn' : 'muted') + '" title="' +
+      (behind ? 'the controller has ' + esc(staged) + ' staged; it updates itself on a timer' : 'matches the staged build') +
+      '">' + esc(ver) + (behind ? ' → ' + esc(staged) : '') + '</span>'
+    : '';
+  cells.push('<div class="ag"><b>Deskhand</b><div class="st ' + (dh === 'listening' ? 'ok' : dh === 'not answering' ? 'bad' : 'off') + '">' + dhTxt + verTxt + '</div></div>');
   cells.push('<div class="ag"><b>Hermes</b><div class="st ' + (inst.indexOf('hermes') >= 0 ? 'ok' : 'off') + '">' + (inst.indexOf('hermes') >= 0 ? '✓ installed' + (a.dashboard_port ? ' · dashboard :' + a.dashboard_port : '') : 'not installed') + '</div></div>');
   cells.push('<div class="ag"><b>opencode</b><div class="st ' + (inst.indexOf('opencode') >= 0 ? 'ok' : 'off') + '">' + (inst.indexOf('opencode') >= 0 ? '✓ installed · terminal app, run it on the desktop' : 'not installed') + '</div></div>');
   inst.filter(x => x !== 'hermes' && x !== 'opencode').forEach(x => cells.push('<div class="ag"><b>' + esc(x) + '</b><div class="st ok">✓ installed</div></div>'));
@@ -1265,6 +1275,9 @@ async function payload(){
     const d = await getJSON('api/payload'), el = $('pay');
     if (!d.kind) { el.innerHTML = '<span class="bad">nothing staged — Create and Update will fail</span>'; return; }
     el.textContent = (d.tag ? d.tag + ' ' : '') + (d.asset || d.kind) + ' · ' + (d.size/1048576).toFixed(1) + ' MB · ' + (d.fetched || d.mtime || '');
+    const mins = cap && cap.deskhand_update_interval_min;
+    $('pay_note').textContent = 'What Create installs and what Reinstall Deskhand rolls out.'
+      + (mins ? ' Sandboxes also check GitHub themselves every ' + mins + ' min and update in place.' : '');
   } catch(e) { $('pay').textContent = 'could not read'; }
 }
 async function fetchDh(){
