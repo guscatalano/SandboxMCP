@@ -25,6 +25,7 @@ Stdlib only, on purpose: no pip, nothing to keep patched.
 """
 import base64
 import gzip
+import collections
 import concurrent.futures
 import hashlib
 import html
@@ -511,6 +512,7 @@ def apply_groundhog(vmid, source, sha256=None, allow_http=None, allow_reboot=Fal
     Returns once the task has been kicked; the agent keeps going on its own.
     Poll groundhog_status for the outcome.
     """
+    _GH_STATUS_CACHE.pop(int(vmid), None)
     source = (source or "").strip()
     if not source:
         raise ValueError("source is required: a path, URL or zip the agent can fetch")
@@ -726,7 +728,28 @@ def groundhog_write_adhoc(vmid, content):
     return f"{SELF_URL}/payload/{name}"
 
 
-def groundhog_status(vmid):
+# The outcome of a Groundhog run changes when the run changes, which is rarely,
+# but the panel asks every ten seconds and each ask was two guest round trips.
+# Held briefly, and held for less while a run is actually moving, which is the
+# only time a stale answer would matter.
+_GH_STATUS_CACHE = {}
+
+
+def groundhog_status(vmid, fresh=False):
+    vmid_i = int(vmid)
+    if not fresh:
+        hit = _GH_STATUS_CACHE.get(vmid_i)
+        if hit:
+            age = time.time() - hit[1]
+            moving = hit[0].get("outcome") in ("running", "reboot-pending")
+            if age < (4.0 if moving else 25.0):
+                return hit[0]
+    got = _groundhog_status_uncached(vmid)
+    _GH_STATUS_CACHE[vmid_i] = (got, time.time())
+    return got
+
+
+def _groundhog_status_uncached(vmid):
     """What the last apply did, from the agent and from the pending file's fate.
 
     The agent renames pending.json rather than deleting it -- pending.done.json
@@ -743,18 +766,26 @@ def groundhog_status(vmid):
                     "$f = Test-Path ($h + '\\pending.failed.json')\n"
                     "$s = (& $exe status 2>&1 | Out-String).Trim()\n"
                     "Write-Output ('OK|' + $p + '|' + $d + '|' + $f + '|' "
-                    "+ ($s -replace '\r?\n', ' ~ '))",
+                    "+ ($s -replace '\r?\n', ' ~ '))\n"
+                    # Carried back in the same round trip. Reading status.json
+                    # separately cost a second guest exec, about three seconds, on a
+                    # call the dashboard made every ten.
+                    f"$lr = '{GROUNDHOG_LAST_RUN}\\status.json'\n"
+                    "if (Test-Path $lr) { Write-Output ('RUN|' + [Convert]::ToBase64String([IO.File]::ReadAllBytes($lr))) }",
                     timeout=120)
     line = _marked_line(out)
     if line.startswith("ERR|"):
         raise RuntimeError(line.split("|", 1)[1])
     _, pending, done, failed, status = line.split("|", 4)
     run = None
-    try:
-        raw = guest_read(vmid, GROUNDHOG_LAST_RUN + r"\status.json")
-        run = json.loads(raw.get("text") or "{}") or None
-    except Exception:                                 # noqa: BLE001
-        run = None                  # never applied, or an agent older than 0.12
+    for raw_line in (out or "").splitlines():
+        raw_line = raw_line.strip()
+        if raw_line.startswith("RUN|"):
+            try:
+                run = json.loads(base64.b64decode(raw_line[4:]).decode("utf-8", "replace")) or None
+            except Exception:                         # noqa: BLE001
+                run = None          # never applied, or an agent older than 0.12
+            break
     pending = pending.strip().lower() == "true"
     done = done.strip().lower() == "true"
     failed = failed.strip().lower() == "true"
@@ -1076,7 +1107,22 @@ def _pve_events(vmid, limit=200):
     return out
 
 
+# A boot time changes when the machine boots. Asking the guest costs a round
+# trip of about three seconds, and sandbox_history asked on every call.
+_BOOT_CACHE = {}
+
+
 def _guest_boot(vmid):
+    hit = _BOOT_CACHE.get(int(vmid))
+    if hit and time.time() - hit[1] < 300:
+        return hit[0]
+    got = _guest_boot_uncached(vmid)
+    if got:
+        _BOOT_CACHE[int(vmid)] = (got, time.time())
+    return got
+
+
+def _guest_boot_uncached(vmid):
     """Ask the guest when it last booted. Best effort: a wedged or powered-off
     guest simply contributes nothing."""
     try:
@@ -3598,8 +3644,13 @@ def power_sandbox(vmid, action, who="", force=False):
         # The token was read out of a guest that is no longer there to ask.
         _TOKEN_CACHE.pop(vmid, None)
         _EGRESS_CACHE.pop(vmid, None)
+        _BOOT_CACHE.pop(vmid, None)
+        _GH_STATUS_CACHE.pop(vmid, None)
+        _ALIVE_CACHE.pop(vmid, None)
     elif action == "start":
         _wait_status(vmid, "running", timeout=30)
+        _BOOT_CACHE.pop(vmid, None)
+        _ALIVE_CACHE.pop(vmid, None)
     out = {"vmid": vmid, "status": vm_status(vmid), "changed": True, "action": action}
     if action == "start":
         # Windows still has to boot and Deskhand still has to come up; the VM
@@ -3893,6 +3944,56 @@ def do_revert(job, vmid, name, who=""):
                 + ("" if token else "  (no Deskhand token: Repair if it does not return)"))
     job.log("reverted")
     return {"vmid": vmid, "reverted_to": name, "status": vm_status(vmid)}
+
+
+# --------------------------------------------------------------------------
+# Timings
+#
+# Every HTTP route and every MCP tool is timed, because "some calls take a
+# really long time" is a suspicion and this turns it into a table. Kept in
+# memory only -- the last few hundred samples per route, which is enough to see
+# a median move and cheap enough to leave on. Anything over the slow line is
+# also printed, so a bad call shows up in journalctl without anyone asking.
+# --------------------------------------------------------------------------
+TIMINGS = {}
+TIMINGS_LOCK = threading.Lock()
+TIMING_SAMPLES = 200
+SLOW_SECONDS = float(CONFIG.get("slow_call_seconds") or 2.0)
+
+
+def record_timing(route, seconds, failed=False):
+    try:
+        with TIMINGS_LOCK:
+            d = TIMINGS.setdefault(route, {"n": 0, "fail": 0, "samples": collections.deque(
+                maxlen=TIMING_SAMPLES), "last": 0.0, "worst": 0.0})
+            d["n"] += 1
+            if failed:
+                d["fail"] += 1
+            d["samples"].append(seconds)
+            d["last"] = seconds
+            d["worst"] = max(d["worst"], seconds)
+        if seconds >= SLOW_SECONDS:
+            print(f"slow: {route} took {seconds:.2f}s", flush=True)
+    except Exception:                                 # noqa: BLE001
+        pass                                          # measuring must never break serving
+
+
+def timings_report():
+    rows = []
+    with TIMINGS_LOCK:
+        items = [(route, dict(d, samples=list(d["samples"]))) for route, d in TIMINGS.items()]
+    for route, d in items:
+        vals = sorted(d["samples"])
+        if not vals:
+            continue
+        def pct(p):
+            return vals[min(len(vals) - 1, int(len(vals) * p))]
+        rows.append({"route": route, "calls": d["n"], "failed": d["fail"],
+                     "min": round(vals[0], 3), "median": round(pct(0.5), 3),
+                     "p95": round(pct(0.95), 3), "max": round(d["worst"], 3),
+                     "last": round(d["last"], 3), "samples": len(vals)})
+    rows.sort(key=lambda r: -r["median"])
+    return {"slow_line_seconds": SLOW_SECONDS, "routes": rows}
 
 
 def capacity():
@@ -4339,6 +4440,18 @@ _QUIET_TOOLS = {"list_sandboxes", "job_status", "read_comments", "sandbox_histor
 
 
 def mcp_call(name, args):
+    t0 = time.perf_counter()
+    failed = False
+    try:
+        return _mcp_call(name, args)
+    except Exception:
+        failed = True
+        raise
+    finally:
+        record_timing("MCP " + str(name), time.perf_counter() - t0, failed)
+
+
+def _mcp_call(name, args):
     # Reads are not worth a timeline entry; everything that changes something,
     # or reaches into a guest, is.
     if name not in _QUIET_TOOLS:
@@ -4729,6 +4842,32 @@ def page_html():
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
+    # Timed at the edge so the number is what the caller actually waited, not
+    # what the handler thinks it did.
+    def do_GET(self):
+        t0 = time.perf_counter()
+        failed = False
+        try:
+            return self._route_get()
+        except Exception:
+            failed = True
+            raise
+        finally:
+            record_timing("GET " + urllib.parse.urlparse(self.path).path,
+                          time.perf_counter() - t0, failed)
+
+    def do_POST(self):
+        t0 = time.perf_counter()
+        failed = False
+        try:
+            return self._route_post()
+        except Exception:
+            failed = True
+            raise
+        finally:
+            record_timing("POST " + urllib.parse.urlparse(self.path).path,
+                          time.perf_counter() - t0, failed)
+
     def log_message(self, fmt, *args):
         print(f"{self.address_string()} {fmt % args}", flush=True)
 
@@ -4741,7 +4880,7 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def do_GET(self):
+    def _route_get(self):
         p = urllib.parse.urlparse(self.path)
         host = self.headers.get("Host")
         # Discovery surfaces for agents. An AI handed this URL will usually
@@ -4826,6 +4965,8 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(body)
             return
+        if p.path == "/api/timings":
+            return self._send(200, json.dumps(timings_report()))
         if p.path == "/api/capacity":
             try:
                 return self._send(200, json.dumps(capacity()))
@@ -5012,7 +5153,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         return self._send(404, json.dumps({"error": "not found"}))
 
-    def do_POST(self):
+    def _route_post(self):
         p = urllib.parse.urlparse(self.path)
         length = int(self.headers.get("Content-Length") or 0)
         try:

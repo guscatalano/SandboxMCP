@@ -330,6 +330,10 @@ details.adv>summary{cursor:pointer;color:var(--mut);font-size:12px;margin-bottom
         <div class="btns"><button class="btn" onclick="copyHub('claude')">Copy for Claude Code</button><button class="btn" onclick="copyHub('hermes')">Copy for Hermes</button></div>
         <pre id="hubcmd" style="max-height:none"></pre>
         <div class="hint"><b>Sandbox-only mode for Hermes:</b> scope a run with <code>hermes -t sandboxctl -z "…"</code>, or make it permanent with <code>hermes tools disable web browser terminal file code_execution</code>.</div></div>
+      <div class="grp"><div class="gl">Call timings <span class="muted" id="t_note"></span></div>
+        <div id="t_rows" class="hint">reading…</div>
+        <div class="hint">Median round trip per route, newest samples first. Anything over the slow line is also written to the service log.</div>
+      </div>
       <div class="grp"><div class="gl">Controller</div>
         <div class="fact"><span>Template</span><span class="mono" id="i_tmpl">—</span></div>
         <div class="fact"><span>Proxmox</span><span class="mono">@@PVEHOST@@ · @@PVENODE@@</span></div>
@@ -628,7 +632,7 @@ function showCreate(){
   $('view-sb').classList.add('hidden'); $('view-create').classList.remove('hidden');
   $('i_sb').classList.add('hidden'); $('i_fleet').classList.remove('hidden');
   $('i_head').textContent = 'Fleet';
-  renderList();
+  renderList(); timings();
   if (!$('c_profile').options.length || $('c_profile').options.length === 1) ghLoadLibrary();
 }
 function renderHeader(){
@@ -1136,6 +1140,24 @@ async function pollJob(){
   setTimeout(pollJob, 2000);
 }
 
+/* ---- what each call costs ---- */
+async function timings(){
+  if (sel !== null) return;                 // only shown in fleet mode
+  const d = await getJSON('api/timings').catch(() => null);
+  if (!d || d.error || !d.routes) { $('t_rows').textContent = 'not available'; return; }
+  $('t_note').textContent = 'slow line ' + d.slow_line_seconds + ' s';
+  const rows = d.routes.slice(0, 8);
+  if (!rows.length) { $('t_rows').textContent = 'nothing measured yet'; return; }
+  $('t_rows').innerHTML = '<div class="fact" style="color:var(--mut)"><span>route</span><span>median · max</span></div>' +
+    rows.map(r => {
+      const slow = r.median >= d.slow_line_seconds, warn = r.max >= d.slow_line_seconds;
+      return '<div class="fact" title="' + esc(r.route + ' — ' + r.calls + ' calls, ' + r.samples +
+             ' sampled, min ' + r.min + 's, p95 ' + r.p95 + 's' + (r.failed ? ', ' + r.failed + ' failed' : '')) + '">' +
+        '<span class="mono" style="overflow:hidden;text-overflow:ellipsis">' + esc(r.route) + '</span>' +
+        '<span class="mono ' + (slow ? 'bad' : warn ? 'warn' : '') + '">' + r.median.toFixed(3) + 's · ' + r.max.toFixed(3) + 's</span></div>';
+    }).join('');
+}
+
 /* ---- fleet-level odds and ends ---- */
 async function payload(){
   try {
@@ -1157,12 +1179,12 @@ document.addEventListener('visibilitychange', () => { if (document.hidden) stopS
 
 /* ---- start ---- */
 $('hubcmd').textContent = '# Claude Code\n' + hubCmd('claude') + '\n\n# Hermes\n' + hubCmd('hermes');
-renderWho(); ghLoadLibrary(); payload();
+renderWho(); ghLoadLibrary(); payload(); timings();
 refresh().then(() => {
   let last = parseInt((location.hash || '').slice(1), 10) || null;
   if (!last) { try { last = parseInt(localStorage.getItem('sbx-sel'), 10); } catch(e){} }
   if (last && fleetBy[last]) select(last);
 });
 setInterval(() => { refresh(); if (sel !== null && !jobId) { ghRefresh(); recLoad(); } }, 10000);
-setInterval(() => { if (sel !== null) histLoad(); }, 30000);
+setInterval(() => { if (sel !== null) histLoad(); else timings(); }, 30000);
 </script></body></html>
