@@ -1442,6 +1442,9 @@ def list_sandboxes():
 # read_launcher), and list_sandboxes reads every running sandbox's token on every
 # UI poll, so an uncached read there would put seconds of latency on each refresh.
 _TOKEN_CACHE = {}
+# vmid -> when we last looked and found nothing.
+_TOKEN_MISS = {}
+_TOKEN_MISS_TTL = 45.0
 
 
 # What was installed where. Kept on disk so the UI can still offer a link after
@@ -1535,12 +1538,24 @@ def read_token(vmid, refresh=False):
     """
     if not refresh and vmid in _TOKEN_CACHE:
         return _TOKEN_CACHE[vmid]
+    # A miss is cached too, briefly. Finding nothing costs both lookups -- about
+    # six seconds on a sandbox whose Deskhand is down, because the fast path
+    # fails before the slow one runs -- and only hits were remembered, so a
+    # sandbox without a token taxed every ten-second poll of the fleet list for
+    # as long as it existed. Short, because a sandbox mid-install gains one.
+    if not refresh:
+        miss = _TOKEN_MISS.get(vmid)
+        if miss and time.time() - miss < _TOKEN_MISS_TTL:
+            return None
     tok = read_config_token(vmid)
     if not tok:
         m = re.search(r"DESKHAND_TOKEN\s*=\s*'([^']+)'", read_launcher(vmid))
         tok = m.group(1) if m else None
     if tok:
         _TOKEN_CACHE[vmid] = tok
+        _TOKEN_MISS.pop(vmid, None)
+    else:
+        _TOKEN_MISS[vmid] = time.time()
     return tok
 
 
@@ -5354,6 +5369,18 @@ if __name__ == "__main__":
     n = publish_groundhog_library()
     if n:
         print(f"groundhog library: {n} profile(s) published to the payload port", flush=True)
+
+    # The first fleet list after a restart pays for every token read and every
+    # Deskhand probe at once -- measured at 6.5 s against four sandboxes, versus
+    # 0.11 s warm. Doing it here means the cost lands before anyone asks.
+    def _warm():
+        try:
+            entries = list_sandboxes()
+            warm_alive(entries)
+            print(f"warmed {len(entries)} sandbox(es)", flush=True)
+        except Exception as exc:                      # noqa: BLE001
+            print(f"warm-up skipped: {exc}", flush=True)
+    threading.Thread(target=_warm, daemon=True).start()
 
     threading.Thread(target=reaper_loop, daemon=True).start()
     print("expiry reaper running (default "
