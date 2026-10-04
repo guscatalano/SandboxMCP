@@ -295,7 +295,7 @@ details.adv>summary{cursor:pointer;color:var(--mut);font-size:12px;margin-bottom
       </div>
 
       <div class="sec">
-        <div class="sh">History<span class="r"><span id="hist_sum"></span><a href="#" onclick="histLoad(true);return false">Refresh</a><a href="#" onclick="histExport();return false">Export</a></span></div>
+        <div class="sh">History<span class="r"><span id="hist_sum"></span><a href="#" onclick="histLoad(true);return false">Refresh</a><a href="#" onclick="histExport();return false">Export</a><a href="#" id="hist_tog" onclick="histToggle();return false">Collapse</a></span></div>
         <div class="tl" id="hist"></div>
       </div>
 
@@ -567,6 +567,7 @@ function select(vmid){
   $('view-create').classList.add('hidden'); $('view-sb').classList.remove('hidden');
   $('i_fleet').classList.add('hidden'); $('i_sb').classList.remove('hidden');
   $('gh_editor').classList.add('hidden'); $('ag_form').classList.add('hidden');
+  histAll = false; histToggle(histOpen);
   $('recplayer').classList.add('hidden'); $('recplayer').src = '';
   $('detail').scrollTop = 0;
   renderList(); renderHeader(); renderInspector();
@@ -742,7 +743,15 @@ async function installAgents(){
 function agForm(){ toggle('ag_form'); if (!$('ag_form').classList.contains('hidden') && !$('ag_models').options.length) loadModels(); }
 
 /* ---- history ---- */
-let HIST = [];
+let HIST = [], histAll = false;
+const HIST_LIMIT = 10;
+let histOpen = true; try { histOpen = localStorage.getItem('sbx-hist') !== 'closed'; } catch(e){}
+function histToggle(force){
+  if (typeof force === 'boolean') histOpen = force; else histOpen = !histOpen;
+  try { localStorage.setItem('sbx-hist', histOpen ? 'open' : 'closed'); } catch(e){}
+  $('hist').classList.toggle('hidden', !histOpen);
+  $('hist_tog').textContent = histOpen ? 'Collapse' : 'Expand';
+}
 function histKind(w){
   w = (w || '').toLowerCase();
   if (/destroy/.test(w)) return ['red', 'end'];
@@ -761,7 +770,10 @@ async function histLoad(force){
   if (d.error) { $('hist').innerHTML = '<div class="t"></div><div class="m"><i class="red"></i></div><div class="e bad">could not load: ' + esc(d.error) + '</div>'; return; }
   HIST = d.events || [];
   const s = fleetBy[vmid] || {};
-  let html = HIST.map(e => {
+  const shown = histAll ? HIST : HIST.slice(-HIST_LIMIT);
+  const hidden = HIST.length - shown.length;
+  let html = hidden > 0 ? '<div class="t"></div><div class="m"><i class="grey"></i></div><div class="e future"><a href="#" onclick="histAll=true;histLoad();return false">' + hidden + ' earlier event' + (hidden === 1 ? '' : 's') + ' · show all</a></div>' : (histAll && HIST.length > HIST_LIMIT ? '<div class="t"></div><div class="m"><i class="grey"></i></div><div class="e future"><a href="#" onclick="histAll=false;histLoad();return false">show only the latest ' + HIST_LIMIT + '</a></div>' : '');
+  html += shown.map(e => {
     const k = histKind(e.what), cls = k[0] + (e.ok === false ? ' red' : '');
     return '<div class="t" title="' + esc(e.when) + '">' + hhmm(e.ts) + '</div><div class="m"><i class="' + cls + '"></i></div>' +
       '<div class="e"><span class="k">' + k[1] + '</span><b>' + esc(e.what) + '</b>' + (e.count > 1 ? '<span class="n">×' + e.count + (e.last ? ' · last ' + hhmm(e.last) : '') + '</span>' : '') +
@@ -769,7 +781,7 @@ async function histLoad(force){
   }).join('');
   if (s.expires_at) html += '<div class="t">' + hhmm(s.expires_at) + '</div><div class="m"><i class="grey"></i></div><div class="e future"><span class="k">expiry</span><b>Scheduled destroy</b><p>unless extended · a held sandbox is left alone until its claim lapses</p></div>';
   $('hist').innerHTML = html || '<div class="t"></div><div class="m"><i class="dim"></i></div><div class="e muted">Nothing recorded yet.</div>';
-  $('hist_sum').textContent = HIST.length + ' event' + (HIST.length === 1 ? '' : 's') + ' · controller and Proxmox';
+  $('hist_sum').textContent = (hidden > 0 ? 'latest ' + shown.length + ' of ' + HIST.length : HIST.length + ' event' + (HIST.length === 1 ? '' : 's')) + ' · controller and Proxmox';
 }
 function histExport(){
   const s = fleetBy[sel] || {};
