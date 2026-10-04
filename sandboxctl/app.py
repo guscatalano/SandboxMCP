@@ -1551,15 +1551,54 @@ def read_config_token(vmid, timeout=90):
         "$p = Join-Path $env:ProgramData 'Deskhand\\deskhand.json'\n"
         "if (Test-Path $p) { Get-Content -Raw -LiteralPath $p }",
         timeout=timeout)
+    out = strip_clixml(out)
     if not out:
         return None
     try:
-        return (json.loads(out.strip()) or {}).get("token") or None
+        return (json.loads(out) or {}).get("token") or None
     except Exception:                                 # noqa: BLE001
         # Not JSON yet, or half-written mid-install. The regex is a last resort
         # rather than the plan, so a malformed file does not become a crash.
         m = re.search(r'"token"\s*:\s*"([^"]+)"', out)
         return m.group(1) if m else None
+
+
+def strip_clixml(text):
+    """Drop PowerShell's serialised progress stream from a guest reply.
+
+    The guest agent merges stdout and the other streams, so a reply often ends
+    with "#< CLIXML" followed by an XML blob describing a progress record. It is
+    not output, it is not an error, and it makes anything that parses the reply
+    whole -- JSON especially -- fail on a result that is actually fine.
+    """
+    if not text:
+        return ""
+    cut = text.find("#< CLIXML")
+    return (text[:cut] if cut >= 0 else text).strip()
+
+
+def read_config(vmid, timeout=90):
+    """All of deskhand.json, for callers that need more than the token."""
+    out = agent_run_ps(
+        vmid,
+        "$ErrorActionPreference='SilentlyContinue'" + chr(10) +
+        "$p = Join-Path $env:ProgramData 'Deskhand" + chr(92) + "deskhand.json'" + chr(10) +
+        "if (Test-Path $p) { Get-Content -Raw -LiteralPath $p }",
+        timeout=timeout)
+    out = strip_clixml(out)
+    if not out:
+        return {}
+    try:
+        return json.loads(out) or {}
+    except Exception:                                 # noqa: BLE001
+        # A half-written file mid-install, or something else printed first.
+        i, j = out.find("{"), out.rfind("}")
+        if i >= 0 and j > i:
+            try:
+                return json.loads(out[i:j + 1]) or {}
+            except Exception:                         # noqa: BLE001
+                pass
+        return {}
 
 
 def read_token(vmid, refresh=False):
@@ -1736,6 +1775,7 @@ files:
         "token": "${secret:DESKHAND_TOKEN}",
         "port": @@PORT@@,
         "bind": "any",
+        "hideConsole": true,
         "maxToolChars": @@TOOLCHARS@@,
         "enableShell": @@SHELL@@,
         "enableSessionLaunch": @@SHELL@@@@TLS_LINE@@
@@ -1853,6 +1893,11 @@ if (-not `$ip) { `$ip = 'any' }
 # cap to a 1.5k preview, so a Deskhand budget larger than that just guarantees
 # the client throws the difference away.
 `$env:DESKHAND_MAX_TOOL_CHARS = '@@TOOLCHARS@@'
+# Deskhand runs in the logged-in session because it has to drive the desktop,
+# and a plain exe in a session means a console window sitting on that desktop --
+# in every screenshot, and in the way of anything being automated. 0.2.32 added
+# this; on an older build it is simply an unknown variable and is ignored.
+`$env:DESKHAND_HIDE_CONSOLE = '1'
 @@SHELL_LINE@@
 @@TLS_LINE@@
 Set-Location '$dir'
@@ -2083,6 +2128,27 @@ def install_deskhand_groundhog(job, vmid, opts, token):
     sha = _payload_sha256(f"{SELF_URL}/payload/{asset}")
     if not sha:
         raise RuntimeError("could not hash the staged deskhand.zip to pin it")
+
+    # Stop Deskhand before the files step replaces its folder. "extract: true"
+    # swaps C:\Deskhand wholesale, and a running Deskhand holds its own binaries
+    # open, so reinstalling over a live one failed with "cannot replace
+    # C:\Deskhand: Access is denied". Nothing to stop on a fresh install, so this
+    # is a no-op there -- and Groundhog runs files before run, which is why this
+    # cannot simply live in the Groundhogfile's run step.
+    try:
+        agent_run_ps(vmid, chr(10).join([
+            "$ErrorActionPreference='SilentlyContinue'",
+            "Stop-ScheduledTask -TaskName 'Deskhand' -ErrorAction SilentlyContinue",
+            "Get-Process deskhand-http -ErrorAction SilentlyContinue | "
+            "Stop-Process -Force -ErrorAction SilentlyContinue",
+            "$by = (Get-Date).AddSeconds(20)",
+            "while ((Get-Process deskhand-http -ErrorAction SilentlyContinue) -and "
+            "(Get-Date) -lt $by) { Start-Sleep -Milliseconds 500 }",
+            "Write-Output 'STOPPED'",
+        ]), timeout=120)
+        job.log("stopped any running Deskhand so its folder can be replaced")
+    except Exception as exc:                          # noqa: BLE001
+        job.log(f"  could not stop a running Deskhand first: {exc}")
 
     tls = ',\n        "tls": "self-signed"' if opts.get("tls") else ""
     body = (DESKHAND_GROUNDHOG
@@ -3350,19 +3416,33 @@ def do_update(job, vmid):
     if (vm("/status/current", vmid=vmid) or {}).get("status") != "running":
         raise RuntimeError("sandbox must be running to update it")
 
-    cur = read_launcher(vmid, timeout=120)
-    if "DESKHAND_TOKEN" not in cur:
-        raise RuntimeError("Deskhand is not installed on this sandbox; use repair_sandbox instead")
-
-    m = re.search(r"DESKHAND_TOKEN\s*=\s*'([^']+)'", cur)
-    if not m:
-        raise RuntimeError("could not read the existing token; use repair_sandbox instead")
-    token = m.group(1)
-    pm = re.search(r"DESKHAND_PORT\s*=\s*'(\d+)'", cur)
-    port = int(pm.group(1)) if pm else 8791
-    shell = "DESKHAND_ENABLE_SHELL" in cur
-    tls = "DESKHAND_TLS" in cur
-    job.log(f"preserving token/port {port} shell={shell} tls={tls}")
+    # deskhand.json first. The declarative install -- the default since Groundhog
+    # took over the install -- writes that and no launcher at all, so looking only
+    # for a launcher reported "Deskhand is not installed" on a sandbox where it
+    # was installed and running, and sent people to the heavy repair instead.
+    cfg = read_config(vmid, timeout=120)
+    token = (cfg.get("token") or "").strip() or None
+    declarative = bool(token)
+    if token:
+        port = int(cfg.get("port") or 8791)
+        shell = bool(cfg.get("enableShell", True))
+        tls = bool(cfg.get("tls"))
+    else:
+        cur = read_launcher(vmid, timeout=120)
+        m = re.search(r"DESKHAND_TOKEN\s*=\s*'([^']+)'", cur or "")
+        if not m:
+            raise RuntimeError(
+                "no Deskhand configuration found on this sandbox -- neither "
+                "deskhand.json nor a launcher holds a token, so there is nothing to "
+                "reinstall in place. Rebuild the setup instead, which installs it "
+                "fresh with a new token.")
+        token = m.group(1)
+        pm = re.search(r"DESKHAND_PORT\s*=\s*'(\d+)'", cur)
+        port = int(pm.group(1)) if pm else 8791
+        shell = "DESKHAND_ENABLE_SHELL" in cur
+        tls = "DESKHAND_TLS" in cur
+    job.log(f"preserving token, port {port}, shell={shell}, tls={tls} "
+            f"(from {'deskhand.json' if declarative else 'the launcher'})")
 
     kind = artifact_kind()
     if kind is None:
@@ -3377,8 +3457,14 @@ def do_update(job, vmid):
               .replace("@@TLS_LINE@@", "`$env:DESKHAND_TLS = 'self-signed'" if tls else "")
               .replace("@@USER@@", WIN_USER)
               .replace("@@TOOLCHARS@@", str(DESKHAND_TOOL_CHARS)))
-    job.log(f"installing {asset}")
-    run_install(job, vmid, script)
+    if declarative and kind == "zip":
+        # Same route it came in by, so the config file stays the source of truth
+        # and picks up anything new in it -- hideConsole, for one.
+        job.log(f"reinstalling {asset} the declarative way, keeping the token")
+        install_deskhand_groundhog(job, vmid, {"port": port, "shell": shell, "tls": tls}, token)
+    else:
+        job.log(f"installing {asset}")
+        run_install(job, vmid, script)
     after = read_token(vmid, refresh=True)
     job.result = {"vmid": vmid, "token_preserved": after == token}
     job.log("done" + ("" if after == token else "  WARNING: token changed"))
