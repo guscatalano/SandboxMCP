@@ -94,11 +94,12 @@ pre{margin:0;background:var(--inset);border:1px solid var(--ln);border-radius:6p
 .fb img{display:block;width:100%;height:auto;max-height:70vh;object-fit:contain;background:#000}
 .fb .live{position:absolute;top:8px;right:8px;font-size:10px;color:#fff;background:#DC2626;padding:1px 6px;border-radius:3px;font-weight:600}
 .fb .msg{color:var(--mut);font-size:12px;padding:20px;text-align:center}
-.steps{display:grid;grid-auto-flow:column;grid-auto-columns:minmax(0,1fr);gap:4px;padding:10px 12px 6px}
-.step{font-size:10px;text-align:center;color:var(--fg2)}
-.step i{display:block;height:6px;border-radius:3px;background:var(--ln3);margin-bottom:4px}
-.step.done i{background:var(--ok)} .step.failed i{background:var(--bad)} .step.failed{color:var(--bad)} .step.changed i{background:var(--acc)}
-.step span{display:block;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.steps{display:flex;flex-wrap:wrap;gap:6px;padding:10px 12px 6px}
+.step{display:inline-flex;align-items:center;gap:6px;font-size:12px;color:var(--fg2);background:var(--inset);border:1px solid var(--ln);border-radius:999px;padding:3px 10px;max-width:100%}
+.step i{width:7px;height:7px;border-radius:50%;background:var(--ln3);flex:none}
+.step.done i{background:var(--ok)} .step.failed i{background:var(--bad)} .step.changed i{background:var(--acc)}
+.step.failed{color:var(--bad);border-color:#5A2A2A;background:var(--bad-bg)}
+.step span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .kv{display:grid;grid-template-columns:auto minmax(0,1fr);gap:4px 12px;font-size:12px;margin:0}
 .kv dt{color:var(--mut);margin:0}.kv dd{margin:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .agents{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:1px;background:var(--ln2)}
@@ -343,6 +344,12 @@ details.adv>summary{cursor:pointer;color:var(--mut);font-size:12px;margin-bottom
         <div class="btns" id="i_claim_btns"></div>
       </div>
       <div class="grp">
+        <div class="gl">Power</div>
+        <div class="btns" id="i_power"></div>
+        <div class="hint" id="i_powernote"></div>
+        <div class="hint hidden" id="i_agentwarn"><span class="warn">No answer from the guest agent.</span> Windows may well be up and logged on behind this, but the controller cannot read its address or token without the agent, so Watch and the endpoint stay empty. A reboot usually brings it back.</div>
+      </div>
+      <div class="grp">
         <div class="gl">Expires <b id="i_exp" class="mono"></b></div>
         <div class="seg" id="i_ttl">
           <button onclick="setTtl(15)">15m</button><button onclick="setTtl(60)">1h</button><button onclick="setTtl(240)">4h</button><button onclick="setTtl(1440)">24h</button><button onclick="setTtl(0)">never</button>
@@ -350,10 +357,19 @@ details.adv>summary{cursor:pointer;color:var(--mut);font-size:12px;margin-bottom
         <div class="btns"><button class="btn sm" onclick="extendTtl(60)">Extend 1 h</button></div>
       </div>
       <div class="grp">
-        <div class="gl">Isolation</div>
-        <div class="fact"><span>Egress</span><span>controller payload port only</span></div>
+        <div class="gl">Containment</div>
+        <div class="seg" id="i_egress">
+          <button onclick="setEgress('open')">Open</button><button onclick="setEgress('local')">Local</button><button onclick="setEgress('blocked')">Blocked</button>
+        </div>
+        <div class="hint" id="i_egressnote">reading…</div>
         <div class="fact"><span>Recorder</span><span id="i_rec">—</span></div>
         <div class="fact"><span>Groundhog</span><span id="i_gh">—</span></div>
+      </div>
+      <div class="grp">
+        <div class="gl">Snapshots <span id="i_snapsum" class="muted"></span></div>
+        <div id="i_snaps"></div>
+        <div class="btns"><button class="btn sm" onclick="snapTake()">Take snapshot</button></div>
+        <div class="hint">Disk only, never memory. Reverting stops the sandbox, rolls it back and starts it again, and everything written since is gone.</div>
       </div>
       <div class="grp" id="i_endpoint">
         <div class="gl">Endpoint</div>
@@ -379,6 +395,7 @@ details.adv>summary{cursor:pointer;color:var(--mut);font-size:12px;margin-bottom
 <script>
 'use strict';
 const $ = id => document.getElementById(id);
+const Q = String.fromCharCode(39);
 const PVE = { host: '@@PVEHOST@@', node: '@@PVENODE@@' };
 let fleet = [], fleetBy = {}, cap = null, jobsList = [];
 let sel = null, filter = 'all', query = '';
@@ -520,6 +537,8 @@ function rowTags(s){
   else if (s.groundhog === 'succeeded') t.push('<span class="tag ok">groundhog ✓</span>');
   else if (s.groundhog === 'reboot-pending') t.push('<span class="tag warn">needs reboot</span>');
   else if (s.groundhog && s.groundhog !== 'none') t.push('<span class="tag warn">groundhog ' + esc(s.groundhog) + '</span>');
+  if (s.egress === 'blocked') t.push('<span class="tag bad">egress blocked</span>');
+  else if (s.egress === 'local') t.push('<span class="tag warn">no internet</span>');
   if (s.status === 'running' && !s.token) t.push('<span class="tag bad">no token</span>');
   if (s.notes) t.push('<span class="tag">' + s.notes + ' note' + (s.notes === 1 ? '' : 's') + '</span>');
   return t.length ? '<div class="tags">' + t.join('') + '</div>' : '';
@@ -567,7 +586,7 @@ function select(vmid){
   $('view-create').classList.add('hidden'); $('view-sb').classList.remove('hidden');
   $('i_fleet').classList.add('hidden'); $('i_sb').classList.remove('hidden');
   $('gh_editor').classList.add('hidden'); $('ag_form').classList.add('hidden');
-  histAll = false; histToggle(histOpen);
+  histAll = false; histToggle(histOpen); EGRESS_MSG = '';
   $('recplayer').classList.add('hidden'); $('recplayer').src = '';
   $('detail').scrollTop = 0;
   renderList(); renderHeader(); renderInspector();
@@ -598,7 +617,7 @@ function renderHeader(){
   else if (!screenTimer) screenMode();
 }
 function loadSections(){
-  ghRefresh(); histLoad(); recLoad(); notesLoad(); agentsRender();
+  ghRefresh(); histLoad(); recLoad(); notesLoad(); agentsRender(); containLoad();
 }
 
 /* ---- console ---- */
@@ -834,6 +853,87 @@ async function addNote(){
   txt.value = ''; notesLoad(); histLoad(true); refresh();
 }
 
+/* ---- power, containment, snapshots ---- */
+let CONTAIN = null, EGRESS_MSG = '';
+async function containLoad(){
+  const vmid = sel; if (vmid === null) return;
+  CONTAIN = null; renderContain();
+  const d = await getJSON('api/containment?vmid=' + vmid).catch(e => ({error: e.message}));
+  if (vmid !== sel) return;
+  CONTAIN = d; renderContain();
+}
+function renderContain(){
+  const d = CONTAIN;
+  const note = $('i_egressnote'), seg = $('i_egress');
+  if (!d || d.error) {
+    note.textContent = d ? ('could not read it: ' + d.error) : 'reading…';
+    seg.querySelectorAll('button').forEach(b => { b.classList.remove('on'); b.disabled = !!d; });
+    $('i_snaps').innerHTML = ''; $('i_snapsum').textContent = '';
+    return;
+  }
+  seg.querySelectorAll('button').forEach(b => {
+    const m = b.textContent.toLowerCase();
+    b.disabled = false;
+    b.classList.toggle('on', m === d.egress);
+  });
+  note.innerHTML = esc((d.modes || {})[d.egress] || d.egress) + (EGRESS_MSG ? ' ' + EGRESS_MSG : '');
+  const snaps = d.snapshots || [];
+  $('i_snapsum').textContent = snaps.length ? String(snaps.length) : '';
+  $('i_snaps').innerHTML = snaps.length ? snaps.map(sn =>
+    '<div class="fact"><span title="' + esc(sn.description || '') + '">' + esc(sn.name) + '</span>' +
+    '<span><a href="#" onclick="snapRevert(\'' + esc(sn.name) + '\');return false">revert</a> · ' +
+    '<a href="#" onclick="snapDelete(\'' + esc(sn.name) + '\');return false">delete</a></span></div>').join('')
+    : '<div class="hint" style="margin:0">None yet.</div>';
+}
+async function setEgress(mode){
+  if (sel === null) return;
+  const seg = $('i_egress');
+  seg.querySelectorAll('button').forEach(b => b.disabled = true);
+  // Proxmox recompiles on a timer, so this genuinely takes about ten seconds.
+  // Saying so beats a button that looks stuck.
+  $('i_egressnote').textContent = 'changing, then confirming from inside the sandbox (about 10 s)…';
+  EGRESS_MSG = '';
+  const d = await post('api/egress', {vmid: sel, mode, who: whoAmI(true)});
+  if (d.error) { alert('Could not change it: ' + d.error); }
+  else if (d.warning) EGRESS_MSG = '<span class="bad">' + esc(d.warning) + '</span>';
+  else if (d.verified) EGRESS_MSG = '<span class="ok">confirmed in the sandbox after ' + d.verified_after_seconds + ' s</span>';
+  else if (d.verified === null) EGRESS_MSG = '<span class="muted">not confirmed: the guest could not be asked</span>';
+  containLoad(); refresh(); histLoad(true);
+}
+async function snapTake(){
+  if (sel === null) return;
+  const name = (prompt('Snapshot name (letters, digits, dash):', 'pre-' + new Date().toISOString().slice(11, 16).replace(':', '')) || '').trim();
+  if (!name) return;
+  const what = (prompt('What is this the state before? (optional)') || '').trim();
+  const d = await post('api/snapshot', {vmid: sel, op: 'take', name, description: what, who: whoAmI(true)});
+  if (d.error) { alert('Could not take it: ' + d.error); return; }
+  containLoad(); histLoad(true);
+}
+async function snapDelete(name){
+  if (sel === null || !confirm('Delete snapshot "' + name + '"? The sandbox itself is untouched.')) return;
+  const d = await post('api/snapshot', {vmid: sel, op: 'delete', name, who: whoAmI(true)});
+  if (d.error) { alert('Could not delete it: ' + d.error); return; }
+  containLoad(); histLoad(true);
+}
+async function snapRevert(name){
+  const sb = fleetBy[sel]; if (!sb) return;
+  if (!confirm('Revert ' + sb.name + ' to "' + name + '"?\n\nEverything written since that snapshot is lost, including recordings still inside the guest. It stops, rolls back and starts again.')) return;
+  const d = await post('api/snapshot', {vmid: sel, op: 'revert', name, who: whoAmI(true)});
+  if (d.error) { alert('Could not revert it: ' + d.error); return; }
+  followJob(d.id);
+}
+async function power(action){
+  const sb = fleetBy[sel]; if (!sb) return;
+  if (action === 'stop' && !confirm('Force stop ' + sb.name + '?\n\nThis is the power cable, not a shutdown. Windows gets no warning.')) return;
+  $('i_power').querySelectorAll('button').forEach(b => b.disabled = true);
+  $('i_powernote').textContent = 'working…';
+  const d = await post('api/power', {vmid: sel, action, who: whoAmI(true)});
+  if (d.error) { alert(d.error); $('i_powernote').textContent = ''; }
+  else $('i_powernote').textContent = d.note || (d.changed ? (action + ' sent') : '');
+  refresh(); histLoad(true);
+  setTimeout(() => { refresh(); containLoad(); }, 4000);
+}
+
 /* ---- inspector ---- */
 function renderInspector(){
   const s = fleetBy[sel]; if (!s) return;
@@ -869,9 +969,22 @@ function renderInspector(){
   $('i_hermes').classList.toggle('hidden', !hermes); if (hermes) $('i_hermes').href = 'http://' + s.ip + ':' + a.dashboard_port + '/';
   $('i_hcred').classList.toggle('hidden', !a.dashboard_password);
   if (a.dashboard_password) $('i_hcred').innerHTML = 'Hermes sign-in: user <code>' + esc(a.dashboard_user || 'sandbox') + '</code> · pass <code>' + esc(a.dashboard_password) + '</code>';
+  const pw = running
+    ? '<button class="btn sm" onclick="power(' + Q + 'shutdown' + Q + ')" title="Ask Windows to shut down; it can hang on a modal dialog">Shut down</button>' +
+      '<button class="btn sm" onclick="power(' + Q + 'reboot' + Q + ')">Reboot</button>' +
+      '<button class="btn sm dng" onclick="power(' + Q + 'stop' + Q + ')" title="The power cable. Risks a dirty filesystem.">Force stop</button>'
+    : '<button class="btn sm pri" onclick="power(' + Q + 'start' + Q + ')">Start</button>';
+  $('i_power').innerHTML = pw;
+  $('i_powernote').textContent = running
+    ? 'Stopping frees a running slot and the memory its recorder costs.'
+    : 'It keeps its disk, its name and its notes while it is off.';
   $('i_repair').textContent = s.token ? 'Repair' : 'Finish setup';
   $('i_update').disabled = !s.token;
   $('i_lost').textContent = 'Destroying removes the VM and its disk. Recordings and notes stay on the controller.';
+  // Running, but the controller cannot see it: almost always the guest agent
+  // did not come back with the VM. Windows is usually fine behind this.
+  const mute = running && !s.token && !s.ip;
+  $('i_agentwarn').classList.toggle('hidden', !mute);
 }
 async function claim(){
   const who = whoAmI(); if (!who) return;

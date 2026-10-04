@@ -2062,6 +2062,82 @@ MCP_TOOLS = [
         },
     },
     {
+        "name": "power_sandbox",
+        "description": ("Start, shut down, stop or reboot a sandbox without destroying it. "
+                        "Stopping returns a running slot and the ~180 MB its console recorder "
+                        "costs the controller, so it is how you make room without throwing a "
+                        "sandbox away. Starting is refused at the running limit for the same "
+                        "reason a create is. shutdown asks Windows politely and can hang on a "
+                        "modal dialog; stop is the power cable and risks a dirty filesystem."),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "vmid": {"type": "integer"},
+                "action": {"type": "string", "enum": ["start", "shutdown", "stop", "reboot"]},
+                "who": {"type": "string", "description": "You, for the history."},
+                "force": {"type": "boolean",
+                          "description": "Act on a sandbox someone else holds. Default false."},
+            },
+            "required": ["vmid", "action"],
+        },
+    },
+    {
+        "name": "set_egress",
+        "description": ("Change what a sandbox can reach on the network. 'open' is how one is "
+                        "built: the internet is allowed, the home LAN and sibling sandboxes are "
+                        "not. 'local' keeps the controller, the inference endpoint and DNS but "
+                        "cuts the internet. 'blocked' stops everything leaving. This is enforced "
+                        "by the hypervisor, not inside Windows, so something running as "
+                        "administrator in the sandbox cannot switch it off. Deskhand stays "
+                        "reachable in every mode, because answering a connection you opened is "
+                        "not egress -- so you can still drive a sandbox you have just cut off. "
+                        "Set it to blocked before detonating anything you do not want phoning "
+                        "home, and note that a change takes about ten seconds to take effect "
+                        "because Proxmox recompiles on a timer -- leave verify on and this call "
+                        "waits for it rather than telling you it is contained before it is."),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "vmid": {"type": "integer"},
+                "mode": {"type": "string", "enum": ["open", "local", "blocked"]},
+                "who": {"type": "string", "description": "You, for the history."},
+                "verify": {"type": "boolean",
+                           "description": ("Confirm the change from inside the sandbox before "
+                                           "returning. Default true, and worth leaving on: "
+                                           "Proxmox compiles its ruleset on a timer, so a block "
+                                           "takes about ten seconds to actually take effect. "
+                                           "With this on, the call returns when the sandbox "
+                                           "really cannot get out, and the reply carries "
+                                           "verified and verified_after_seconds.")},
+            },
+            "required": ["vmid", "mode"],
+        },
+    },
+    {
+        "name": "snapshot_sandbox",
+        "description": ("Take, list, roll back to, or delete a disk snapshot. Take one before "
+                        "running something you cannot undo; revert puts the disk back exactly "
+                        "as it was. Snapshots here are disk only and never memory, so a revert "
+                        "stops the sandbox, rolls it back and starts it again if it was running "
+                        "-- it returns a job id, so poll job_status. Everything written since "
+                        "the snapshot is gone, including anything you were keeping as evidence, "
+                        "so pull files out first."),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "vmid": {"type": "integer"},
+                "op": {"type": "string", "enum": ["list", "take", "revert", "delete"],
+                       "description": "Default list."},
+                "name": {"type": "string",
+                         "description": ("Snapshot name. Required for revert and delete; "
+                                         "defaults to a timestamp when taking one.")},
+                "description": {"type": "string", "description": "Optional, shown when listing."},
+                "who": {"type": "string", "description": "You, for the history."},
+            },
+            "required": ["vmid"],
+        },
+    },
+    {
         "name": "claim_sandbox",
         "description": ("Say you are using a sandbox, so nobody destroys it under you. "
                         "Advisory: it does not stop anyone driving the machine, but "
@@ -3293,6 +3369,380 @@ if REC_DIR:
 _REC_WARNED = ""
 
 
+# --------------------------------------------------------------------------
+# Power, containment and snapshots
+#
+# Three things a sandbox needs that Proxmox can do and this controller could
+# not: turn it off without destroying it, cut its network, and keep a point to
+# go back to. Power and containment are what make a sandbox reusable rather
+# than disposable-only; the snapshot is what makes detonating something in one
+# a repeatable experiment instead of a one-way trip.
+# --------------------------------------------------------------------------
+POWER_ACTIONS = {
+    "start":    ("/status/start",    "powered on"),
+    "shutdown": ("/status/shutdown", "shut down"),
+    "stop":     ("/status/stop",     "powered off"),
+    "reboot":   ("/status/reboot",   "rebooted"),
+}
+
+
+def vm_status(vmid):
+    try:
+        return (vm("/status/current", vmid=vmid) or {}).get("status", "unknown")
+    except Exception:                                 # noqa: BLE001
+        return "unknown"
+
+
+def _wait_status(vmid, want, timeout=120):
+    end = time.time() + timeout
+    while time.time() < end:
+        if vm_status(vmid) == want:
+            return True
+        time.sleep(2)
+    return False
+
+
+def power_sandbox(vmid, action, who="", force=False):
+    """Start, shut down, stop or reboot a sandbox.
+
+    Starting is capacity-checked exactly like a create. A stopped sandbox
+    coming back up takes a running slot and a console recorder with it, and the
+    memory ceiling does not care how the VM got there -- without this, start
+    would be the one way to walk past the limit that create respects.
+
+    Stopping is the point of the whole thing: it returns a running slot and
+    ~180 MB of recorder without destroying anything, which until now was only
+    possible by throwing the sandbox away.
+    """
+    vmid = _check_managed(vmid)
+    if action not in POWER_ACTIONS:
+        raise ValueError("action must be one of: " + ", ".join(sorted(POWER_ACTIONS)))
+    path, label = POWER_ACTIONS[action]
+    now = vm_status(vmid)
+    if action == "start":
+        if now == "running":
+            return {"vmid": vmid, "status": "running", "changed": False,
+                    "note": "it was already running"}
+        cap = capacity()
+        if cap["running"] >= MAX_RUNNING:
+            raise RuntimeError(
+                f"at the running limit: {cap['running']} of {MAX_RUNNING} are running. "
+                "Each running sandbox costs the controller ~180 MB for its console "
+                "recorder. Stop one you are not using, or raise max_running in "
+                "config.json.")
+    else:
+        # Turning off someone else's sandbox is as disruptive as repairing it.
+        _guard_claim(vmid, action, who, force)
+        if now != "running":
+            return {"vmid": vmid, "status": now, "changed": False,
+                    "note": "it was not running"}
+    vm(path, "POST", vmid=vmid, timeout=90)
+    record_event(vmid, label, (who or "").strip()[:60])
+    # Report what the VM is, not what it was asked to be. Proxmox returns as
+    # soon as it has accepted the request, so reading the status straight after
+    # a start reports "stopped" and reads as a failure.
+    if action in ("stop", "shutdown"):
+        _wait_status(vmid, "stopped", timeout=30 if action == "shutdown" else 15)
+        # The token was read out of a guest that is no longer there to ask.
+        _TOKEN_CACHE.pop(vmid, None)
+        _EGRESS_CACHE.pop(vmid, None)
+    elif action == "start":
+        _wait_status(vmid, "running", timeout=30)
+    out = {"vmid": vmid, "status": vm_status(vmid), "changed": True, "action": action}
+    if action == "start":
+        # Windows still has to boot and Deskhand still has to come up; the VM
+        # being "running" is the start of that, not the end of it. And a cold
+        # start sometimes loses the guest agent even though Windows is fine --
+        # the agent service races the virtio-serial driver it talks over, and
+        # when it loses, the sandbox is up, logged on and serving Deskhand
+        # while this controller cannot see an address for it. A reboot settles
+        # it, so say so here rather than let it look like a failed start.
+        out["note"] = ("powered on. Windows takes a minute or two to log on and bring "
+                       "Deskhand back. If it is still showing no address after that, "
+                       "reboot it: a cold start occasionally comes up without the guest "
+                       "agent, and a reboot restores it")
+    return out
+
+
+# ---- containment -----------------------------------------------------------
+# Every sandbox carries one firewall rule: a reference to the "sandbox"
+# security group, which allows the inference endpoint, the controller's payload
+# port and the gateway, and drops the private ranges. The internet is reachable
+# only because nothing in that group matches it.
+#
+# Proxmox evaluates rules top to bottom and the first match wins, so a single
+# "drop everything outbound" rule says two different things depending on where
+# it sits. Above the group, the group is never consulted and nothing leaves at
+# all. Below it, the group's allowances still stand and the only traffic left
+# to fall through is the internet. One rule, two useful modes, and both inherit
+# whatever the group says rather than restating it -- edit the group and these
+# follow.
+EGRESS_TAG = "sandboxctl:"
+EGRESS_MODES = {
+    "open":    "internet allowed; the home LAN and sibling sandboxes are not",
+    "local":   "controller, inference endpoint and DNS only; no internet",
+    "blocked": "nothing leaves this sandbox at all",
+}
+# vmid -> (mode, read_at). Containment state belongs in the fleet list, but
+# reading it costs a Proxmox call per sandbox, so it is held briefly rather
+# than fetched on every ten-second poll.
+_EGRESS_CACHE = {}
+_EGRESS_TTL = 60.0
+
+
+def _fw_rules(vmid):
+    return vm("/firewall/rules", vmid=vmid) or []
+
+
+def _egress_of(rules):
+    ours = [r for r in rules if str(r.get("comment") or "").startswith(EGRESS_TAG)]
+    if not ours:
+        return "open"
+    group = next((r for r in rules if r.get("type") == "group"), None)
+    if group is None:
+        return "blocked"
+    return "blocked" if ours[0].get("pos", 0) < group.get("pos", 0) else "local"
+
+
+def get_egress(vmid, cached=False):
+    """Which containment mode a sandbox is in.
+
+    Derived from the live rules rather than remembered: this is changeable in
+    the Proxmox UI, and a stored answer about whether a box can reach the
+    internet would eventually be a confident lie.
+    """
+    vmid = int(vmid)
+    if cached:
+        hit = _EGRESS_CACHE.get(vmid)
+        if hit and time.time() - hit[1] < _EGRESS_TTL:
+            return hit[0]
+    try:
+        mode = _egress_of(_fw_rules(vmid))
+    except Exception:                                 # noqa: BLE001
+        return None if cached else "unknown"
+    _EGRESS_CACHE[vmid] = (mode, time.time())
+    return mode
+
+
+# Proxmox compiles its ruleset on a timer rather than when the rule is written,
+# so a change takes a measured ten to twelve seconds to actually bite. That gap
+# is the whole ballgame for this feature: "blocked" that is not yet blocked,
+# returned to someone about to detonate a sample, is worse than no button at
+# all. So the guest is asked whether it can still get out, and the answer comes
+# from the sandbox rather than from the API that was just written to.
+# No backslash escapes anywhere in this string: a newline written as an escape
+# is interpreted by whatever generates this file before Python ever sees it,
+# which is the same trap the dashboard used to sit in. chr(10) cannot be
+# misread by anything.
+EGRESS_PROBE = chr(10).join([
+    "function TryTcp($h,$p){try{$c=New-Object Net.Sockets.TcpClient;"
+    "$r=$c.BeginConnect($h,$p,$null,$null);$ok=$r.AsyncWaitHandle.WaitOne(2500,$false);"
+    "if($ok){try{$c.EndConnect($r)}catch{$ok=$false}};$c.Close();return $ok}"
+    "catch{return $false}}",
+    "Write-Output ('OUT|' + (TryTcp 'github.com' 443))",
+    ""])
+
+
+def egress_reaches_internet(vmid):
+    """True, False, or None when the guest could not be asked."""
+    try:
+        out = agent_run_ps(vmid, EGRESS_PROBE, timeout=60) or ""
+    except Exception:                                 # noqa: BLE001
+        return None
+    for line in out.splitlines():
+        if line.strip().startswith("OUT|"):
+            return line.strip().split("|", 1)[1].strip().lower().startswith("t")
+    return None
+
+
+def verify_egress(vmid, mode, timeout=45):
+    """Wait until the sandbox really is in the state the rules claim.
+
+    Returns (verified, seconds, note). verified is None when the guest cannot
+    be asked at all, which is not a failure -- a stopped sandbox reaches
+    nothing by definition.
+    """
+    want_reach = (mode == "open")
+    start = time.time()
+    last = None
+    while time.time() - start < timeout:
+        last = egress_reaches_internet(vmid)
+        if last is None:
+            return None, round(time.time() - start, 1), "the guest could not be asked"
+        if last == want_reach:
+            return True, round(time.time() - start, 1), ""
+        time.sleep(2)
+    return False, round(time.time() - start, 1), (
+        "still reaching the internet" if last else "still cut off")
+
+
+def set_egress(vmid, mode, who="", verify=False):
+    vmid = _check_managed(vmid)
+    if mode not in EGRESS_MODES:
+        raise ValueError("mode must be one of: " + ", ".join(EGRESS_MODES))
+    rules = _fw_rules(vmid)
+    group = next((r for r in rules if r.get("type") == "group"), None)
+    if mode == "local" and group is None:
+        raise RuntimeError(
+            "this sandbox has no security group rule, so there is nothing for "
+            "'local' to keep. Use 'blocked', or restore the group in Proxmox.")
+    # Drop ours highest-position first; deleting a rule renumbers the ones
+    # under it, so going upward would delete the wrong rule on the second pass.
+    for r in sorted([r for r in rules if str(r.get("comment") or "").startswith(EGRESS_TAG)],
+                    key=lambda r: -int(r.get("pos", 0))):
+        vm(f"/firewall/rules/{int(r['pos'])}", "DELETE", vmid=vmid)
+    if mode != "open":
+        # A new rule always lands at the top whatever position is asked for, so
+        # "blocked" is simply a create. "local" has to be moved below the group
+        # afterwards, and moveto=N means "sit where index N is now", so the
+        # group's own position plus one puts it immediately underneath.
+        vm("/firewall/rules", "POST", {
+            "type": "out", "action": "DROP", "enable": 1,
+            "comment": f"{EGRESS_TAG} egress {mode}",
+        }, vmid=vmid)
+        if mode == "local":
+            rules = _fw_rules(vmid)
+            group = next((r for r in rules if r.get("type") == "group"), None)
+            ours = next((r for r in rules
+                         if str(r.get("comment") or "").startswith(EGRESS_TAG)), None)
+            if group is not None and ours is not None:
+                vm(f"/firewall/rules/{int(ours['pos'])}", "PUT",
+                   {"moveto": int(group["pos"]) + 1}, vmid=vmid)
+    _EGRESS_CACHE.pop(vmid, None)
+    now = get_egress(vmid)
+    record_event(vmid, f"egress {now}", (who or "").strip()[:60])
+    out = {"vmid": vmid, "mode": now, "note": EGRESS_MODES.get(now, ""),
+           "modes": EGRESS_MODES}
+    if now != mode:
+        # Only ever stricter than asked, by construction -- but say so rather
+        # than report success for a mode this is not in.
+        out["warning"] = (f"asked for {mode} but it is {now}. The rule could not be "
+                          "placed below the security group.")
+    if verify and vm_status(vmid) == "running":
+        ok, secs, why = verify_egress(vmid, now)
+        out["verified"] = ok
+        out["verified_after_seconds"] = secs
+        if ok is None:
+            out["note"] += ". Could not confirm from inside the sandbox: " + why
+        elif ok:
+            out["note"] += f". Confirmed from inside the sandbox after {secs} s"
+        else:
+            out["warning"] = (f"the rules say {now} but the sandbox is {why} after "
+                              f"{secs} s. Treat it as not yet contained.")
+    return out
+
+
+# ---- snapshots -------------------------------------------------------------
+# Disk only, never memory. A memory snapshot of an 8 GB sandbox writes 8 GB to
+# the pool every time, and the thing worth keeping here is the filesystem
+# before something ran, not the exact contents of RAM. The cost is that a
+# rollback cannot happen under a running VM, so revert stops it first and puts
+# it back the way it found it.
+SNAP_NAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,39}$")
+
+
+def _wait_task(upid, timeout=600):
+    """Wait for a Proxmox task to finish.
+
+    Snapshot create, delete and rollback all return a task id and do the work
+    afterwards, so reading the snapshot list straight after a delete showed the
+    snapshot still there -- the call had been accepted, not completed.
+    """
+    if not isinstance(upid, str) or not upid.startswith("UPID"):
+        return None
+    end = time.time() + timeout
+    while time.time() < end:
+        try:
+            st = api(f"/nodes/{NODE}/tasks/{urllib.parse.quote(upid)}/status") or {}
+        except Exception:                             # noqa: BLE001
+            return None
+        if st.get("status") == "stopped":
+            exit_status = st.get("exitstatus") or "OK"
+            if exit_status != "OK":
+                raise RuntimeError(f"Proxmox refused it: {exit_status}")
+            return exit_status
+        time.sleep(1)
+    raise RuntimeError("Proxmox is still working on it after "
+                       f"{timeout}s; check the task log on the node")
+
+
+def list_snapshots(vmid):
+    out = []
+    for snap in (vm("/snapshot", vmid=_check_managed(vmid)) or []):
+        if snap.get("name") == "current":
+            continue                     # PVE's "you are here" marker
+        out.append({"name": snap.get("name"),
+                    "description": (snap.get("description") or "").strip(),
+                    "ts": snap.get("snaptime"),
+                    "has_memory": bool(snap.get("vmstate"))})
+    return sorted(out, key=lambda s: s.get("ts") or 0)
+
+
+def take_snapshot(vmid, name=None, description="", who=""):
+    vmid = _check_managed(vmid)
+    name = (name or time.strftime("snap-%Y%m%d-%H%M%S")).strip()
+    if not SNAP_NAME_RE.match(name):
+        raise ValueError("a snapshot name starts with a letter and holds only "
+                         "letters, digits, dash and underscore (40 max)")
+    who = (who or "").strip()[:60]
+    _wait_task(vm("/snapshot", "POST",
+                  {"snapname": name, "description": (description or "").strip()[:200]
+                   or f"taken by {who or 'the dashboard'}"},
+                  vmid=vmid, timeout=300))
+    record_event(vmid, "snapshot taken", name)
+    return {"vmid": vmid, "name": name, "snapshots": list_snapshots(vmid)}
+
+
+def delete_snapshot(vmid, name, who=""):
+    vmid = _check_managed(vmid)
+    if not SNAP_NAME_RE.match((name or "").strip()):
+        raise ValueError("no such snapshot")
+    _wait_task(vm(f"/snapshot/{name}", "DELETE", vmid=vmid, timeout=300))
+    record_event(vmid, "snapshot deleted", name)
+    return {"vmid": vmid, "deleted": name, "snapshots": list_snapshots(vmid)}
+
+
+def do_revert(job, vmid, name, who=""):
+    """Roll a sandbox back, stopping and restarting it around the rollback.
+
+    Everything written since the snapshot goes, which is the point, but it is
+    also why this is a job with a log rather than a button that returns
+    instantly: when it goes wrong you want to see which step it was on.
+    """
+    vmid = _check_managed(vmid)
+    _guard_claim(vmid, "revert", who)
+    if not SNAP_NAME_RE.match((name or "").strip()):
+        raise ValueError("no such snapshot")
+    was = vm_status(vmid)
+    job.vmid = vmid
+    job.log(f"reverting {vmid} to {name} (was {was})")
+    if was == "running":
+        job.log("stopping it: a disk snapshot cannot be rolled back underneath a running VM")
+        vm("/status/stop", "POST", vmid=vmid, timeout=90)
+        if not _wait_status(vmid, "stopped", timeout=120):
+            raise RuntimeError("it did not stop; nothing was rolled back")
+    wait_unlocked(vmid)
+    job.log("rolling back")
+    _wait_task(vm(f"/snapshot/{name}/rollback", "POST", vmid=vmid, timeout=900), timeout=900)
+    wait_unlocked(vmid, timeout=900)
+    # The disk that came back holds whatever token it held when the snapshot
+    # was taken, so anything cached about this guest is now fiction.
+    _TOKEN_CACHE.pop(vmid, None)
+    clear_agent_state(vmid)
+    record_event(vmid, "rolled back", name)
+    if was == "running":
+        job.log("starting it again")
+        vm("/status/start", "POST", vmid=vmid, timeout=90)
+        if wait_agent(vmid, timeout=600):
+            job.log("guest agent answered")
+        ip = guest_ip(vmid)
+        token = read_token(vmid, refresh=True)
+        job.log(f"back up: {ip or 'no address yet'}"
+                + ("" if token else "  (no Deskhand token: Repair if it does not return)"))
+    job.log("reverted")
+    return {"vmid": vmid, "reverted_to": name, "status": vm_status(vmid)}
+
+
 def capacity():
     """How many sandboxes exist and run, against the limits.
 
@@ -3644,6 +4094,13 @@ def _sandbox_view(e):
     if exp:
         out["expires_at"] = exp["until"]
         out["expires_minutes_left"] = exp["minutes_left"]
+    # Containment belongs in the list, not just on the page you clicked into:
+    # "which of these can reach the internet right now" is a question you ask
+    # about the fleet. Cached, so it is not a Proxmox call per row per poll.
+    if e.get("status") == "running":
+        eg = get_egress(e["vmid"], cached=True)
+        if eg:
+            out["egress"] = eg
     claim = get_claim(e["vmid"])
     if claim:
         out["claimed_by"] = claim["who"]
@@ -3690,6 +4147,31 @@ def mcp_call(name, args):
             raise ValueError("vmid is required")
         _check_managed(vmid)
         return set_expiry(vmid, args.get("minutes"), args.get("who"))
+    if name == "power_sandbox":
+        return power_sandbox(args.get("vmid"), (args.get("action") or "").strip(),
+                             args.get("who"), bool(args.get("force")))
+    if name == "set_egress":
+        return set_egress(args.get("vmid"), (args.get("mode") or "").strip(), args.get("who"),
+                          verify=bool(args.get("verify", True)))
+    if name == "snapshot_sandbox":
+        vmid = args.get("vmid")
+        if vmid is None:
+            raise ValueError("vmid is required")
+        op = (args.get("op") or "list").strip()
+        nm = (args.get("name") or "").strip()
+        if op == "list":
+            return {"vmid": _check_managed(vmid), "snapshots": list_snapshots(vmid)}
+        if op == "take":
+            return take_snapshot(vmid, nm or None, args.get("description"), args.get("who"))
+        if op == "delete":
+            return delete_snapshot(vmid, nm, args.get("who"))
+        if op == "revert":
+            if not nm:
+                raise ValueError("name is required to revert")
+            job = start_job(f"Reverting {vmid} to {nm}", do_revert, vmid, nm,
+                            (args.get("who") or ""))
+            return {"job_id": job.id, "note": "poll job_status; it stops, rolls back and restarts"}
+        raise ValueError("op must be list, take, revert or delete")
     if name == "claim_sandbox":
         return claim_sandbox(args.get("vmid"), args.get("who"),
                              args.get("purpose"), args.get("minutes"))
@@ -4052,6 +4534,20 @@ class Handler(BaseHTTPRequestHandler):
                     {k: get_expiry(k) for k in _expiry_load()}))
             except Exception as exc:                  # noqa: BLE001
                 return self._send(500, json.dumps({"error": str(exc)}))
+        if p.path == "/api/containment":
+            # One call for the two things the inspector shows together, so
+            # selecting a sandbox does not cost three round trips.
+            try:
+                vmid = urllib.parse.parse_qs(p.query).get("vmid", [""])[0]
+                vmid = _check_managed(vmid)
+                return self._send(200, json.dumps({
+                    "vmid": vmid,
+                    "egress": get_egress(vmid),
+                    "modes": EGRESS_MODES,
+                    "status": vm_status(vmid),
+                    "snapshots": list_snapshots(vmid)}))
+            except Exception as exc:                  # noqa: BLE001
+                return self._send(400, json.dumps({"error": str(exc)}))
         if p.path == "/api/groundhog/library":
             try:
                 return self._send(200, json.dumps(groundhog_library()))
@@ -4329,6 +4825,38 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, json.dumps(apply_groundhog(
                     vmid, source, body.get("sha256"), None,
                     bool(body.get("allow_reboot")), None, secrets=secrets or None)))
+            except Exception as exc:                  # noqa: BLE001
+                return self._send(400, json.dumps({"error": str(exc)}))
+        if p.path == "/api/power":
+            try:
+                return self._send(200, json.dumps(power_sandbox(
+                    body.get("vmid"), (body.get("action") or "").strip(),
+                    body.get("who"), bool(body.get("force")))))
+            except Exception as exc:                  # noqa: BLE001
+                return self._send(400, json.dumps({"error": str(exc)}))
+        if p.path == "/api/egress":
+            try:
+                return self._send(200, json.dumps(set_egress(
+                    body.get("vmid"), (body.get("mode") or "").strip(), body.get("who"),
+                    verify=bool(body.get("verify", True)))))
+            except Exception as exc:                  # noqa: BLE001
+                return self._send(400, json.dumps({"error": str(exc)}))
+        if p.path == "/api/snapshot":
+            try:
+                vmid = body.get("vmid")
+                op = (body.get("op") or "take").strip()
+                name = (body.get("name") or "").strip()
+                if op == "take":
+                    return self._send(200, json.dumps(take_snapshot(
+                        vmid, name or None, body.get("description"), body.get("who"))))
+                if op == "delete":
+                    return self._send(200, json.dumps(delete_snapshot(
+                        vmid, name, body.get("who"))))
+                if op == "revert":
+                    job = start_job(f"Reverting {vmid} to {name}", do_revert,
+                                    vmid, name, (body.get("who") or ""))
+                    return self._send(200, json.dumps({"id": job.id}))
+                raise ValueError("op must be take, revert or delete")
             except Exception as exc:                  # noqa: BLE001
                 return self._send(400, json.dumps({"error": str(exc)}))
         if p.path == "/api/expiry":

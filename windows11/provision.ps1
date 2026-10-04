@@ -122,6 +122,31 @@ Register-ScheduledTask -TaskName 'SandboxTimeResync' -Force `
 Ok 'UTC, NTP peers set, resync at boot'
 
 # ---------------------------------------------------------------------------
+# Guest agent, kept answering
+# ---------------------------------------------------------------------------
+# The QEMU guest agent talks over a virtio-serial port, and on a cold start it
+# sometimes wins the race against the driver that provides that port. When it
+# loses, the service sits there marked Running while the channel it needs was
+# never there, so Proxmox reports no guest: the sandbox is up, logged on and
+# serving Deskhand, and the controller cannot read its address or its token.
+# Observed exactly once on a stop/start cycle, and a reboot cleared it -- which
+# is the tell, because a reboot is the case where the driver is already loaded.
+#
+# Restarting the service a minute into boot costs nothing when the channel is
+# already healthy and fixes it when it is not. Service recovery actions do not
+# help here: the service has not failed, it just has nothing to talk to.
+Step 'Guest agent restart at boot'
+$kick = 'Start-Sleep 60; Restart-Service QEMU-GA -ErrorAction SilentlyContinue'
+$kAction = New-ScheduledTaskAction -Execute 'powershell.exe' `
+    -Argument ('-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -Command "' + $kick + '"')
+$kPrincipal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
+$kSettings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable
+Register-ScheduledTask -TaskName 'SandboxAgentKick' -Force `
+    -Action $kAction -Trigger (New-ScheduledTaskTrigger -AtStartup) `
+    -Principal $kPrincipal -Settings $kSettings | Out-Null
+Ok 'QEMU-GA restarted a minute after every boot'
+
+# ---------------------------------------------------------------------------
 # Groundhog agent
 # ---------------------------------------------------------------------------
 # Groundhog configures a Windows machine from a declarative file. Its templated-VM

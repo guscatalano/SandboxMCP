@@ -61,6 +61,9 @@ client, and the lifecycle buttons. **Watch** opens a live view of any of them.
 | **Discover** | An arriving agent is told what this is, via MCP `instructions`, `/llms.txt` and `/.well-known/`. |
 | **Limits** | Hard caps on how many sandboxes exist and how many run at once. `create_sandbox` refuses at the limit; `capacity` reports the headroom. |
 | **Expire** | An optional timer per sandbox — destroyed automatically when it runs out. `never` is a first-class option, and the default. |
+| **Power** | Start, shut down, stop or reboot without destroying anything. Stopping returns a running slot and the memory its recorder costs; starting is refused at the running limit for the same reason a create is. |
+| **Containment** | Three egress modes per sandbox, enforced by the hypervisor rather than inside Windows: `open` (internet, no LAN), `local` (controller and DNS only) and `blocked` (nothing leaves). Deskhand stays reachable in all three, so a sandbox you have just cut off is still one you can drive. The change is confirmed from inside the guest before the call returns, because Proxmox compiles its ruleset on a timer and a block takes about ten seconds to bite. |
+| **Snapshots** | Take, roll back to and delete disk snapshots -- the before-and-after of detonating something. Disk only, never memory, so a revert stops the sandbox, rolls it back and starts it again. |
 
 The two watch sources are not redundant. **Proxmox VNC works when nothing is
 running in the guest** — during Windows setup, at a lock screen, on a boot loop,
