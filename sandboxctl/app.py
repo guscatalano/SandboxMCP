@@ -1103,6 +1103,11 @@ def sandbox_history(vmid, include_guest=True):
     events += _pve_events(vmid)
     if include_guest:
         events += _guest_boot(vmid)
+    # Proxmox keeps its task log per VMID and does not know the number was
+    # reused, so the previous sandbox's clone, boots and destroy are in here.
+    epoch = vmid_epoch(vmid)
+    if epoch:
+        events = [e for e in events if e.get("ts", 0) >= epoch]
     events.sort(key=lambda e: e["ts"])
     for e in events:
         e["when"] = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(e["ts"]))
@@ -1114,6 +1119,145 @@ def sandbox_history(vmid, include_guest=True):
                  "token talks to it directly and never passes through here, so that "
                  "traffic cannot appear in this list."),
     }
+
+
+# --------------------------------------------------------------------------
+# Generations
+#
+# VMIDs are reused. The pool is 900-949 and a destroyed sandbox frees its
+# number for the next one, so everything keyed by VMID -- this controller's
+# event log, Proxmox's task log, the console recordings on disk -- belongs to
+# whichever sandbox held that number at the time, not to whoever holds it now.
+#
+# Without this, a sandbox created five minutes ago showed recordings from days
+# ago and a history of things done to a machine that no longer exists. On a
+# tool for investigating things, attributing one sandbox's evidence to another
+# is not untidiness, it is a wrong answer.
+#
+# So destroying a sandbox stamps the VMID with the time it was retired, and
+# everything per-VMID is read as "since that stamp". Comments were already
+# handled this way, by archiving; this is the same idea for the rest.
+# --------------------------------------------------------------------------
+GENERATIONS_PATH = os.path.join(HERE, "generations.json")
+GENERATIONS_LOCK = threading.Lock()
+EVENTS_ARCHIVE_PATH = os.path.join(HERE, "events-archive.json")
+
+
+def _generations():
+    try:
+        with open(GENERATIONS_PATH, encoding="utf-8") as fh:
+            return json.load(fh)
+    except Exception:                                 # noqa: BLE001
+        return {}
+
+
+# vmid -> (born_ts, read_at). A clone time changes only when a sandbox is
+# created, so this is cached; the VMID is stamped on destroy, which clears it.
+_BORN_CACHE = {}
+_BORN_TTL = 300.0
+
+
+def vmid_last_destroy(vmid):
+    """When this VMID's previous occupant was destroyed, per Proxmox.
+
+    Two things that do not work, so they are not tried again. A VM's own ctime
+    is inherited from the template by a full clone, so every sandbox on this
+    host claims to have been created the day the template was built. And the
+    clone task is logged against the SOURCE vmid -- the template -- so asking
+    for this number's tasks never returns the clone that made it.
+
+    A destroy, though, is logged against the number being destroyed. The newest
+    one is exactly the line between the last sandbox to hold this number and
+    the one holding it now.
+    """
+    vmid = int(vmid)
+    hit = _BORN_CACHE.get(vmid)
+    if hit and time.time() - hit[1] < _BORN_TTL:
+        return hit[0]
+    try:
+        tasks = api(f"/nodes/{NODE}/tasks?vmid={vmid}&limit=500") or []
+    except Exception:                                 # noqa: BLE001
+        return hit[0] if hit else 0.0
+    ts = 0.0
+    for t in tasks:
+        if t.get("type") == "qmdestroy":
+            # The end, not the start: a destroy releases the claim and writes
+            # its own events while it runs, and those belong to the sandbox
+            # being destroyed, not to the next one to take the number.
+            ts = max(ts, float(t.get("endtime") or 0), float(t.get("starttime") or 0) + 30)
+    _BORN_CACHE[vmid] = (ts, time.time())
+    return ts
+
+
+def vmid_epoch(vmid):
+    """The line before which nothing belongs to the current sandbox.
+
+    The later of two answers for the same question: when this controller
+    retired the number, and when Proxmox last destroyed it. The second covers
+    sandboxes destroyed before any of this existed, including by hand in the
+    Proxmox UI; the first covers a task log old enough to have rotated.
+    """
+    try:
+        stamped = float(_generations().get(str(int(vmid)), 0) or 0)
+    except Exception:                                 # noqa: BLE001
+        stamped = 0.0
+    return max(stamped, vmid_last_destroy(vmid))
+
+
+def retire_vmid(vmid, name=""):
+    """Close the books on the sandbox that is being destroyed."""
+    vmid = int(vmid)
+    now = int(time.time())
+    try:
+        with EVENTS_LOCK:
+            d = _events_load()
+            thread = d.pop(str(vmid), None)
+            if thread:
+                try:
+                    with open(EVENTS_ARCHIVE_PATH, encoding="utf-8") as fh:
+                        arch = json.load(fh)
+                except Exception:                     # noqa: BLE001
+                    arch = []
+                arch.append({"vmid": vmid, "name": name, "retired": now,
+                             "events": thread})
+                del arch[:-200]
+                tmp = EVENTS_ARCHIVE_PATH + ".tmp"
+                with open(tmp, "w", encoding="utf-8") as fh:
+                    json.dump(arch, fh, indent=2, default=str)
+                os.replace(tmp, EVENTS_ARCHIVE_PATH)
+            _events_save(d)
+    except Exception:                                 # noqa: BLE001
+        pass                                          # never block a destroy
+    _BORN_CACHE.pop(vmid, None)
+    try:
+        with GENERATIONS_LOCK:
+            g = _generations()
+            g[str(vmid)] = now
+            tmp = GENERATIONS_PATH + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump(g, fh, indent=2)
+            os.replace(tmp, GENERATIONS_PATH)
+    except Exception:                                 # noqa: BLE001
+        pass
+
+
+def _rec_started_ts(stamp):
+    """The 'YYYYMMDD-HHMMSS' in a recording's name, as a local timestamp."""
+    try:
+        return time.mktime(time.strptime(stamp, "%Y%m%d-%H%M%S"))
+    except Exception:                                 # noqa: BLE001
+        return 0.0
+
+
+def recordings_for(vmid):
+    """This sandbox's recordings, not the ones belonging to its VMID."""
+    items = RECORDER.listing(vmid) if RECORDER else []
+    if vmid is None:
+        return items
+    epoch = vmid_epoch(vmid)
+    if not epoch:
+        return items
+    return [it for it in items if _rec_started_ts(it.get("started", "")) >= epoch]
 
 
 # --------------------------------------------------------------------------
@@ -1923,10 +2067,18 @@ def do_destroy(job, vmid):
                                f"adhoc-{int(vmid)}.groundhog.yaml"))
     except OSError:
         pass
+    _name = ""
     try:
-        archive_comments(vmid, (vm("/config", vmid=vmid) or {}).get("name") or "")
+        _name = (vm("/config", vmid=vmid) or {}).get("name") or ""
+    except Exception:                                 # noqa: BLE001
+        pass
+    try:
+        archive_comments(vmid, _name)
     except Exception:                                 # noqa: BLE001
         pass                                          # a note must never block a destroy
+    # Stamp the number as retired, so the next sandbox to take it does not
+    # inherit this one's history or its recordings.
+    retire_vmid(vmid, _name)
     _TOKEN_CACHE.pop(vmid, None)
     clear_agent_state(vmid)
     if RECORDER:
@@ -4338,6 +4490,34 @@ HOW MANY YOU MAY HAVE
   create_sandbox refuses at either limit rather than queueing, so check this
   before creating several. Each running sandbox costs the controller about
   180 MB for its console recorder, which is what the running limit protects.
+  At the running limit, stopping a sandbox you are not using frees a slot
+  immediately and keeps the machine; you do not have to destroy one.
+
+TURNING THEM OFF WITHOUT LOSING THEM
+  power_sandbox   start, shutdown, stop or reboot. Stopping is not destroying:
+      the disk, the name, the notes and the snapshots all stay, and it hands
+      back a running slot and the ~180 MB the console recorder costs. That is
+      the right move when you are at the running limit and not finished with
+      anything. Starting is refused at that limit for the same reason creating
+      is. A sandbox sometimes comes up from a cold start without its guest
+      agent, so it is running and logged on while this controller can see no
+      address for it; reboot it and the agent returns.
+
+BEFORE YOU RUN SOMETHING YOU DO NOT TRUST
+  set_egress      what the sandbox may reach, enforced by the hypervisor rather
+      than by Windows, so nothing inside the sandbox can switch it off. 'open'
+      is how one is built: the internet yes, the home LAN and sibling sandboxes
+      no. 'local' keeps this controller, the inference endpoint and DNS but
+      cuts the internet. 'blocked' stops everything leaving. Deskhand stays
+      reachable in all three, because answering a connection you opened is not
+      egress, so a sandbox you have just cut off is still one you can drive.
+      A change takes about ten seconds to take effect; leave verify on and the
+      call waits and confirms from inside the sandbox rather than telling you
+      it is contained before it is.
+  snapshot_sandbox  take one before you detonate anything. Revert puts the disk
+      back exactly as it was, and takes a job id because it stops the sandbox,
+      rolls back and starts it again. Everything written since is gone, so pull
+      out anything you are keeping as evidence first.
 
 WHEN THEY GO AWAY
   set_expiry      a sandbox can be destroyed automatically when its time is up.
@@ -4353,15 +4533,19 @@ GETTING FILES IN AND OUT
   itself -- and runs at roughly 4 MiB in 13 seconds, so do not go looking for a
   way around it for a few megabytes.
   For something large that is publicly downloadable, it is still faster to let
-  the guest fetch it: a sandbox can reach the internet, so run the download
-  inside it (deskhand_run_command, or a Groundhogfile 'files:' entry) rather
-  than pushing the bytes through this controller.
+  the guest fetch it: a sandbox can reach the internet unless someone has
+  contained it, so run the download inside it (deskhand_run_command, or a
+  Groundhogfile 'files:' entry) rather than pushing the bytes through this
+  controller. If that fails, check set_egress before blaming the URL.
 
 RULES
   - A sandbox is untrusted. Never put real credentials, keys or private data in
     one; assume anything inside it can be read.
-  - A sandbox cannot reach this controller or the LAN, by design. It can reach
-    the inference endpoint and the public internet.
+  - A sandbox cannot reach the home LAN or its sibling sandboxes, by design. By
+    default it can reach the public internet, the inference endpoint, and this
+    controller's payload port and nothing else of this controller. That default
+    is changeable per sandbox with set_egress, so check it rather than assume
+    it: a box someone contained will fail downloads that would otherwise work.
   - Creating and destroying VMs is real work on real hardware. Prefer a running
     sandbox over creating one; destroy what you finish with.
   - Deskhand runs elevated inside the sandbox: its bearer token is administrator
@@ -4370,6 +4554,7 @@ RULES
 ALSO HERE
   GET /api/sandboxes           the same list as JSON
   GET /api/screen?vmid=<id>    JPEG of a sandbox's console; works even when the guest is wedged
+  GET /api/containment?vmid=<id>  egress mode, power state and snapshots in one call
   GET /.well-known/agent.json  machine-readable card for this service
   Source and docs:             https://github.com/guscatalano/SandboxMCP
 """
@@ -4590,7 +4775,7 @@ class Handler(BaseHTTPRequestHandler):
                 "enabled": True,
                 "retention_days": REC_RETENTION_DAYS,
                 "status": {str(k): v for k, v in RECORDER.status().items()},
-                "items": RECORDER.listing(vmid)}))
+                "items": recordings_for(int(vmid) if vmid is not None else None)}))
         if p.path == "/api/recording":
             # Serve a chunk for playback/download. Name-checked, not path-joined
             # from user input: the filename pattern is the whole allowlist.

@@ -71,6 +71,7 @@ pre{margin:0;background:var(--inset);border:1px solid var(--ln);border-radius:6p
 .row .nm b{font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .row .nm .id{color:var(--mut);font-size:11px;font-family:var(--mono)}
 .row .sub{color:var(--mut);font-size:11px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.row .sub.wrap{white-space:normal;overflow:visible}
 .row .tags{display:flex;gap:4px;margin-top:4px;flex-wrap:wrap}
 .tag{font-size:10px;padding:1px 6px;border-radius:4px;background:var(--ln2);color:var(--fg2);white-space:nowrap;max-width:100%;overflow:hidden;text-overflow:ellipsis}
 .tag.bad{background:var(--bad-bg);color:var(--bad)} .tag.warn{background:var(--warn-bg);color:var(--warn)} .tag.ok{background:var(--ok-bg);color:var(--ok)}
@@ -523,6 +524,16 @@ function visible(s){
   }
   return true;
 }
+// The row is one line wide and a purpose can be a sentence, so the whole truth
+// goes in the tooltip rather than being cut off with no way to see the rest.
+function rowTitle(s){
+  const bits = [s.name + ' (vmid ' + s.vmid + ') - ' + s.status];
+  if (s.claimed_by) bits.push('held by ' + s.claimed_by + (s.claim_purpose ? ': ' + s.claim_purpose : ''));
+  if (s.ip) bits.push(s.ip);
+  if (s.groundhog && s.groundhog !== 'none') bits.push('groundhog ' + s.groundhog);
+  if (s.egress && s.egress !== 'open') bits.push('egress ' + s.egress);
+  return bits.join(' - ');
+}
 function rowSub(s){
   const bits = [];
   if (s.claimed_by) bits.push(s.claimed_by + (s.claim_purpose ? ' · ' + s.claim_purpose : ''));
@@ -546,18 +557,30 @@ function rowTags(s){
 function renderList(){
   const rows = fleet.filter(visible).sort((a, b) => (a.status === 'running' ? 0 : 1) - (b.status === 'running' ? 0 : 1) || a.vmid - b.vmid);
   let html = rows.map(s =>
-    '<button class="row' + (sel === s.vmid ? ' sel' : '') + '" onclick="select(' + s.vmid + ')">' +
+    '<button class="row' + (sel === s.vmid ? ' sel' : '') + '" title="' + esc(rowTitle(s)) + '" onclick="select(' + s.vmid + ')">' +
     '<span class="dot ' + (s.status === 'running' ? 'run' : '') + '"></span><span>' +
     '<span class="nm"><b>' + esc(s.name) + '</b><span class="id">' + s.vmid + '</span></span>' +
     '<span class="sub">' + rowSub(s) + '</span>' + rowTags(s) + '</span></button>').join('');
-  // A create in flight is a row too: it is about to be a sandbox and it holds a slot.
-  jobsList.filter(j => !j.done && /^Creating /.test(j.title)).forEach(j => {
-    html += '<button class="row" onclick="followJob(\'' + esc(j.id) + '\')"><span class="dot busy"></span><span>' +
-      '<span class="nm"><b>' + esc(j.title.replace(/^Creating /, '')) + '</b><span class="id">—</span></span>' +
-      '<span class="sub">creating · ' + esc(j.last || '') + '</span></span></button>';
+  // A create in flight is a row too: it is about to be a sandbox and it holds a
+  // slot. But the VM joins the pool minutes before the job finishes, so once the
+  // real row exists this one is the same sandbox listed twice -- drop it then.
+  const live = {};
+  fleet.forEach(s => { live[s.name] = true; });
+  jobsList.filter(j => !j.done && j.title.indexOf('Creating ') === 0).forEach(j => {
+    const nm = j.title.slice('Creating '.length);
+    if (live[nm]) return;
+    // Job lines read 'HH:MM:SS  message'; the clock is noise in a 260px rail,
+    // and the message is the part that was being cut off.
+    const raw = j.last || '';
+    const cut = raw.indexOf('  ');
+    const msg = cut > 0 ? raw.slice(cut + 2) : raw;
+    html += '<button class="row" onclick="followJob(' + Q + esc(j.id) + Q + ')">' +
+      '<span class="dot busy"></span><span>' +
+      '<span class="nm"><b>' + esc(nm) + '</b><span class="id">creating</span></span>' +
+      '<span class="sub wrap">' + esc(msg) + '</span></span></button>';
   });
   $('rows').innerHTML = html || '<div class="empty">' + (fleet.length ? 'Nothing matches.' : 'No sandboxes yet. Create one.') + '</div>';
-  const creating = jobsList.filter(j => !j.done && /^Creating /.test(j.title)).length;
+  const creating = jobsList.filter(j => !j.done && j.title.indexOf('Creating ') === 0).length;
   $('listfoot').textContent = fleet.length + ' sandbox' + (fleet.length === 1 ? '' : 'es') +
     (creating ? ' · ' + creating + ' creating' : '') + (cap ? ' · ' + cap.sandboxes_left + ' slots free' : '');
   ticks();
@@ -586,7 +609,7 @@ function select(vmid){
   $('view-create').classList.add('hidden'); $('view-sb').classList.remove('hidden');
   $('i_fleet').classList.add('hidden'); $('i_sb').classList.remove('hidden');
   $('gh_editor').classList.add('hidden'); $('ag_form').classList.add('hidden');
-  histAll = false; histToggle(histOpen); EGRESS_MSG = '';
+  histAll = false; recAll = false; histToggle(histOpen); EGRESS_MSG = '';
   $('recplayer').classList.add('hidden'); $('recplayer').src = '';
   $('detail').scrollTop = 0;
   renderList(); renderHeader(); renderInspector();
@@ -762,7 +785,8 @@ async function installAgents(){
 function agForm(){ toggle('ag_form'); if (!$('ag_form').classList.contains('hidden') && !$('ag_models').options.length) loadModels(); }
 
 /* ---- history ---- */
-let HIST = [], histAll = false;
+let HIST = [], histAll = false, recAll = false;
+const REC_LIMIT = 8;
 const HIST_LIMIT = 10;
 let histOpen = true; try { histOpen = localStorage.getItem('sbx-hist') !== 'closed'; } catch(e){}
 function histToggle(force){
@@ -805,10 +829,17 @@ async function histLoad(force){
 function histExport(){
   const s = fleetBy[sel] || {};
   const text = ['# ' + (s.name || sel) + ' (vmid ' + sel + ')', ''].concat(HIST.map(e => e.when + '  ' + e.what + (e.count > 1 ? ' x' + e.count : '') + (e.detail ? '  — ' + e.detail : ''))).join('\n');
+  // The anchor must be in the document before it is clicked. Firefox refuses a
+  // programmatic download from a detached element and reports it as a file:///
+  // security error, which is a confusing way to say "it is not in the page".
+  const url = URL.createObjectURL(new Blob([text], {type: 'text/plain;charset=utf-8'}));
   const a = document.createElement('a');
-  a.href = URL.createObjectURL(new Blob([text], {type: 'text/plain'}));
-  a.download = (s.name || sel) + '-history.txt'; a.click();
-  setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+  a.href = url;
+  a.download = (s.name || sel) + '-history.txt';
+  a.style.display = 'none';
+  document.body.appendChild(a);
+  a.click();
+  setTimeout(() => { URL.revokeObjectURL(url); a.remove(); }, 2000);
 }
 
 /* ---- recordings ---- */
@@ -825,7 +856,15 @@ async function recLoad(){
   const total = d.items.reduce((a, it) => a + it.size, 0);
   sum.textContent = d.items.length + ' · ' + (total/1048576).toFixed(0) + ' MB' + (now ? ' · recording now' : '') + ' · kept ' + d.retention_days + ' d' + (st && st.error ? ' · ' + st.error : '');
   if (!d.items.length) { box.innerHTML = '<span class="muted">Nothing recorded yet.</span>'; return; }
-  box.innerHTML = d.items.map(it => {
+  // A sandbox watched for days has dozens of chunks, and the full list pushed
+  // the notes beside it off the page. Newest first, the rest one click away.
+  const all = d.items.slice().reverse();
+  const show = recAll ? all : all.slice(0, REC_LIMIT);
+  const more = all.length > show.length
+    ? '<div><a href="#" onclick="recAll=true;recLoad();return false">' + (all.length - show.length) + ' older · show all</a></div>'
+    : (recAll && all.length > REC_LIMIT
+       ? '<div><a href="#" onclick="recAll=false;recLoad();return false">show only the latest ' + REC_LIMIT + '</a></div>' : '');
+  box.innerHTML = more + show.map(it => {
     const t = it.started, pretty = t.slice(0,4) + '-' + t.slice(4,6) + '-' + t.slice(6,8) + ' ' + t.slice(9,11) + ':' + t.slice(11,13);
     const live = (st && st.file === it.file) ? ' <span class="tag ok">live</span>' : '';
     return '<div class="it"><span class="mono">' + pretty + live + '</span><span class="muted">' + (it.size/1048576).toFixed(1) + ' MB</span>' +
