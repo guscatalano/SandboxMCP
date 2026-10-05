@@ -2720,6 +2720,19 @@ MCP_TOOLS = [
             "type": "object",
             "properties": {
                 "vmid": {"type": "integer", "description": "The sandbox VMID"},
+                "hermes_parts": {
+                    "type": "array", "items": {"type": "string",
+                                               "enum": ["browser", "computer_use", "desktop"]},
+                    "description": ("Which optional parts of Hermes to install. Omit for the "
+                                    "default, browser and computer_use. browser is agent-browser "
+                                    "plus Chromium and is what the browser toolset needs; "
+                                    "computer_use is the cua-driver, Hermes's own desktop "
+                                    "control, which a sandbox may not need because Deskhand "
+                                    "already does that; desktop adds the desktop app build. "
+                                    "Pass [] for the core only, which is much faster. Each "
+                                    "omission is remembered by Hermes's package manager and "
+                                    "survives hermes update, so a part left out stays out until "
+                                    "someone runs hermes pm install for it.")},
                 "agents": {"type": "array", "items": {"type": "string", "enum": ["hermes", "opencode"]},
                            "description": "Which agents to install"},
                 "base_url": {"type": "string", "description": (
@@ -3072,6 +3085,37 @@ def do_repair(job, vmid, opts=None):
 # controller -- and could not reach it anyway, since the control port is
 # firewalled off from the sandbox subnet. What it does get is the sandbox's own
 # Deskhand as an MCP server, which lets it drive the desktop it is sitting on.
+# The optional parts of a Hermes install, and the switch that leaves each one
+# out. Everything else the installer does -- git, python, node, the repository,
+# the venv, the build -- is the core and is not optional.
+#
+# Each opt-out is recorded by Hermes's own package manager and survives
+# `hermes update`, so these are not just install-time: leaving a part out keeps
+# it out until someone runs `hermes pm install <component>` in the sandbox.
+HERMES_PARTS = {
+    "browser": ("-SkipBrowser",
+                "agent-browser and Chromium; needed by the browser toolset"),
+    "computer_use": ("-SkipComputerUse",
+                     "the cua-driver, Hermes's own desktop control"),
+    "desktop": (None,
+                "the desktop app build stage (adds -IncludeDesktop rather than "
+                "removing anything)"),
+}
+HERMES_PARTS_DEFAULT = ["browser", "computer_use"]
+
+
+def hermes_flags(parts):
+    """Installer switches for the parts NOT wanted, plus the one that adds."""
+    parts = {p.strip().lower() for p in (parts or []) if str(p).strip()}
+    out = []
+    for name, (skip, _why) in HERMES_PARTS.items():
+        if name not in parts and skip:
+            out.append(skip)
+    if "desktop" in parts:
+        out.append("-IncludeDesktop")
+    return out
+
+
 AGENTS_PS = r"""
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
@@ -3149,7 +3193,7 @@ if ($want -contains 'hermes') {
         # the main branch rather than a release, so two sandboxes built a week
         # apart get different Hermes. Pin with -Commit if that ever matters.
         $src = Invoke-RestMethod 'https://hermes-agent.nousresearch.com/install.ps1'
-        & ([scriptblock]::Create($src)) -NonInteractive
+        & ([scriptblock]::Create($src)) -NonInteractive @@HERMES_FLAGS@@
     }
     if (-not (Test-Path $exe)) { throw 'hermes.exe missing after install' }
 
@@ -3663,15 +3707,23 @@ def do_install_agents(job, vmid, agents, opts=None):
     base_url = (opts.get("base_url") or defaults.get("base_url") or "").strip()
     api_key = (opts.get("api_key") or defaults.get("api_key") or "").strip()
     # Overridable: set agents.hermes.disable_toolsets to [] to keep them all.
-    # 'browser' is NOT here any more: the install now pulls agent-browser and
-    # Chromium, and installing a browser stack and then switching the toolset
-    # off is the worst of both -- the download without the use.
+    # 'browser' is not in this list: whether that toolset is on follows whether
+    # the browser part was installed, just below. Installing a browser stack and
+    # then switching the toolset off is the worst of both -- the download
+    # without the use -- and so is the reverse.
     DEFAULT_OFF = ["web", "image_gen", "tts", "video", "video_gen",
                    "x_search", "stt", "homeassistant", "spotify", "yuanbao",
                    "delegation", "cronjob", "session_search", "skills", "memory",
                    "todo", "clarify"]
     # 'vision' stays ON: Deskhand is a screenshot-heavy toolset, and at ~845
     # bytes of schema it is the cheapest entry on the list to keep.
+    _parts = opts.get("hermes_parts")
+    if _parts is None:
+        _parts = (defaults.get("hermes") or {}).get("parts")
+    if _parts is None:
+        _parts = HERMES_PARTS_DEFAULT
+    if "browser" not in {str(p).lower() for p in _parts}:
+        DEFAULT_OFF = DEFAULT_OFF + ["browser"]
     cfg = {
         "api_keys": dict(defaults.get("api_keys") or {}),
         "hermes": dict(defaults.get("hermes") or {}),
@@ -3756,10 +3808,22 @@ def do_install_agents(job, vmid, agents, opts=None):
             job.log("WARNING: could not pre-open the dashboard port")
 
     blob = base64.b64encode(json.dumps(cfg).encode()).decode()
+    parts = opts.get("hermes_parts")
+    if parts is None:
+        parts = (AGENTS_CFG.get("hermes") or {}).get("parts")
+    if parts is None:
+        parts = HERMES_PARTS_DEFAULT
+    flags = hermes_flags(parts)
     script = (AGENTS_PS.replace("@@AGENTS@@", ",".join(wanted))
                        .replace("@@CFG@@", blob)
                        .replace("@@WINUSER@@", WIN_USER)
+                       .replace("@@HERMES_FLAGS@@", " ".join(flags))
                        .replace("@@DASHPORT@@", str(DASH_PORT)))
+    if "hermes" in wanted:
+        chosen = [p for p in HERMES_PARTS if p in {str(x).lower() for x in parts}]
+        left = [p for p in HERMES_PARTS if p not in chosen]
+        job.log("hermes parts: " + (", ".join(chosen) or "core only")
+                + (("  (without " + ", ".join(left) + ")") if left else ""))
     job.log(f"installing {', '.join(wanted)} as {WIN_USER} (several minutes)")
     out = run_in_guest_as_user(job, vmid, script, timeout=2400)
 
@@ -4883,7 +4947,10 @@ def _mcp_call(name, args):
         agents = args.get("agents") or []
         opts = {k: args.get(k) for k in ("base_url", "api_key", "model", "context_length")
                 if args.get(k)}
-        job = start_job(f"Installing agents on {vmid}", do_install_agents, vmid, agents, opts)
+        if isinstance(args.get("hermes_parts"), list):
+            opts["hermes_parts"] = args["hermes_parts"]
+        job = start_job(f"Installing agents on {vmid}", do_install_agents, vmid, agents, opts,
+                        vmid=vmid)
         return {"job_id": job.id, "note": "poll job_status; several minutes"}
     if name == "sandbox_call":
         return proxy_call(f"{args['sandbox']}{SEP}{args['tool']}", args.get("arguments") or {})
@@ -5571,6 +5638,8 @@ class Handler(BaseHTTPRequestHandler):
         if p.path == "/api/agents":
             opts = {k: body.get(k) for k in ("base_url", "api_key", "model", "context_length")
                     if body.get(k)}
+            if isinstance(body.get("hermes_parts"), list):
+                opts["hermes_parts"] = body["hermes_parts"]
             try:
                 guard_busy(body.get("vmid"), "install agents on it")
             except Exception as exc:                  # noqa: BLE001

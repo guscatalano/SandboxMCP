@@ -272,8 +272,21 @@ details.adv>summary{cursor:pointer;color:var(--mut);font-size:12px;margin-bottom
             <div><label>Model</label><input id="ag_model" list="ag_models" value="@@AGENT_MODEL@@" placeholder="pick or type"><datalist id="ag_models"></datalist></div>
           </div>
           <div class="hint" id="ag_models_note" style="margin:-6px 0 10px">&nbsp;</div>
+          <div class="hint" id="ag_parts" style="margin:-4px 0 10px">
+            <b>Hermes parts</b> &mdash; everything else (git, python, node, the build) is the core and always installs.
+            <div class="btns" style="margin-top:6px">
+              <label style="display:flex;align-items:center;gap:6px;margin:0"><input type="checkbox" id="hp_browser" checked style="width:auto"> browser <span class="muted">agent-browser + Chromium, needed by the browser toolset</span></label>
+            </div>
+            <div class="btns" style="margin-top:4px">
+              <label style="display:flex;align-items:center;gap:6px;margin:0"><input type="checkbox" id="hp_cua" checked style="width:auto"> computer use <span class="muted">cua-driver; Deskhand already drives the desktop</span></label>
+            </div>
+            <div class="btns" style="margin-top:4px">
+              <label style="display:flex;align-items:center;gap:6px;margin:0"><input type="checkbox" id="hp_desktop" style="width:auto"> desktop app <span class="muted">extra build stage</span></label>
+            </div>
+            <div style="margin-top:6px">Leaving a part out is remembered by Hermes and survives its own updates, until <code>hermes pm install</code> puts it back.</div>
+          </div>
           <div class="btns" style="align-items:center">
-            <label style="display:flex;align-items:center;gap:6px;margin:0"><input type="checkbox" id="ag_hermes" checked style="width:auto"> Hermes</label>
+            <label style="display:flex;align-items:center;gap:6px;margin:0"><input type="checkbox" id="ag_hermes" checked style="width:auto" onchange="agParts()"> Hermes</label>
             <label style="display:flex;align-items:center;gap:6px;margin:0"><input type="checkbox" id="ag_opencode" checked style="width:auto"> opencode</label>
             <button class="btn pri" onclick="installAgents()">Install</button>
           </div>
@@ -874,13 +887,21 @@ async function installAgents(){
   if ($('ag_opencode').checked) list.push('opencode');
   if (!list.length) { alert('Pick at least one agent.'); return; }
   const body = {vmid: sel, agents: list};
+  if ($('ag_hermes').checked) {
+    const parts = [];
+    if ($('hp_browser').checked) parts.push('browser');
+    if ($('hp_cua').checked) parts.push('computer_use');
+    if ($('hp_desktop').checked) parts.push('desktop');
+    body.hermes_parts = parts;            // [] is a real choice: core only
+  }
   const u = $('ag_url').value.trim(), k = $('ag_key').value.trim(), md = $('ag_model').value.trim();
   if (u) body.base_url = u; if (k) body.api_key = k; if (md) body.model = md;
   if (MODEL_CTX[md]) body.context_length = MODEL_CTX[md];
   $('ag_form').classList.add('hidden');
   const d = await post('api/agents', body); followJob(d.id);
 }
-function agForm(){ toggle('ag_form'); if (!$('ag_form').classList.contains('hidden') && !$('ag_models').options.length) loadModels(); }
+function agParts(){ $('ag_parts').classList.toggle('hidden', !$('ag_hermes').checked); }
+function agForm(){ toggle('ag_form'); agParts(); if (!$('ag_form').classList.contains('hidden') && !$('ag_models').options.length) loadModels(); }
 
 /* ---- history ---- */
 let HIST = [], histAll = false, recAll = false;
