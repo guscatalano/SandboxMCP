@@ -1779,6 +1779,7 @@ files:
         "port": @@PORT@@,
         "bind": "any",
         "hideConsole": true,
+        "noFleet": true,
         "autoUpdate": true,
         "autoUpdateIntervalMin": @@UPDATEMIN@@,
         "maxToolChars": @@TOOLCHARS@@,
@@ -1906,6 +1907,10 @@ if (-not `$ip) { `$ip = 'any' }
 # Check GitHub for a newer Deskhand and apply it unattended. The sandbox does
 # the fetching, not this controller, so a sandbox with its egress cut simply
 # fails the check and carries on with what it has.
+# Single-machine deployment: hides the dashboard's fleet-only UI. Each sandbox
+# is its own machine here and the fleet view belongs to this controller, so the
+# link only ever led somewhere that does not apply.
+`$env:DESKHAND_NO_FLEET = '1'
 `$env:DESKHAND_AUTO_UPDATE = '1'
 `$env:DESKHAND_AUTO_UPDATE_INTERVAL_MIN = '@@UPDATEMIN@@'
 @@SHELL_LINE@@

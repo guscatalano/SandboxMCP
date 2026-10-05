@@ -832,6 +832,17 @@ async function ghApply(){
 }
 
 /* ---- agents ---- */
+// Compare dotted versions numerically. "0.2.9" is older than "0.2.10", which a
+// string comparison gets backwards.
+function cmpVer(a, b){
+  const pa = String(a).split('.').map(n => parseInt(n, 10) || 0);
+  const pb = String(b).split('.').map(n => parseInt(n, 10) || 0);
+  for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+    const d = (pa[i] || 0) - (pb[i] || 0);
+    if (d) return d < 0 ? -1 : 1;
+  }
+  return 0;
+}
 function agentsRender(){
   const s = fleetBy[sel]; if (!s) return;
   const a = s.agents || {}, inst = a.installed || [], cells = [];
@@ -847,10 +858,15 @@ function agentsRender(){
   // actually running rather than leaving "Deskhand looks old" as a hunch.
   const staged = (cap && cap.deskhand_staged || '').replace(/^v/, '');
   const ver = s.deskhand_version || '';
-  const behind = ver && staged && ver !== staged;
+  // Not just "different": with auto-update on, a sandbox routinely runs a
+  // newer build than the controller has staged, and flagging that as a problem
+  // reads as a fault when it is the feature working.
+  const behind = ver && staged && cmpVer(ver, staged) < 0;
   const verTxt = ver
     ? ' · <span class="' + (behind ? 'warn' : 'muted') + '" title="' +
-      (behind ? 'the controller has ' + esc(staged) + ' staged; it updates itself on a timer' : 'matches the staged build') +
+      (behind ? 'the controller has ' + esc(staged) + ' staged; the sandbox updates itself on a timer'
+              : (cmpVer(ver, staged) > 0 ? 'newer than the staged ' + esc(staged) + ', so it updated itself'
+                                         : 'matches the staged build')) +
       '">' + esc(ver) + (behind ? ' → ' + esc(staged) : '') + '</span>'
     : '';
   cells.push('<div class="ag"><b>Deskhand</b><div class="st ' + (dh === 'listening' ? 'ok' : dh === 'not answering' ? 'bad' : 'off') + '">' + dhTxt + verTxt + '</div></div>');
