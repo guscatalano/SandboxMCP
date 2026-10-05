@@ -265,7 +265,7 @@ details.adv>summary{cursor:pointer;color:var(--mut);font-size:12px;margin-bottom
         <div class="sh">Agents<span class="r"><span id="ag_sum"></span><a href="#" onclick="agForm();return false">Install agents</a></span></div>
         <div class="agents" id="ag_cells"></div>
         <div class="body hidden" id="ag_form" style="border-top:1px solid var(--ln2)">
-          <div class="hint" style="margin-bottom:10px">Installs into the sandbox itself and configures it with this sandbox's own Deskhand as an MCP server, so the agent can drive the desktop it runs on. Several minutes; Hermes is a ~2 GB install. Leave the endpoint blank to use the controller's configured keys.</div>
+          <div class="hint" style="margin-bottom:10px">Installs into the sandbox itself and configures it with this sandbox's own Deskhand as an MCP server, so the agent can drive the desktop it runs on. Hermes is a full install and takes a while: it brings its own git, python and node, plus the browser tools and the computer-use driver. Leave the endpoint blank to use the controller's configured keys.</div>
           <div class="grid">
             <div style="grid-column:span 2"><label>Inference endpoint (OpenAI-compatible)</label><input id="ag_url" value="@@AGENT_BASEURL@@" placeholder="http://host:11444/v1" onchange="document.getElementById('ag_model').value='';loadModels()"></div>
             <div><label>API key</label><input id="ag_key" placeholder="blank if none"></div>

@@ -3134,9 +3134,22 @@ if ($want -contains 'hermes') {
     $exe = Join-Path $hh 'bin\hermes.exe'
     $freshInstall = -not (Test-Path $exe)
     if (-not (Test-Path $exe)) {
-        # Brings its own git, python and node; user-scoped, so no elevation.
+        # The vendor's own bootstrap. Brings its own git, python and node;
+        # user-scoped, so no elevation.
+        #
+        # -NonInteractive and nothing else: a full install. It was passing
+        # -SkipComputerUse, which leaves out the cua-driver, and -SkipSetup,
+        # which the script's own header calls a deprecated alias for
+        # -NonInteractive kept only so old wrappers keep binding. Both opt-outs
+        # are remembered by Hermes's package manager and survive `hermes
+        # update`, so a half install stayed half installed.
+        #
+        # This is the one unpinned thing in a sandbox build -- the Deskhand zip
+        # is sha256-pinned, this is whatever the URL serves -- and it checks out
+        # the main branch rather than a release, so two sandboxes built a week
+        # apart get different Hermes. Pin with -Commit if that ever matters.
         $src = Invoke-RestMethod 'https://hermes-agent.nousresearch.com/install.ps1'
-        & ([scriptblock]::Create($src)) -SkipSetup -SkipComputerUse
+        & ([scriptblock]::Create($src)) -NonInteractive
     }
     if (-not (Test-Path $exe)) { throw 'hermes.exe missing after install' }
 
@@ -3650,7 +3663,10 @@ def do_install_agents(job, vmid, agents, opts=None):
     base_url = (opts.get("base_url") or defaults.get("base_url") or "").strip()
     api_key = (opts.get("api_key") or defaults.get("api_key") or "").strip()
     # Overridable: set agents.hermes.disable_toolsets to [] to keep them all.
-    DEFAULT_OFF = ["web", "browser", "image_gen", "tts", "video", "video_gen",
+    # 'browser' is NOT here any more: the install now pulls agent-browser and
+    # Chromium, and installing a browser stack and then switching the toolset
+    # off is the worst of both -- the download without the use.
+    DEFAULT_OFF = ["web", "image_gen", "tts", "video", "video_gen",
                    "x_search", "stt", "homeassistant", "spotify", "yuanbao",
                    "delegation", "cronjob", "session_search", "skills", "memory",
                    "todo", "clarify"]
