@@ -45,8 +45,8 @@ client, and the lifecycle buttons. **Watch** opens a live view of any of them.
 | | |
 |---|---|
 | **Create** | Linked-clone a sysprepped template, wait out OOBE, apply auto-logon, install Deskhand with a freshly generated token. ~5 min. |
-| **Update** | Reinstall the staged Deskhand build in place, keeping the sandbox's token so connected clients keep working. ~25 s. |
-| **Repair** | For a sandbox stuck at a lock screen or with no Deskhand: redo auto-logon and install. Issues a new token. |
+| **Reinstall Deskhand** | Reinstall the staged build in place, keeping the sandbox's token, port and settings, so clients pointed at it keep working. No reboot. The gentle one, and usually the right one when Deskhand has stopped or is out of date. (`update_sandbox`.) |
+| **Rebuild setup** | For a sandbox that never finished its build -- a lock screen, no Deskhand, no logon. Redoes auto-logon and the install. It **reboots the sandbox and issues a new token**, so anything using the old one breaks, and it resets the Deskhand port, shell and TLS to defaults. Not the way to fix a stopped Deskhand. (`repair_sandbox`.) |
 | **Destroy** | Purges the VM and its disk. |
 | **Watch** | Live MJPEG of the screen, from Proxmox's VNC framebuffer *or* Deskhand's own capture. |
 | **Agents** | Install Hermes and/or opencode *inside* a sandbox, on demand, preconfigured. |
@@ -63,6 +63,7 @@ client, and the lifecycle buttons. **Watch** opens a live view of any of them.
 | **Expire** | An optional timer per sandbox — destroyed automatically when it runs out. `never` is a first-class option, and the default. |
 | **Power** | Start, shut down, stop or reboot without destroying anything. Stopping returns a running slot and the memory its recorder costs; starting is refused at the running limit for the same reason a create is. |
 | **Containment** | Three egress modes per sandbox, enforced by the hypervisor rather than inside Windows: `open` (internet, no LAN), `local` (controller and DNS only) and `blocked` (nothing leaves). Deskhand stays reachable in all three, so a sandbox you have just cut off is still one you can drive. The change is confirmed from inside the guest before the call returns, because Proxmox compiles its ruleset on a timer and a block takes about ten seconds to bite. |
+| **Timings** | Every HTTP route and MCP tool timed at the edge, so the number is what the caller waited: calls, median, p95, max and failures at `/api/timings`, the slowest shown on the page, anything over the slow line printed to the service log. |
 | **Snapshots** | Take, roll back to and delete disk snapshots -- the before-and-after of detonating something. Disk only, never memory, so a revert stops the sandbox, rolls it back and starts it again. |
 
 The two watch sources are not redundant. **Proxmox VNC works when nothing is
@@ -281,6 +282,24 @@ right now is playable. With 8-hour files the recording you most want to watch is
 the one still open, and `+faststart` only writes its index on close -- which
 makes exactly that file unopenable.
 
+## What Deskhand is given in a sandbox
+
+Deskhand is installed declaratively, from a Groundhogfile this controller
+renders per sandbox, and its settings land in
+`%ProgramData%\Deskhand\deskhand.json`:
+
+| | |
+|---|---|
+| `bind: any` | Reachable from the controller rather than loopback only. The port is firewalled to the controller, not open to the LAN. |
+| `hideConsole: true` | Runs windowless. It has to run *in the logged-in session* to drive the desktop -- a session-0 service cannot -- and without this it leaves a console window in every screenshot. Deskhand 0.2.32+. |
+| `autoUpdate` + `autoUpdateIntervalMin: 10` | The sandbox checks GitHub itself and applies newer builds, rather than this controller pushing them. The sandbox does the fetching, so one with its egress cut simply fails the check and carries on. Set `deskhand_update_interval_min` to change it; Deskhand clamps to 5 minutes--1 week. |
+| `noFleet: true` | Single-machine deployment: hides the dashboard's fleet-only UI, because the fleet view belongs to this controller. |
+| elevated | The logon task runs at `RunLevel Highest` and the `sandbox` account is an administrator. Deskhand's system-control and UAC tools cannot work otherwise, and an unelevated process cannot elevate without a consent prompt on the secure desktop that nothing can click. **Its bearer token is therefore administrator on that VM.** |
+
+These are written **at install time**. A sandbox built before a setting existed
+does not acquire it on its own: reinstall Deskhand on it once, after which it
+keeps itself current.
+
 ## Connecting an agent
 
 The controller's own endpoint covers everything — sandboxes you create later
@@ -344,10 +363,34 @@ The **Agents** button on a sandbox (or the `install_agents` MCP tool) installs
 [Hermes](https://hermes-agent.nousresearch.com) and/or
 [opencode](https://opencode.ai) into the guest itself and configures them.
 
-On demand rather than at creation: Hermes alone is a ~2 GB install that brings
-its own git, python and node. Both land in the sandbox account's profile and
-need no elevation. opencode is a plain zip from its GitHub release, so it needs
-no toolchain at all.
+On demand rather than at creation: a full Hermes is ~2.7 GB and around thirteen
+minutes, and brings its own git, python and node. Both land in the sandbox
+account's profile and need no elevation. opencode is a plain zip from its GitHub
+release, so it needs no toolchain at all. Both get a Start menu entry and a PATH
+entry, because an agent you can only launch by typing a path four folders deep
+is one nobody finds.
+
+**Which parts of Hermes.** Three components are optional and are a choice rather
+than something edited into the install script:
+
+| | |
+|---|---|
+| `browser` | agent-browser and Chromium. What the browser toolset needs. |
+| `computer_use` | the cua-driver, Hermes's own desktop control. A sandbox often does not need it: Deskhand already drives the desktop. |
+| `desktop` | the desktop app build stage. |
+
+Everything else the installer does -- git, python, node, the repository, the
+venv, the build -- is the core and is not optional, so it is not offered as if
+it were. The default is browser and computer use; an empty list is a real choice
+and means core only, which is much faster. Checkboxes on the page,
+`hermes_parts` over MCP, `agents.hermes.parts` for a fleet-wide default. The
+browser *toolset* follows the browser *part*, since installing a browser stack
+and then disabling its toolset wastes the download and the reverse is worse.
+
+Two things about that. These apply on a **fresh** install -- the installer is
+skipped entirely when `hermes.exe` already exists. And each omission is recorded
+by Hermes's own package manager and survives `hermes update`, so a part left out
+stays out until `hermes pm install <component>` puts it back.
 
 Each agent is seeded with:
 
@@ -903,6 +946,53 @@ Things that cost real time to find:
   and `repair_sandbox` does finish it. But the cheap fix is to look at
   `/api/jobs` before bouncing the service.
 
+- **VMIDs are reused, so everything keyed by one needs a generation.** The pool
+  is fifty numbers and a destroyed sandbox frees its number for the next one.
+  Comments were always archived on destroy for that reason; the event log,
+  Proxmox's task log and the recordings on disk were not, so a sandbox created
+  five minutes ago showed recordings from days earlier and a history of things
+  done to a machine that no longer existed. Each VMID now carries the time its
+  last occupant was retired and everything per-VMID is read as "since then".
+  Finding that line is fiddlier than it sounds: a full clone inherits the
+  template's `ctime`, so every sandbox claims to have been created the day the
+  template was built, and a clone task is logged against the *source* VMID, so
+  asking for a sandbox's own tasks never returns the clone that made it. A
+  destroy is logged against the number destroyed, and its *end* time is the
+  honest boundary -- the start is not, because a destroy writes its own events
+  while it runs.
+- **A token is not a heartbeat.** Reading a token means a file was read out of
+  the guest; it says nothing about whether anything is listening, and the two
+  part company the moment Deskhand dies under a sandbox that keeps running. The
+  dashboard reported "listening" for a sandbox whose port had been timing out
+  for hours, and the MCP endpoint advertised that sandbox's whole tool set, all
+  of which would have hung. Liveness is now probed, cached briefly and warmed in
+  parallel so one dead sandbox does not add seconds to every refresh.
+- **PowerShell's other streams come back merged as CLIXML.** A reply often ends
+  with `#< CLIXML` and an XML progress blob. It is not output and not an error,
+  but anything parsing the reply whole -- JSON especially -- fails on a result
+  that is actually fine. Strip it before parsing.
+- **`Start-ScheduledTask` is silently ignored while the scheduler still thinks
+  the task is running.** Killing the process and starting the task in the same
+  breath leaves it Ready with nothing listening, which is how a Deskhand install
+  failed its own port check while Deskhand sat installed and idle. Stop the
+  task, wait for the scheduler to agree, start it, then confirm it went.
+- **An at-logon task does not fire for a logon that already happened.** The same
+  install registers Deskhand's logon task after the reboot has already logged
+  in, so the trigger alone never starts it.
+- **Replacing a folder a service is running from fails with access denied.**
+  Groundhog applies `files:` before `run:`, so the stop cannot live in the
+  Groundhogfile; Deskhand is stopped before the apply instead.
+- **A firewall change takes about ten seconds to bite.** Proxmox compiles its
+  ruleset on a timer, not when the rule is written. For a containment control
+  that gap is the whole thing -- "blocked" returned to someone about to detonate
+  a sample would be false for ten seconds -- so `set_egress` asks the guest
+  whether it can still reach out and returns when the answer is no.
+- **A cold start occasionally comes up without the guest agent.** The agent
+  service races the virtio-serial driver it talks over; when it loses, the
+  sandbox is up, logged on and serving Deskhand while this controller can see no
+  address for it. A reboot settles it, which is the tell. The template now
+  restarts the agent a minute into every boot.
+
 ## Layout
 
 ```
@@ -912,6 +1002,10 @@ sandboxctl/
   live.py                RFB client + Deskhand capture -> MJPEG
   config.example.json    copy to config.json (gitignored: holds credentials)
   sandboxctl.service     systemd unit
+  groundhog/             profiles shipped with the controller, served to guests
+  (written at runtime)   jobs, claims, expiry, events, comments and their
+                         archives, generations, agent state -- all JSON beside
+                         app.py, all safe to delete if you want a clean slate
 waa-runner/
   runner.py              WindowsAgentArena harness: reset, setup, score
   tasks/                 25 task definitions (clock, notepad, file_explorer)
