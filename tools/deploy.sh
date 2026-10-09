@@ -15,10 +15,19 @@
 # the number cannot be read at all, it refuses rather than assuming zero.
 set -euo pipefail
 
-HOST=root@192.168.6.58
-CTL=http://sandbox.winetown.wirehavok.net
-SRC="C:/Users/crimson/source/repos/SandboxMCP/sandboxctl/app.py"
-PAGE="C:/Users/crimson/source/repos/SandboxMCP/sandboxctl/dashboard.html"
+# Where your controller lives. Real hostnames stay out of the repo: put them
+# in tools/deploy.env, which is gitignored, or set them in the environment.
+#
+#   HOST=root@sandboxctl.example.lan
+#   CTL=http://sandboxctl.example.lan
+#
+HERE="$(cd "$(dirname "$0")" && pwd)"
+[ -f "$HERE/deploy.env" ] && . "$HERE/deploy.env"
+HOST="${HOST:-root@sandboxctl.lan}"
+CTL="${CTL:-http://sandboxctl.lan}"
+# Derived from this script's own location, so the checkout can live anywhere.
+SRC="${SRC:-$HERE/../sandboxctl/app.py}"
+PAGE="${PAGE:-$HERE/../sandboxctl/dashboard.html}"
 
 running=$(curl -s -m 20 "$CTL/api/capacity" | python -c "
 import sys, json

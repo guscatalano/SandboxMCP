@@ -16,3 +16,6 @@ sandboxctl/payload/
 
 __pycache__/
 *.pyc
+
+# Local deploy target: real hostnames stay out of the repo.
+tools/deploy.env

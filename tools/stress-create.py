@@ -22,6 +22,7 @@ destroys, so it cannot take anything it did not make.
 """
 import argparse
 import json
+import os
 import re
 import statistics
 import sys
@@ -122,7 +123,9 @@ def controller_mem(host):
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--host", default="http://sandbox.winetown.wirehavok.net")
+    # No real hostname in the repo: pass --host, or set SANDBOXCTL_URL.
+    p.add_argument("--host", default=os.environ.get("SANDBOXCTL_URL",
+                                                    "http://sandboxctl.lan"))
     p.add_argument("--count", type=int, default=4)
     p.add_argument("--stagger", type=float, default=0.0,
                    help="seconds between starts; 0 means all at once")
