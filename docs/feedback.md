@@ -203,6 +203,40 @@ Item 4 is the one with a caveat: the running limit was full, so it has not been
 observed on an actual create. Both calls it makes were exercised against a live
 sandbox and it cannot fail a create.
 
+## The GitHub limit, resolved (2026-10-11)
+
+Measured on the live controller mid-investigation: **7 of 60 requests
+remaining**, which is the reported failure happening in front of us.
+
+Built a mirror rather than either suggested option. A caching HTTP proxy is the
+obvious answer and the wrong one: these are HTTPS fetches, so a proxy either
+tunnels them and caches nothing, or intercepts TLS, which means installing a CA
+into machines we deliberately detonate malware in. Per-sandbox tokens raise the
+ceiling but put a live credential inside an untrusted box.
+
+The mirror fetches each release asset once on the controller, pins it by
+SHA-256, and serves it from the payload port. Shipped profiles are rewritten
+automatically; `mirror_asset` warms one by hand. Any token stays on the
+controller, where it raises *our* limit to 5000 an hour and never goes near a
+guest.
+
+Verified: heisenberg.exe mirrored at 2,292,736 bytes with the hash matching on
+read-back, and both shipped profiles rewritten off `github:`.
+
+One claim corrected by testing. The first version of this said a mirrored
+profile would install with egress `local` **or** `blocked`. Only `local` is
+true:
+
+| egress | mirror on the payload port | github.com |
+|---|---|---|
+| open | 2,292,736 bytes | reachable |
+| local | 2,292,736 bytes | unreachable |
+| blocked | unreachable | unreachable |
+
+`blocked` puts a DROP above the security group, so nothing leaves at all,
+including to us. That is the point of the mode, and the comment in the code now
+says so.
+
 ## Suggested order
 
 Cheap, mechanical, no decision needed:

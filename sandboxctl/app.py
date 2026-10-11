@@ -639,6 +639,174 @@ GH_LIBRARY_NOTES = {
 }
 
 
+# --------------------------------------------------------------------------
+# GitHub mirror
+#
+# Every sandbox shares one egress address, and GitHub allows 60 unauthenticated
+# requests an hour from it. A day of runs exhausted that and profiles started
+# failing with 403 mid-install.
+#
+# A caching HTTP proxy is the obvious answer and the wrong one: these are HTTPS
+# fetches, so a proxy either tunnels them and caches nothing, or intercepts TLS,
+# which means installing a CA into machines we deliberately detonate malware in.
+#
+# So this mirrors instead, which is what the Deskhand install already does:
+# fetch once here, serve from the payload port, pin by SHA-256. The fleet's
+# identical downloads collapse into one fetch; the sandbox needs no GitHub
+# access at all; and because the payload port is one of the few things the
+# security group lets a sandbox reach, a profile still installs with egress
+# set to "local".
+#
+# Measured, because the first version of this comment overclaimed: with
+# "local" the guest fetched the mirrored 2.29 MB asset while github.com was
+# unreachable. With "blocked" the mirror is unreachable too -- that mode puts
+# a DROP above the security group and means nothing leaves, including to us,
+# which is the point of it.
+#
+# The token, if there is one, stays here. It raises THIS machine's limit to
+# 5000 an hour and never goes near a guest, which is the whole point of not
+# handing tokens to sandboxes.
+# --------------------------------------------------------------------------
+GITHUB_TOKEN = (CONFIG.get("github_token") or "").strip()
+MIRROR_DIR = os.path.join(HERE, "payload", "mirror")
+MIRROR_RE = re.compile(r"github:([A-Za-z0-9._-]+)/([A-Za-z0-9._-]+)@([A-Za-z0-9._-]+)/([^\s'\"]+)")
+_MIRROR_LOCK = threading.Lock()
+MIRROR_NAME_RE = re.compile(r"^[A-Za-z0-9._-]{1,180}$")
+
+
+def _gh(url, raw=False, timeout=60):
+    headers = {"User-Agent": "sandboxctl", "Accept":
+               "application/octet-stream" if raw else "application/vnd.github+json"}
+    if GITHUB_TOKEN:
+        headers["Authorization"] = "Bearer " + GITHUB_TOKEN
+    req = urllib.request.Request(url, headers=headers)
+    return urllib.request.urlopen(req, timeout=timeout)
+
+
+def github_rate_limit():
+    """What is left of this controller's own budget."""
+    try:
+        with _gh("https://api.github.com/rate_limit") as r:
+            core = (json.load(r).get("resources") or {}).get("core") or {}
+        return {"limit": core.get("limit"), "remaining": core.get("remaining"),
+                "resets_in_min": max(0, int((core.get("reset", 0) - time.time()) / 60)),
+                "authenticated": bool(GITHUB_TOKEN)}
+    except Exception as exc:                          # noqa: BLE001
+        return {"error": str(exc)[:120], "authenticated": bool(GITHUB_TOKEN)}
+
+
+def _mirror_meta_path(name):
+    return os.path.join(MIRROR_DIR, name + ".json")
+
+
+def mirror_github(owner, repo, tag, asset, refresh=False):
+    """Fetch one release asset to the mirror and return how to reach it.
+
+    A pinned tag is fetched once and never again. "latest" is re-resolved each
+    time -- that is one cheap API call rather than a download -- and the bytes
+    are only pulled if the resolved tag is not the one already held.
+    """
+    name = "%s_%s_%s_%s" % (owner, repo, tag, os.path.basename(asset))
+    name = re.sub(r"[^A-Za-z0-9._-]", "_", name)[:180]
+    os.makedirs(MIRROR_DIR, exist_ok=True)
+    blob_path = os.path.join(MIRROR_DIR, name)
+    meta_path = _mirror_meta_path(name)
+
+    with _MIRROR_LOCK:
+        meta = {}
+        if os.path.isfile(meta_path):
+            try:
+                with open(meta_path, encoding="utf-8") as fh:
+                    meta = json.load(fh)
+            except Exception:                         # noqa: BLE001
+                meta = {}
+
+        pinned = tag.lower() not in ("latest",)
+        if meta and os.path.isfile(blob_path) and pinned and not refresh:
+            return dict(meta, cached=True)
+
+        api = ("https://api.github.com/repos/%s/%s/releases/%s"
+               % (owner, repo, "latest" if tag.lower() == "latest" else "tags/" + tag))
+        with _gh(api) as r:
+            rel = json.load(r)
+        real_tag = rel.get("tag_name") or tag
+        if (meta and os.path.isfile(blob_path) and not refresh
+                and meta.get("resolved_tag") == real_tag):
+            return dict(meta, cached=True)
+
+        want = os.path.basename(asset)
+        found = next((a for a in (rel.get("assets") or []) if a.get("name") == want), None)
+        if not found:
+            names = ", ".join(a.get("name", "") for a in (rel.get("assets") or []))[:200]
+            raise RuntimeError("no asset %r in %s/%s %s. It has: %s"
+                               % (want, owner, repo, real_tag, names or "nothing"))
+
+        tmp = blob_path + ".part"
+        digest = hashlib.sha256()
+        size = 0
+        with _gh(found["browser_download_url"], raw=True, timeout=600) as up, open(tmp, "wb") as fh:
+            while True:
+                chunk = up.read(262144)
+                if not chunk:
+                    break
+                fh.write(chunk)
+                digest.update(chunk)
+                size += len(chunk)
+        os.replace(tmp, blob_path)
+
+        meta = {"name": name, "owner": owner, "repo": repo, "tag": tag,
+                "resolved_tag": real_tag, "asset": want, "size": size,
+                "sha256": digest.hexdigest(), "fetched": time.strftime("%Y-%m-%d %H:%M"),
+                "url": "%s/payload/mirror/%s" % (SELF_URL, name)}
+        tmpm = meta_path + ".tmp"
+        with open(tmpm, "w", encoding="utf-8") as fh:
+            json.dump(meta, fh, indent=2)
+        os.replace(tmpm, meta_path)
+        return dict(meta, cached=False)
+
+
+def mirror_rewrite(text):
+    """Point every github: reference in a Groundhogfile at the mirror.
+
+    Done here, on the controller, rather than by letting the payload port fetch
+    on demand: a sandbox that could name a URL for this service to go and get
+    would be a confused deputy, and that port is the one thing an untrusted
+    machine can reach.
+    """
+    if not text or "github:" not in text:
+        return text, []
+    done = []
+
+    def swap(m):
+        owner, repo, tag, asset = m.groups()
+        try:
+            got = mirror_github(owner, repo, tag, asset)
+            done.append(got)
+            return got["url"]
+        except Exception as exc:                      # noqa: BLE001
+            # Leave the original reference alone. A sandbox with working egress
+            # still installs; one without gets a clear failure from Groundhog
+            # rather than a silently rewritten URL that 404s.
+            print("mirror: leaving %s/%s@%s/%s as-is (%s)"
+                  % (owner, repo, tag, asset, str(exc)[:90]), flush=True)
+            return m.group(0)
+
+    return MIRROR_RE.sub(swap, text), done
+
+
+def mirror_listing():
+    out = []
+    for fn in sorted(os.listdir(MIRROR_DIR)) if os.path.isdir(MIRROR_DIR) else []:
+        if not fn.endswith(".json"):
+            continue
+        try:
+            with open(os.path.join(MIRROR_DIR, fn), encoding="utf-8") as fh:
+                out.append(json.load(fh))
+        except Exception:                             # noqa: BLE001
+            pass
+    return out
+
+
 def groundhog_library():
     """The profiles shipped alongside this service, newest content each time.
 
@@ -656,10 +824,11 @@ def groundhog_library():
                 body = fh.read()
         except OSError:
             continue
+        content, _ = mirror_rewrite(body.replace("@@SELF@@", SELF_URL.split("//", 1)[-1]))
         out.append({"name": stem,
                     "note": GH_LIBRARY_NOTES.get(stem, ""),
                     "url": f"{SELF_URL}/payload/lib-{name}",
-                    "content": body.replace("@@SELF@@", SELF_URL.split("//", 1)[-1])})
+                    "content": content})
     return out
 
 
@@ -726,6 +895,7 @@ def groundhog_write_adhoc(vmid, content):
     route the Deskhand install uses. The file names its secrets rather than
     carrying them, so serving it is not a disclosure.
     """
+    content, _ = mirror_rewrite(content)
     if not (content or "").strip():
         raise ValueError("nothing to apply: the Groundhogfile is empty")
     name = f"adhoc-{int(vmid)}.groundhog.yaml"
@@ -2431,6 +2601,27 @@ MCP_TOOLS = [
                 "who": {"type": "string", "description": "Who set it, for the history."},
             },
             "required": ["vmid"],
+        },
+    },
+    {
+        "name": "mirror_asset",
+        "description": ("Copy a GitHub release asset onto this controller and serve it to the "
+                        "sandboxes from the payload port. Every sandbox shares one egress "
+                        "address with a 60-request hourly limit, so the fleet pulling the same "
+                        "file repeatedly is what exhausts it. Mirrored assets are fetched once, "
+                        "pinned by SHA-256, and still reachable from a sandbox whose egress is "
+                        "set to \"local\", because the payload port survives that mode; "
+                        "\"blocked\" cuts the mirror off too, by design. "
+                        "Profiles from the shipped library are rewritten to use this "
+                        "automatically; call it directly to warm something first. "
+                        "ref looks like github:owner/repo@tag/asset.zip, where tag may be "
+                        "\"latest\"."),
+        "inputSchema": {
+            "type": "object",
+            "properties": {"ref": {"type": "string"},
+                           "refresh": {"type": "boolean",
+                                       "description": "Re-fetch even if it is already held."}},
+            "required": ["ref"],
         },
     },
     {
@@ -5039,6 +5230,13 @@ def _mcp_call(name, args):
             raise ValueError("vmid is required")
         _check_managed(vmid)
         return set_expiry(vmid, args.get("minutes"), args.get("who"))
+    if name == "mirror_asset":
+        ref = (args.get("ref") or "").strip()
+        m = MIRROR_RE.match(ref if ref.startswith("github:") else "github:" + ref)
+        if not m:
+            raise ValueError("ref looks like github:owner/repo@tag/asset.zip")
+        got = mirror_github(*m.groups(), refresh=bool(args.get("refresh")))
+        return dict(got, rate_limit=github_rate_limit())
     if name == "sandbox_screenshot":
         jpg = host_screenshot(args.get("vmid"))
         return {"_mcp_content": [{"type": "image",
@@ -5569,6 +5767,9 @@ class Handler(BaseHTTPRequestHandler):
             return
         if p.path == "/api/timings":
             return self._send(200, json.dumps(timings_report()))
+        if p.path == "/api/mirror":
+            return self._send(200, json.dumps({"items": mirror_listing(),
+                                               "rate_limit": github_rate_limit()}))
         if p.path == "/api/capacity":
             try:
                 return self._send(200, json.dumps(capacity()))
@@ -5795,9 +5996,8 @@ class Handler(BaseHTTPRequestHandler):
         if p.path.startswith("/payload/"):
             # Served to the sandboxes themselves; this is the one thing they are
             # allowed to reach on the LAN.
-            fn = os.path.basename(p.path)
-            full = os.path.join(HERE, "payload", fn)
-            if not os.path.isfile(full):
+            full = _payload_file(p.path)
+            if not full:
                 return self._send(404, json.dumps({"error": "not found"}))
             size = os.path.getsize(full)
             self.send_response(200)
@@ -5981,6 +6181,33 @@ class Handler(BaseHTTPRequestHandler):
         return self._send(404, json.dumps({"error": "not found"}))
 
 
+def _payload_file(path):
+    """Map a /payload/... request to a file, or None.
+
+    Exactly two shapes are served: /payload/<name> and /payload/mirror/<name>.
+    The names are matched against a pattern rather than cleaned, so there is no
+    traversal to get wrong -- a name with a slash or a dot-dot in it simply is
+    not a name. This is the surface an untrusted machine talks to.
+    """
+    parts = [x for x in path.split("/") if x not in ("", ".")]
+    if not parts or parts[0] != "payload":
+        return None
+    rest = parts[1:]
+    if len(rest) == 2 and rest[0] == "mirror":
+        name, base = rest[1], MIRROR_DIR
+    elif len(rest) == 1:
+        name, base = rest[0], os.path.join(HERE, "payload")
+    else:
+        return None
+    # A name is one path component of safe characters, and never all dots.
+    # "..": the join would land on a directory and isfile() would refuse it, but
+    # a guard that is right by accident is not a guard.
+    if not MIRROR_NAME_RE.match(name) or name.strip(".") == "":
+        return None
+    full = os.path.join(base, name)
+    return full if os.path.isfile(full) else None
+
+
 class PayloadHandler(BaseHTTPRequestHandler):
     """Read-only static file server for the Deskhand payload.
 
@@ -5999,9 +6226,8 @@ class PayloadHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", "0")
             self.end_headers()
             return
-        fn = os.path.basename(p.path)
-        full = os.path.join(HERE, "payload", fn)
-        if not os.path.isfile(full):
+        full = _payload_file(p.path)
+        if not full:
             self.send_response(404)
             self.send_header("Content-Length", "0")
             self.end_headers()
