@@ -634,6 +634,10 @@ GH_LIBRARY_NOTES = {
               "python and node.",
     "debug-kit": "Heisenberg and opencode together: drive native debugging from "
                  "an agent.",
+    "dev-debug": "Build and debug in the box: WinDbg, procdump, Process Explorer "
+                 "and Monitor, Node, git, the w64devkit toolchain, Defender "
+                 "exclusions for the build dirs, and a compiled classic Win32 "
+                 "target to attach to. Minutes, not the Windows Update wait.",
     "everything": "Every agent and tool here in one apply. Bake this into a "
                   "template rather than waiting on it per sandbox.",
 }
@@ -671,6 +675,8 @@ GITHUB_TOKEN = (CONFIG.get("github_token") or "").strip()
 MIRROR_DIR = os.path.join(HERE, "payload", "mirror")
 MIRROR_RE = re.compile(r"github:([A-Za-z0-9._-]+)/([A-Za-z0-9._-]+)@([A-Za-z0-9._-]+)/([^\s'\"]+)")
 _MIRROR_LOCK = threading.Lock()
+# How long a resolved "latest" is trusted before asking GitHub again.
+LATEST_TTL_S = float(CONFIG.get("mirror_latest_ttl_hours") or 6) * 3600
 MIRROR_NAME_RE = re.compile(r"^[A-Za-z0-9._-]{1,180}$")
 
 
@@ -722,8 +728,16 @@ def mirror_github(owner, repo, tag, asset, refresh=False):
                 meta = {}
 
         pinned = tag.lower() not in ("latest",)
-        if meta and os.path.isfile(blob_path) and pinned and not refresh:
+        held = bool(meta) and os.path.isfile(blob_path)
+        if held and pinned and not refresh:
             return dict(meta, cached=True)
+        # "latest" still means asking which release that is, and that question
+        # costs a request against the same budget this exists to protect. Ask
+        # at most once every LATEST_TTL_S; in between, what we hold is latest
+        # enough. Without this the mirror spent the limit it was saving.
+        if (held and not refresh
+                and time.time() - float(meta.get("resolved_at") or 0) < LATEST_TTL_S):
+            return dict(meta, cached=True, stale_ok=True)
 
         api = ("https://api.github.com/repos/%s/%s/releases/%s"
                % (owner, repo, "latest" if tag.lower() == "latest" else "tags/" + tag))
@@ -732,6 +746,12 @@ def mirror_github(owner, repo, tag, asset, refresh=False):
         real_tag = rel.get("tag_name") or tag
         if (meta and os.path.isfile(blob_path) and not refresh
                 and meta.get("resolved_tag") == real_tag):
+            meta["resolved_at"] = time.time()
+            try:
+                with open(meta_path, "w", encoding="utf-8") as fh:
+                    json.dump(meta, fh, indent=2)
+            except OSError:
+                pass
             return dict(meta, cached=True)
 
         want = os.path.basename(asset)
@@ -755,6 +775,7 @@ def mirror_github(owner, repo, tag, asset, refresh=False):
         os.replace(tmp, blob_path)
 
         meta = {"name": name, "owner": owner, "repo": repo, "tag": tag,
+                "resolved_at": time.time(),
                 "resolved_tag": real_tag, "asset": want, "size": size,
                 "sha256": digest.hexdigest(), "fetched": time.strftime("%Y-%m-%d %H:%M"),
                 "url": "%s/payload/mirror/%s" % (SELF_URL, name)}
@@ -765,7 +786,7 @@ def mirror_github(owner, repo, tag, asset, refresh=False):
         return dict(meta, cached=False)
 
 
-def mirror_rewrite(text):
+def mirror_rewrite(text, fetch=False):
     """Point every github: reference in a Groundhogfile at the mirror.
 
     Done here, on the controller, rather than by letting the payload port fetch
@@ -780,6 +801,17 @@ def mirror_rewrite(text):
     def swap(m):
         owner, repo, tag, asset = m.groups()
         try:
+            if not fetch:
+                # Reading is not a reason to download. The dashboard lists the
+                # library on every load; if that fetched, simply looking at the
+                # page would spend the budget. Swap in what is already held and
+                # leave the rest pointing at GitHub.
+                name = re.sub(r"[^A-Za-z0-9._-]", "_",
+                              "%s_%s_%s_%s" % (owner, repo, tag,
+                                               os.path.basename(asset)))[:180]
+                if os.path.isfile(os.path.join(MIRROR_DIR, name)):
+                    return "%s/payload/mirror/%s" % (SELF_URL, name)
+                return m.group(0)
             got = mirror_github(owner, repo, tag, asset)
             done.append(got)
             return got["url"]
@@ -843,10 +875,14 @@ def publish_groundhog_library():
     try:
         os.makedirs(pdir, exist_ok=True)
         for item in groundhog_library():
+            # Fetch here and nowhere else. Publishing happens at startup and
+            # when someone asks for it, which is a sensible moment to spend a
+            # download; serving the listing is not.
+            content, _ = mirror_rewrite(item["content"], fetch=True)
             dest = os.path.join(pdir, "lib-" + item["name"] + ".groundhog.yaml")
             tmp = dest + ".tmp"
             with open(tmp, "w", encoding="utf-8", newline="\n") as fh:
-                fh.write(item["content"])
+                fh.write(content)
             os.replace(tmp, dest)
         return len(groundhog_library())
     except Exception as exc:                          # noqa: BLE001
@@ -895,7 +931,7 @@ def groundhog_write_adhoc(vmid, content):
     route the Deskhand install uses. The file names its secrets rather than
     carrying them, so serving it is not a disclosure.
     """
-    content, _ = mirror_rewrite(content)
+    content, _ = mirror_rewrite(content, fetch=True)
     if not (content or "").strip():
         raise ValueError("nothing to apply: the Groundhogfile is empty")
     name = f"adhoc-{int(vmid)}.groundhog.yaml"
@@ -2474,7 +2510,37 @@ def do_destroy(job, vmid):
     if RECORDER:
         RECORDER.stop(vmid)
     job.log("destroying")
-    api(f"/nodes/{NODE}/qemu/{vmid}?purge=1&destroy-unreferenced-disks=1", "DELETE", timeout=180)
+    # Wait for the task and check how it ended. Proxmox accepts the DELETE and
+    # does the work afterwards, so not waiting meant reporting "gone" for a
+    # destroy that had failed -- seen with a storage offline: the job went
+    # green, the sandbox stayed, and capacity counted a machine nobody thought
+    # existed.
+    # destroy-unreferenced-disks makes Proxmox sweep EVERY configured storage
+    # for stray disks of this VMID, so one dead storage aborts a destroy that
+    # has nothing to do with it. Seen here as "storage 'mininas' is not
+    # online", with the sandbox left behind. The sweep is a tidiness measure;
+    # removing the machine is not. So: try the thorough form, and if a storage
+    # is what stopped it, do the part that matters and say what was skipped.
+    try:
+        _wait_task(api(f"/nodes/{NODE}/qemu/{vmid}?purge=1&destroy-unreferenced-disks=1",
+                       "DELETE", timeout=180), timeout=600)
+    except Exception as exc:                          # noqa: BLE001
+        if "not online" not in str(exc) and "storage" not in str(exc).lower():
+            raise
+        job.log(f"  {exc}")
+        job.log("  retrying without the unreferenced-disk sweep; "
+                "an offline storage cannot hold this sandbox hostage")
+        _wait_task(api(f"/nodes/{NODE}/qemu/{vmid}?purge=1", "DELETE", timeout=180),
+                   timeout=600)
+    if vm_status(vmid) != "unknown":
+        try:
+            vm("/config", vmid=vmid)
+        except Exception:                             # noqa: BLE001
+            job.log("gone")
+            return
+        raise RuntimeError(
+            "Proxmox reported the destroy finished but VM %s is still here. "
+            "Check the node's task log for the reason." % vmid)
     job.log("gone")
 
 
@@ -2905,6 +2971,13 @@ MCP_TOOLS = [
                                                            "scripted install. Ignored when the "
                                                            "staged artifact is the MSI, which "
                                                            "always uses the scripted path.")},
+                "stop_idle": {"type": "boolean",
+                              "description": ("At the running limit, shut down the oldest idle "
+                                              "sandbox and carry on instead of refusing. Idle "
+                                              "means unclaimed, or claimed by you; someone "
+                                              "else's claim is never touched. Stopping is not "
+                                              "destroying -- its disk, notes and snapshots "
+                                              "stay, and it can be started again.")},
                 "expires_in_minutes": {"type": "integer",
                                        "description": ("Destroy it automatically after this long. "
                                                        "0 or omitted means never. A sandbox under "
@@ -4703,7 +4776,42 @@ def capacity():
     }
 
 
-def _guard_capacity():
+def _fmt_uptime(sec):
+    sec = int(sec or 0)
+    if sec >= 86400:
+        return "%dd %dh" % (sec // 86400, (sec % 86400) // 3600)
+    if sec >= 3600:
+        return "%dh %dm" % (sec // 3600, (sec % 3600) // 60)
+    return "%dm" % (sec // 60)
+
+
+def idle_candidates(who=""):
+    """Running sandboxes it would be reasonable to stop, oldest first.
+
+    Idle means nobody else is holding it: unclaimed, or claimed by whoever is
+    asking. Someone else's claim is never a candidate, however long it has been
+    up -- that is the whole point of a claim.
+    """
+    who = (who or "").strip()
+    out = []
+    for e in list_sandboxes():
+        if e.get("status") != "running":
+            continue
+        claim = get_claim(e["vmid"])
+        if claim and claim["who"] != who:
+            continue
+        try:
+            up = (vm("/status/current", vmid=e["vmid"]) or {}).get("uptime") or 0
+        except Exception:                             # noqa: BLE001
+            up = 0
+        out.append({"vmid": e["vmid"], "name": e.get("name", ""),
+                    "uptime_seconds": up, "uptime": _fmt_uptime(up),
+                    "claimed_by": (claim or {}).get("who")})
+    out.sort(key=lambda c: -c["uptime_seconds"])
+    return out
+
+
+def _guard_capacity(who=""):
     """Refuse a new sandbox at the limit, before any work is started.
 
     Checked here rather than inside the job so the caller is told no
@@ -4716,10 +4824,21 @@ def _guard_capacity():
             "Destroy one you are finished with, or raise max_sandboxes in "
             "config.json.")
     if cap["running"] >= MAX_RUNNING:
+        # Name the way out rather than just the wall. Stopping is not
+        # destroying -- the disk, the notes and the snapshots all stay -- and
+        # before power control existed the only way past this was to throw a
+        # sandbox away.
+        free = idle_candidates(who)
+        hint = ""
+        if free:
+            hint = (" Idle and stoppable right now: "
+                    + ", ".join("%s (%s, up %s)" % (c["vmid"], c["name"], c["uptime"])
+                                for c in free[:3])
+                    + ". Pass stop_idle=true to stop the oldest of those and carry on.")
         raise RuntimeError(
             f"at the running limit: {cap['running']} of {MAX_RUNNING} are running. "
             "Each running sandbox costs the controller ~180 MB for its console "
-            "recorder. Destroy or stop one, or raise max_running in config.json.")
+            f"recorder.{hint or ' Stop or destroy one, or raise max_running in config.json.'}")
 
 
 def recorder_loop():
@@ -5339,7 +5458,19 @@ def _mcp_call(name, args):
     if name == "capacity":
         return capacity()
     if name == "create_sandbox":
-        _guard_capacity()
+        who = (args.get("who") or "").strip()[:60]
+        if args.get("stop_idle"):
+            cap = capacity()
+            if cap["running"] >= MAX_RUNNING:
+                free = idle_candidates(who)
+                if not free:
+                    raise RuntimeError(
+                        "at the running limit and nothing is idle: every running sandbox is "
+                        "held by someone else. Ask them, or raise max_running.")
+                pick = free[0]
+                power_sandbox(pick["vmid"], "shutdown", who or "create stop_idle")
+                _ALIVE_CACHE.pop(int(pick["vmid"]), None)
+        _guard_capacity(who)
         opts = {
             "name": (args.get("name") or "").strip() or f"sandbox-{int(time.time()) % 100000}",
             "cores": int(args.get("cores") or 4),
@@ -5768,6 +5899,7 @@ class Handler(BaseHTTPRequestHandler):
         if p.path == "/api/timings":
             return self._send(200, json.dumps(timings_report()))
         if p.path == "/api/mirror":
+            # The budget costs a request to ask for, so only when asked.
             return self._send(200, json.dumps({"items": mirror_listing(),
                                                "rate_limit": github_rate_limit()}))
         if p.path == "/api/capacity":
@@ -6033,7 +6165,7 @@ class Handler(BaseHTTPRequestHandler):
                 "who": (body.get("who") or "").strip()[:60],
             }
             try:
-                _guard_capacity()
+                _guard_capacity(opts.get("who") or "")
             except Exception as exc:                  # noqa: BLE001
                 return self._send(409, json.dumps({"error": str(exc)}))
             if not opts["name"]:

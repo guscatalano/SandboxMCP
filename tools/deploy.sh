@@ -65,6 +65,10 @@ scp -q -o ConnectTimeout=10 -o StrictHostKeyChecking=no "$SRC" "$HOST:/opt/sandb
 # The page is read from disk on every request, so it lands before the restart
 # and the restart is only for app.py.
 scp -q -o ConnectTimeout=10 -o StrictHostKeyChecking=no "$PAGE" "$HOST:/opt/sandboxctl/dashboard.html"
+# The Groundhog profiles are part of the deployable too: they are served to the
+# guests and rewritten on the way out. Shipping only the code meant a new
+# profile existed in the repo and nowhere else.
+scp -qr -o ConnectTimeout=10 -o StrictHostKeyChecking=no     "$(dirname "$PAGE")/groundhog" "$HOST:/opt/sandboxctl/"
 ssh -o ConnectTimeout=10 -o StrictHostKeyChecking=no "$HOST" \
     "systemctl restart sandboxctl; sleep 4; systemctl is-active sandboxctl"
 echo "deployed"

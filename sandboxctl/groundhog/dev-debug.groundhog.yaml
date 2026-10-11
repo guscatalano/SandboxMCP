@@ -1,0 +1,109 @@
+# A sandbox you can build and debug in, staged rather than assembled by hand.
+#
+# From a field report: WinDbg had to be installed with winget, Node and
+# procdump were absent, and a build toolchain tripped Defender and needed an
+# exclusion added by hand before it would survive.
+#
+# Deliberately NOT extends: groundhog:windows-internals. That base is the right
+# home for TTD and the symbol packages, but it is serviced from Windows Update
+# and takes many minutes on a fresh VM. Everything here comes from winget or a
+# release asset, so it finishes in a few. Apply the heisenberg profile on top
+# when you want the heavyweight tooling as well.
+version: 1
+agent: ">=0.11.0"
+
+apps:
+  - Microsoft.WinDbg
+  - Microsoft.Sysinternals.ProcDump
+  - Microsoft.Sysinternals.ProcessExplorer
+  - Microsoft.Sysinternals.ProcessMonitor
+  - OpenJS.NodeJS.LTS
+  - Git.Git
+
+files:
+  # Pinned, not @latest: the asset name carries the version, so "latest" cannot
+  # name a file. A pinned build is the right default for a lab anyway -- two
+  # sandboxes a month apart should compile the same way.
+  #
+  # This is fetched through the controller's mirror, so the whole fleet costs
+  # one download of GitHub's hourly allowance rather than one per sandbox.
+  - from: github:skeeto/w64devkit@v2.10.0/w64devkit-x64-2.10.0.7z.exe
+    to: C:\Tools\dl\w64devkit.exe
+
+run:
+  # Defender exclusions live HERE, in the profile, and not in the template.
+  # This is a malware sandbox: baking exclusions into the image every sandbox
+  # clones from would quietly weaken detonation work everywhere to solve a
+  # build-tools problem in one place. A box that applied this profile has
+  # declared itself a dev box.
+  - command: |
+      $ErrorActionPreference = 'SilentlyContinue'
+      foreach ($p in 'C:\Tools\w64devkit', 'C:\Tools\samples', 'C:\buildsrc') {
+          New-Item -ItemType Directory -Path $p -Force | Out-Null
+          Add-MpPreference -ExclusionPath $p
+      }
+      Write-Output 'exclusions set for the toolchain and build directories only'
+
+  - command: |
+      # Self-extracting 7-zip archive, so it unpacks itself rather than being
+      # unzipped by the agent.
+      $ErrorActionPreference = 'Stop'
+      if (-not (Test-Path 'C:\Tools\w64devkit\bin\gcc.exe')) {
+          & 'C:\Tools\dl\w64devkit.exe' -o'C:\Tools' -y | Out-Null
+      }
+      if (-not (Test-Path 'C:\Tools\w64devkit\bin\gcc.exe')) { throw 'w64devkit did not extract' }
+
+  # A classic Win32 target to attach to and dump.
+  #
+  # Also from the field report: Windows 11's Store Notepad launches through a
+  # stub that exits immediately, so the pid you get is not the pid you want and
+  # comsvcs MiniDump fails against it. Every in-box alternative has been
+  # Store-ified or removed -- WordPad is gone in 24H2 -- so rather than name one
+  # that may not be there, this compiles one. It idles in a message loop with a
+  # window, which is what makes it useful for attach, dump and UI automation.
+  - command: |
+      $ErrorActionPreference = 'Stop'
+      $src = 'C:\Tools\samples\target.c'
+      $exe = 'C:\Tools\samples\classic-target.exe'
+      New-Item -ItemType Directory -Path 'C:\Tools\samples' -Force | Out-Null
+      @'
+      #include <windows.h>
+      static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
+          if (m == WM_DESTROY) { PostQuitMessage(0); return 0; }
+          return DefWindowProc(h, m, w, l);
+      }
+      int WINAPI WinMain(HINSTANCE hi, HINSTANCE hp, LPSTR cl, int sc) {
+          WNDCLASS wc = {0};
+          wc.lpfnWndProc = WndProc; wc.hInstance = hi; wc.lpszClassName = "ClassicTarget";
+          RegisterClass(&wc);
+          HWND h = CreateWindow("ClassicTarget", "Classic Win32 Target",
+                                WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+                                CW_USEDEFAULT, CW_USEDEFAULT, 420, 220, 0, 0, hi, 0);
+          MSG msg;
+          while (GetMessage(&msg, 0, 0, 0) > 0) { TranslateMessage(&msg); DispatchMessage(&msg); }
+          return 0;
+      }
+      '@ | Set-Content -LiteralPath $src -Encoding ASCII
+      & 'C:\Tools\w64devkit\bin\gcc.exe' $src -o $exe -mwindows -O1
+      if (-not (Test-Path $exe)) { throw 'the sample target did not compile' }
+
+path:
+  - dir: C:\Tools\w64devkit\bin
+    scope: machine
+  - dir: C:\Tools\samples
+    scope: machine
+
+verify:
+  - file: C:\Tools\w64devkit\bin\gcc.exe
+  - file: C:\Tools\samples\classic-target.exe
+  - command: if (-not (Get-Command node -ErrorAction SilentlyContinue)) { exit 1 }
+  - command: if (-not (Get-Command git -ErrorAction SilentlyContinue)) { exit 1 }
+  - command: |
+      # procdump lands under a versioned WindowsApps path, so look for the
+      # command rather than a fixed file.
+      if (-not (Get-Command procdump -ErrorAction SilentlyContinue)) { exit 1 }
+  - command: |
+      # The exclusions are the point of this profile as much as the tools are:
+      # without them the toolchain gets quarantined on first use.
+      $ex = (Get-MpPreference).ExclusionPath
+      if ($ex -notcontains 'C:\Tools\w64devkit') { exit 1 }

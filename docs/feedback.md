@@ -237,6 +237,35 @@ true:
 including to us. That is the point of the mode, and the comment in the code now
 says so.
 
+## Found while acting on the above (2026-10-11)
+
+Two bugs of our own, neither reported, both found by testing the fixes.
+
+**A failed destroy reported success.** Proxmox accepts the DELETE and does the
+work afterwards; we never looked at how it ended, so the job went green and
+logged "gone" for a destroy that had failed. The node's task log had three
+VMIDs in this state -- 900, 904 and 911 -- sandboxes someone believed they had
+removed, still occupying fleet slots. Destroy now waits for the task and fails
+loudly.
+
+**And the reason they failed is worth knowing.** `destroy-unreferenced-disks=1`
+makes Proxmox sweep *every* configured storage for stray disks of that VMID, so
+a single dead storage aborts a destroy that has nothing to do with it:
+
+```
+storage 'mininas' is not online
+```
+
+`mininas` is not in the node's storage list at all, and no sandbox has a disk
+on it. The sweep is a tidiness measure; removing the machine is not. Destroy
+now retries without the sweep when a storage is what stopped it, logging what
+it skipped.
+
+**Two things for you, not fixable here.** The stale `mininas` entry should be
+removed from the Proxmox storage config, or it will keep aborting sweeps. And
+**900 (`rucmc5m`) and 904 (`wikiswarm`) still exist despite destroy attempts**
+-- they will now delete if you ask again.
+
 ## Suggested order
 
 Cheap, mechanical, no decision needed:
