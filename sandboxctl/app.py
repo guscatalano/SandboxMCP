@@ -467,6 +467,8 @@ GROUNDHOG_TASK = r"Groundhog\RunPending"
 # by the page tag and the /favicon.svg route.
 FAVICON_B64 = "PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAzMiAzMiI+PHJlY3Qgd2lkdGg9IjMyIiBoZWlnaHQ9IjMyIiByeD0iNyIgZmlsbD0iIzE1MTkyMiIvPjxyZWN0IHg9IjUiIHk9IjgiIHdpZHRoPSIyMiIgaGVpZ2h0PSIxNSIgcng9IjIuNSIgZmlsbD0iIzRhOWVmZiIvPjxyZWN0IHg9IjkiIHk9IjI1IiB3aWR0aD0iMTQiIGhlaWdodD0iMi41IiByeD0iMS4yNSIgZmlsbD0iIzJhMzI0MiIvPjxjaXJjbGUgY3g9IjIyLjUiIGN5PSIxMi41IiByPSIyLjYiIGZpbGw9IiMzZmI5NTAiLz48L3N2Zz4="
 GH_LAST = {}
+# vmid -> the Groundhog agent version last seen in that sandbox.
+GH_AGENT = {}
 GROUNDHOG_LAST_RUN = GROUNDHOG_HOME + r"\last-run"
 
 
@@ -812,6 +814,11 @@ def _groundhog_status_uncached(vmid):
         outcome = "none"              # nothing was ever asked of this sandbox
 
     GH_LAST[int(vmid)] = outcome
+    if run and run.get("agent"):
+        # Which agent a sandbox has decides which Groundhogfiles it can apply,
+        # so it belongs in the listing. Remembered here rather than fetched
+        # there: asking costs a guest round trip and this call already paid it.
+        GH_AGENT[int(vmid)] = str(run["agent"])
     out = {"vmid": int(vmid),
            "pending": pending,
            "outcome": outcome,
@@ -2424,6 +2431,43 @@ MCP_TOOLS = [
                 "who": {"type": "string", "description": "Who set it, for the history."},
             },
             "required": ["vmid"],
+        },
+    },
+    {
+        "name": "sandbox_screenshot",
+        "description": ("A JPEG of a sandbox's screen taken from OUTSIDE the guest, through the "
+                        "hypervisor. Use it when Deskhand cannot answer -- during a restart, at "
+                        "a lock screen, before it has started, or when an install has wedged the "
+                        "desktop -- which is exactly when you most need to see what is there. "
+                        "For a running guest, that sandbox's own deskhand_capture_screen is "
+                        "sharper and cheaper."),
+        "inputSchema": {"type": "object", "properties": {"vmid": {"type": "integer"}},
+                        "required": ["vmid"]},
+    },
+    {
+        "name": "list_recordings",
+        "description": ("The console recordings held for a sandbox. Every running sandbox is "
+                        "recorded continuously from outside the guest, in chunks, so this covers "
+                        "boots, restarts and sign-in -- the parts no in-guest capture can see. "
+                        "Each entry carries a URL this controller serves, so nothing has to come "
+                        "back through a tool result."),
+        "inputSchema": {"type": "object", "properties": {"vmid": {"type": "integer"}},
+                        "required": ["vmid"]},
+    },
+    {
+        "name": "download_guest_file",
+        "description": ("A URL for a file inside a sandbox, served by this controller, so you "
+                        "need no route to the sandbox's own address. Returns the link and the "
+                        "size rather than the bytes: this is for dumps, logs and archives that "
+                        "have no business travelling through a tool result. For small text, "
+                        "read_guest_file is simpler. Goes through Deskhand when it is up and the "
+                        "guest agent when it is not."),
+        "inputSchema": {
+            "type": "object",
+            "properties": {"vmid": {"type": "integer"},
+                           "path": {"type": "string",
+                                    "description": "Full path in the guest, e.g. C:\\dumps\\app.dmp"}},
+            "required": ["vmid", "path"],
         },
     },
     {
@@ -4823,6 +4867,45 @@ def warm_alive(entries):
                        cached=False)
 
 
+# The control surface's own base URL, for handing callers a link they can
+# actually fetch. SELF_URL is the sandbox-facing payload port; this is the
+# same host without it.
+CONTROL_URL = SELF_URL.rsplit(":", 1)[0] if SELF_URL.count(":") > 1 else SELF_URL
+
+
+def host_screenshot(vmid):
+    """A JPEG of the console, taken outside the guest.
+
+    Works in the moments Deskhand cannot answer -- mid-restart, at a lock
+    screen, before it starts -- which is exactly when a caller most wants to
+    see what is on screen. Prefers the recorder's own frame: Proxmox serves one
+    VNC session per VM well and a second one poorly, so opening another
+    alongside a running recorder returns black.
+    """
+    vmid = _check_managed(vmid)
+    jpg = RECORDER.latest(vmid) if RECORDER else None
+    if jpg is None:
+        sess = live.open_vnc(api, NODE, vmid, HOST)
+        try:
+            jpg = sess.frame(incremental=False)
+        finally:
+            sess.close()
+    return jpg
+
+
+def guest_download_url(vmid, path):
+    """A URL for a file inside a sandbox, served by this controller.
+
+    Two people asked for this from opposite ends -- one wanting recordings out,
+    one wanting crash dumps out -- and both were reduced to pulling bytes
+    through a tool result in chunks. The point is that the caller needs no
+    route to the sandbox's own address: this controller has one.
+    """
+    vmid = _check_managed(vmid)
+    return "%s/api/download?vmid=%d&path=%s" % (
+        CONTROL_URL, vmid, urllib.parse.quote(path, safe=""))
+
+
 def _sandbox_view(e):
     """One sandbox, described so a caller can act on it without another lookup."""
     port = e.get("port", 8791)
@@ -4840,6 +4923,9 @@ def _sandbox_view(e):
     gh = GH_LAST.get(int(e["vmid"]))
     if gh and gh != "none":
         out["groundhog"] = gh
+    agent = GH_AGENT.get(int(e["vmid"]))
+    if agent:
+        out["groundhog_agent"] = agent
     exp = get_expiry(e["vmid"])
     out["expires"] = "never" if not exp else ("expired" if exp["expired"]
                                               else f"{exp['minutes_left']} min")
@@ -4877,7 +4963,8 @@ def _sandbox_view(e):
     return out
 
 
-_QUIET_TOOLS = {"list_sandboxes", "job_status", "read_comments", "sandbox_history"}
+_QUIET_TOOLS = {"list_sandboxes", "job_status", "read_comments", "sandbox_history",
+                "list_recordings"}
 
 
 def mcp_call(name, args):
@@ -4952,6 +5039,41 @@ def _mcp_call(name, args):
             raise ValueError("vmid is required")
         _check_managed(vmid)
         return set_expiry(vmid, args.get("minutes"), args.get("who"))
+    if name == "sandbox_screenshot":
+        jpg = host_screenshot(args.get("vmid"))
+        return {"_mcp_content": [{"type": "image",
+                                  "data": base64.b64encode(jpg).decode(),
+                                  "mimeType": "image/jpeg"}]}
+    if name == "list_recordings":
+        vmid = _check_managed(args.get("vmid"))
+        if not RECORDER:
+            return {"enabled": False, "items": [],
+                    "note": "recording is off; set recordings_dir in the controller config"}
+        items = []
+        for it in recordings_for(vmid):
+            items.append(dict(it, url="%s/api/recording?file=%s"
+                              % (CONTROL_URL, urllib.parse.quote(it["file"], safe=""))))
+        st = (RECORDER.status() or {}).get(vmid) or {}
+        return {"enabled": True, "vmid": vmid, "recording_now": bool(st.get("recording")),
+                "retention_days": REC_RETENTION_DAYS, "items": items}
+    if name == "download_guest_file":
+        vmid = _check_managed(args.get("vmid"))
+        path = (args.get("path") or "").strip()
+        if not path:
+            raise ValueError("path is required")
+        size = None
+        try:
+            listing = guest_browse(vmid, path.replace("/", chr(92)).rsplit(chr(92), 1)[0] or "C:" + chr(92))
+            base = os.path.basename(path.replace(chr(92), "/"))
+            for it in (listing.get("entries") or listing.get("items") or []):
+                if str(it.get("name", "")).lower() == base.lower():
+                    size = it.get("size")
+                    break
+        except Exception:                             # noqa: BLE001
+            pass                                      # the size is a nicety
+        return {"vmid": vmid, "path": path, "size": size,
+                "url": guest_download_url(vmid, path),
+                "note": "fetch this URL; it streams from the controller, no route to the sandbox needed"}
     if name == "power_sandbox":
         return power_sandbox(args.get("vmid"), (args.get("action") or "").strip(),
                              args.get("who"), bool(args.get("force")))
@@ -5282,6 +5404,10 @@ def handle_mcp(msg, host=None):
                 inner = proxy_call(tname, targs)
                 return {"jsonrpc": "2.0", "id": mid, "result": inner}
             result = mcp_call(tname, targs)
+            # Almost everything is JSON in a text block; a screenshot is not.
+            if isinstance(result, dict) and "_mcp_content" in result:
+                return {"jsonrpc": "2.0", "id": mid,
+                        "result": {"content": result["_mcp_content"], "isError": False}}
             text = json.dumps(result, indent=2, default=str)
             return {"jsonrpc": "2.0", "id": mid,
                     "result": {"content": [{"type": "text", "text": text}], "isError": False}}
@@ -5465,6 +5591,61 @@ class Handler(BaseHTTPRequestHandler):
                 "retention_days": REC_RETENTION_DAYS,
                 "status": {str(k): v for k, v in RECORDER.status().items()},
                 "items": recordings_for(int(vmid) if vmid is not None else None)}))
+        if p.path == "/api/download":
+            # Straight out of the guest and down to the caller, streamed rather
+            # than buffered, so a crash dump does not have to fit in memory
+            # anywhere. Deskhand's own download endpoint when it is up, because
+            # it is far quicker than the guest agent; the agent when it is not,
+            # because that is when you most need the file.
+            q = urllib.parse.parse_qs(p.query)
+            gpath = (q.get("path") or [""])[0]
+            try:
+                vmid = _check_managed((q.get("vmid") or [""])[0])
+            except Exception as exc:                   # noqa: BLE001
+                return self._send(400, json.dumps({"error": str(exc)}))
+            if not gpath:
+                return self._send(400, json.dumps({"error": "path is required"}))
+            record_event(vmid, "file downloaded", gpath[:120])
+            entry = next((x for x in list_sandboxes() if x["vmid"] == vmid), None)
+            name = os.path.basename(gpath.replace(chr(92), "/")) or "download.bin"
+            if entry and entry.get("ip") and entry.get("token"):
+                url = ("http://%s:%d/fs/download?path=%s"
+                       % (entry["ip"], entry.get("port", 8791),
+                          urllib.parse.quote(gpath, safe="")))
+                req = urllib.request.Request(
+                    url, headers={"Authorization": "Bearer " + entry["token"]})
+                try:
+                    with urllib.request.urlopen(req, timeout=60) as up:
+                        self.send_response(200)
+                        self.send_header("Content-Type", "application/octet-stream")
+                        length = up.headers.get("Content-Length")
+                        if length:
+                            self.send_header("Content-Length", length)
+                        self.send_header("Content-Disposition",
+                                         'attachment; filename="%s"' % name)
+                        self.end_headers()
+                        while True:
+                            chunk = up.read(262144)
+                            if not chunk:
+                                break
+                            self.wfile.write(chunk)
+                    return
+                except Exception as exc:               # noqa: BLE001
+                    print(f"download via Deskhand failed for {vmid}: {exc}; "
+                          "falling back to the guest agent", flush=True)
+            try:
+                got = guest_read(vmid, gpath)
+            except Exception as exc:                   # noqa: BLE001
+                return self._send(502, json.dumps({"error": str(exc)}))
+            blob = (base64.b64decode(got["base64"]) if got.get("base64")
+                    else (got.get("text") or "").encode())
+            self.send_response(200)
+            self.send_header("Content-Type", "application/octet-stream")
+            self.send_header("Content-Length", str(len(blob)))
+            self.send_header("Content-Disposition", 'attachment; filename="%s"' % name)
+            self.end_headers()
+            self.wfile.write(blob)
+            return
         if p.path == "/api/recording":
             # Serve a chunk for playback/download. Name-checked, not path-joined
             # from user input: the filename pattern is the whole allowlist.

@@ -182,6 +182,27 @@ strongest candidates:
    the running-limit refusal for reviewer 1. Both now have cheap answers that did
    not exist when they tested.
 
+## Done so far (2026-10-11)
+
+Nine items are in and verified against the live fleet:
+
+| | item | evidence |
+|---|---|---|
+| 1 | Guest failures report their cause | `New-Item : Cannot find drive...` instead of a CLIXML blob |
+| 2 | `write_guest_file` creates parents, takes either slash | `C:
+ewtop\deep.txt` and `C:/newtop2/b.txt` both write |
+| 3 | Proxy ceiling raised | 120 s to 900 s, configurable |
+| 4 | `clean` snapshot at the end of every create | calls exercised; not yet seen on a real create |
+| 5 | Keepalive on tool use | expiry at 4 min left, one call, 29 min left |
+| 6 | Update cadence 10 min to 60 | 24 GitHub requests an hour back to 4 |
+| 7 | Groundhog agent in `list_sandboxes` | two versions visible across the fleet, 0.23.0 and 0.24.0 |
+| 8 | `sandbox_screenshot`, `list_recordings` | a 204 KB JPEG through MCP; 19 recordings with URLs |
+| 9 | `download_guest_file` + `/api/download` | 300 KB round trip, SHA-256 matched, and again with Deskhand stopped |
+
+Item 4 is the one with a caveat: the running limit was full, so it has not been
+observed on an actual create. Both calls it makes were exercised against a live
+sandbox and it cannot fail a create.
+
 ## Suggested order
 
 Cheap, mechanical, no decision needed:
