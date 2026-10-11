@@ -79,7 +79,12 @@ AGENTS_CFG = CONFIG.get("agents") or {}
 DESKHAND_TOOL_CHARS = int(CONFIG.get("deskhand_max_tool_chars") or 150000)
 # How often a sandbox checks GitHub for a newer Deskhand. Deskhand clamps
 # this to between 5 minutes and a week; 0 turns auto-update off entirely.
-DESKHAND_UPDATE_MIN = int(CONFIG.get("deskhand_update_interval_min") or 10)
+# Every sandbox polls GitHub on this interval, and GitHub allows 60
+# unauthenticated requests an hour from one address -- which all the sandboxes
+# share. At ten minutes, four sandboxes spent 24 of those 60 on update checks
+# before a Groundhog profile fetched anything, and profiles were already
+# failing with 403. Deskhand's own default is 60.
+DESKHAND_UPDATE_MIN = int(CONFIG.get("deskhand_update_interval_min") or 60)
 
 # Console recording. Off unless a directory is configured, because it needs
 # somewhere with room -- a chunk is tens of MB and they accumulate per sandbox.
@@ -1566,20 +1571,6 @@ def read_config_token(vmid, timeout=90):
         return m.group(1) if m else None
 
 
-def strip_clixml(text):
-    """Drop PowerShell's serialised progress stream from a guest reply.
-
-    The guest agent merges stdout and the other streams, so a reply often ends
-    with "#< CLIXML" followed by an XML blob describing a progress record. It is
-    not output, it is not an error, and it makes anything that parses the reply
-    whole -- JSON especially -- fail on a result that is actually fine.
-    """
-    if not text:
-        return ""
-    cut = text.find("#< CLIXML")
-    return (text[:cut] if cut >= 0 else text).strip()
-
-
 def read_config(vmid, timeout=90):
     """All of deskhand.json, for callers that need more than the token."""
     out = agent_run_ps(
@@ -1988,6 +1979,31 @@ def do_create(job, opts):
             job.log("no expiry: this sandbox stays until destroyed")
 
         provision(job, vmid, opts)
+
+        # A point to come back to. Without one, "give me the machine as it was
+        # before I touched it" meant building a new sandbox and staging
+        # everything again, which is minutes against the seconds a rollback
+        # costs.
+        try:
+            if opts.get("groundhog"):
+                # The profile is applied asynchronously, so snapshotting the
+                # moment provision returns can capture a half-applied guest.
+                # Wait for it to settle, but do not let a slow profile cost the
+                # snapshot entirely.
+                job.log("waiting for the profile to settle before snapshotting")
+                for _ in range(60):
+                    time.sleep(10)
+                    st = groundhog_status(vmid, fresh=True)
+                    if st.get("outcome") in ("succeeded", "failed", "reboot-pending", "none"):
+                        break
+            take_snapshot(vmid, SNAPSHOT_CLEAN,
+                          "the sandbox as created, before anyone touched it",
+                          opts.get("who") or "create")
+            job.log(f"snapshot '{SNAPSHOT_CLEAN}' taken; revert to it for a clean machine")
+        except Exception as exc:                      # noqa: BLE001
+            # A sandbox that works but has no snapshot is still a usable
+            # sandbox, so this never fails the create.
+            job.log(f"could not take the '{SNAPSHOT_CLEAN}' snapshot: {exc}")
     finally:
         release_vmid(vmid)
 
@@ -2971,14 +2987,36 @@ def _guest_place(vmid, path, tmp, append, written):
     return {"path": path, "written": written, "size_on_disk": int(line.split("|")[1])}
 
 
+def _guest_mkparent(vmid, path):
+    """Create the file's parent directory if it is missing.
+
+    Reported from the field: writing to C:\\buildsrc\\x failed because the
+    top-level directory did not exist, and the caller had to pre-create it with
+    a separate command. Windows accepts either slash almost everywhere, so the
+    path is normalised too rather than being a second thing to get right.
+    """
+    parent = path.replace("/", chr(92)).rsplit(chr(92), 1)[0]
+    if not parent or parent.endswith(":"):
+        return                      # a drive root always exists
+    script = ("$ErrorActionPreference='Stop'" + chr(10)
+              + "$p = " + _ps_literal(parent) + chr(10)
+              + "if (-not (Test-Path -LiteralPath $p)) "
+                "{ New-Item -ItemType Directory -Path $p -Force | Out-Null }" + chr(10)
+              + "Write-Output 'OK'" + chr(10))
+    _marked_line(_guest_ps(vmid, script, timeout=120), ("OK",))
+
+
 def guest_write(vmid, path, text=None, content_base64=None, append=False):
     """Write a file, in chunks, and verify the length afterwards."""
+    path = path.replace("/", chr(92))
     if content_base64:
         blob = base64.b64decode(content_base64)
     elif text is not None:
         blob = text.encode("utf-8")
     else:
         raise ValueError("pass text or content_base64")
+
+    _guest_mkparent(vmid, path)
 
     # Preferred path: content in the request body rather than a command line.
     # Falls back rather than failing, because an old PVE or a tightened token
@@ -3020,6 +3058,43 @@ def guest_write(vmid, path, text=None, content_base64=None, append=False):
     return {"path": path, "written": len(blob), "size_on_disk": int(line.split("|")[1])}
 
 
+def clixml_errors(text):
+    """PowerShell's error stream, pulled out of the CLIXML blob and made readable.
+
+    The guest agent returns stdout and the other streams together, and the
+    other streams arrive as serialised XML. Dropping it loses the error; this
+    unpacks the <S S="Error"> entries and undoes the escaping PowerShell
+    applies to newlines and spaces inside them.
+    """
+    if not text or "CLIXML" not in text:
+        return ""
+    parts = []
+    for m in re.finditer(r'<S S="Error">(.*?)</S>', text, re.S):
+        frag = m.group(1)
+        frag = (frag.replace("_x000D_", "").replace("_x000A_", chr(10))
+                    .replace("_x0020_", " ").replace("_x0009_", " "))
+        frag = html.unescape(frag).strip()
+        if frag:
+            parts.append(frag)
+    # One error is usually wrapped over several entries; join and squeeze.
+    joined = " ".join(" ".join(parts).split())
+    return joined
+
+
+def strip_clixml(text):
+    """Drop PowerShell's serialised progress stream from a guest reply.
+
+    The guest agent merges stdout and the other streams, so a reply often ends
+    with "#< CLIXML" followed by an XML blob describing a progress record. It is
+    not output, it is not an error, and it makes anything that parses the reply
+    whole -- JSON especially -- fail on a result that is actually fine.
+    """
+    if not text:
+        return ""
+    cut = text.find("#< CLIXML")
+    return (text[:cut] if cut >= 0 else text).strip()
+
+
 def _marked_line(out, prefixes=("OK|", "ERR|")):
     """Pull our own marked line out of whatever else the channel returned.
 
@@ -3031,7 +3106,18 @@ def _marked_line(out, prefixes=("OK|", "ERR|")):
         line = line.strip()
         if any(line.startswith(p) for p in prefixes) or line in prefixes:
             return line
-    raise RuntimeError("no result line in the guest reply: " + (out or "")[:160])
+    # No marked line, so this is a failure and the reply is all we have to
+    # explain it. The cause is usually sitting inside the CLIXML blob rather
+    # than next to it -- PowerShell serialises its error stream in there -- so
+    # it gets unpacked rather than stripped. Someone writing to a path whose
+    # parent did not exist was shown "#< CLIXML <Objs Version=..." and had to
+    # guess; the actual words "New-Item : ... cannot find the path" were in the
+    # blob the whole time.
+    said = clixml_errors(out)
+    if said:
+        raise RuntimeError("the guest reported: " + said[:300])
+    raise RuntimeError("no result line in the guest reply: "
+                       + (strip_clixml(out) or (out or ""))[:200])
 
 
 def _ps_literal(s):
@@ -4153,6 +4239,9 @@ def set_egress(vmid, mode, who="", verify=False):
 # before something ran, not the exact contents of RAM. The cost is that a
 # rollback cannot happen under a running VM, so revert stops it first and puts
 # it back the way it found it.
+# Taken at the end of every create, so there is always something to roll back
+# to without rebuilding.
+SNAPSHOT_CLEAN = "clean"
 SNAP_NAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,39}$")
 
 
@@ -4579,7 +4668,14 @@ _tools_cache = {}          # name -> (expires, tools)
 _CACHE_TTL = 60
 
 
-def deskhand_rpc(ip, port, token, method, params=None, timeout=120):
+# A proxied call used to get 120 s whatever the caller asked for, which is how
+# "timed out at about two minutes" became a property of the service rather than
+# of the work. Installs and builds inside a guest routinely run longer.
+PROXY_TIMEOUT = int(CONFIG.get("proxy_timeout_seconds") or 900)
+
+
+def deskhand_rpc(ip, port, token, method, params=None, timeout=None):
+    timeout = PROXY_TIMEOUT if timeout is None else timeout
     payload = {"jsonrpc": "2.0", "id": 1, "method": method}
     if params is not None:
         payload["params"] = params
@@ -4796,7 +4892,36 @@ def mcp_call(name, args):
         record_timing("MCP " + str(name), time.perf_counter() - t0, failed)
 
 
+# A sandbox under active use should not be reaped out from under the work. The
+# reaper already spares a live claim, but claims lapse too, so a task longer
+# than the claim outlived both protections and someone lost a session mid-task.
+# Touching a sandbox is the signal that it is still wanted.
+KEEPALIVE_FLOOR_MIN = int(CONFIG.get("keepalive_floor_minutes") or 30)
+_KEEPALIVE_SEEN = {}
+
+
+def keepalive(vmid):
+    """Push a near expiry back out, so work in progress is not destroyed."""
+    try:
+        vmid = int(vmid)
+    except (TypeError, ValueError):
+        return
+    now = time.time()
+    if now - _KEEPALIVE_SEEN.get(vmid, 0) < 60:
+        return                       # at most once a minute per sandbox
+    _KEEPALIVE_SEEN[vmid] = now
+    try:
+        exp = get_expiry(vmid)
+        if not exp or exp["minutes_left"] >= KEEPALIVE_FLOOR_MIN:
+            return                   # never expires, or has plenty left
+        set_expiry(vmid, KEEPALIVE_FLOOR_MIN, "keepalive")
+    except Exception:                                 # noqa: BLE001
+        pass                         # a keepalive must never fail a tool call
+
+
 def _mcp_call(name, args):
+    if args.get("vmid") is not None and name not in ("destroy_sandbox", "set_expiry"):
+        keepalive(args.get("vmid"))
     # Reads are not worth a timeline entry; everything that changes something,
     # or reaches into a guest, is.
     if name not in _QUIET_TOOLS:
